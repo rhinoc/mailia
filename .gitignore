@@ -1,0 +1,16 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+Package.resolved
+
+# Frontend dependencies and local build caches.
+Web/Timeline/node_modules/
+Web/Timeline/.vite/
+Web/Timeline/.tmp/
+Web/Timeline/*.tsbuildinfo
+Web/Timeline/.DS_Store

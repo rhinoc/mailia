@@ -1,0 +1,9 @@
+public protocol AccountServicing: Sendable {}
+public protocol FolderDiscoveryServicing: Sendable {}
+public protocol SyncServicing: Sendable {}
+public protocol TimelineServicing: Sendable {}
+public protocol BodyFetchServicing: Sendable {}
+public protocol ReadStateServicing: Sendable {}
+public protocol JunkTrustServicing: Sendable {}
+public protocol AttachmentServicing: Sendable {}
+public protocol ActivityLogServicing: Sendable {}
