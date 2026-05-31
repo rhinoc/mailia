@@ -146,7 +146,7 @@ func displayNormalizerRemovesTrailingBlankSignature() throws {
 func textNormalizerRemovesHimalayaAttachmentPartMarkers() {
     let text = """
     See attached invoice.
-    <#part type=application/pdf filename="/Users/ryan/Downloads/MC72260929.pdf"><#/part>
+    <#part type=application/pdf filename="/Users/example/Downloads/invoice.pdf"><#/part>
     Thanks.
     """
 
@@ -155,7 +155,7 @@ func textNormalizerRemovesHimalayaAttachmentPartMarkers() {
     #expect(result.contains("See attached invoice."))
     #expect(result.contains("Thanks."))
     #expect(!result.contains("<#part"))
-    #expect(!result.contains("MC72260929.pdf"))
+    #expect(!result.contains("invoice.pdf"))
 }
 
 @Test

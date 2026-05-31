@@ -282,13 +282,13 @@ func sendNewMessageRunsDelayedFollowUpRefreshForRecipientAccountCopies() async {
     let initialSnapshot = MailiaSnapshot(
         entities: [mailiaEntitySummary(id: 1, displayName: "Reno")],
         sendAccounts: [
-            mailiaSendAccount(id: "gmail", emailAddress: "rhinocodec@gmail.com", isDefault: true),
-            mailiaSendAccount(id: "outlook", emailAddress: "rhinoc@outlook.com")
+            mailiaSendAccount(id: "primary", emailAddress: "primary@example.com", isDefault: true),
+            mailiaSendAccount(id: "work", emailAddress: "work@example.net")
         ],
         loadedAt: Date()
     )
     let followUpSnapshot = MailiaSnapshot(
-        entities: [mailiaEntitySummary(id: 2, displayName: "rhinocodec@gmail.com")],
+        entities: [mailiaEntitySummary(id: 2, displayName: "primary@example.com")],
         sendAccounts: initialSnapshot.sendAccounts,
         loadedAt: Date()
     )
@@ -304,7 +304,7 @@ func sendNewMessageRunsDelayedFollowUpRefreshForRecipientAccountCopies() async {
 
     await viewModel.load()
     viewModel.sendNewMessage(
-        to: ["rhinoc@outlook.com"],
+        to: ["work@example.net"],
         subject: "hi reno",
         body: "hi reno",
         accountKey: nil
@@ -314,9 +314,9 @@ func sendNewMessageRunsDelayedFollowUpRefreshForRecipientAccountCopies() async {
     }
 
     #expect(provider.sendNewMessageCallCount == 1)
-    #expect(provider.sentNewMessageAccountKey == "gmail")
+    #expect(provider.sentNewMessageAccountKey == "primary")
     #expect(provider.refreshAfterSendingCallCount == 2)
-    #expect(provider.refreshAfterSendingAccountKeys.allSatisfy { $0 == ["gmail", "outlook"] })
+    #expect(provider.refreshAfterSendingAccountKeys.allSatisfy { $0 == ["primary", "work"] })
     #expect(viewModel.entities == followUpSnapshot.entities)
 }
 

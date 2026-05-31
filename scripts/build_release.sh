@@ -10,7 +10,6 @@ RESOURCE_BUNDLE="Mailia_MailiaApp.bundle"
 PLIST_SRC="$ROOT/Sources/MailiaApp/Info.plist"
 ICON_SRC="$ROOT/Sources/MailiaApp/Resources/AppIcon.icns"
 DMG_BACKGROUND="$ROOT/assets/dmg-background.png"
-DMG_DS_STORE="$ROOT/assets/dmg.DS_Store"
 
 if [[ ! -f "$DMG_BACKGROUND" ]]; then
   echo "error: missing DMG background at $DMG_BACKGROUND" >&2
@@ -58,28 +57,22 @@ xattr -cr "$APP"
 "$ROOT/scripts/sign_built_app.sh" "$APP"
 
 mkdir -p "$ROOT/dist"
-DMG_ROOT="$STAGE/dmg-root"
-mkdir -p "$DMG_ROOT/.background"
-cp -R "$APP" "$DMG_ROOT/"
-cp "$DMG_BACKGROUND" "$DMG_ROOT/.background/background.png"
-ln -s /Applications "$DMG_ROOT/Applications"
-if [[ -f "$DMG_DS_STORE" ]]; then
-  cp "$DMG_DS_STORE" "$DMG_ROOT/.DS_Store"
-fi
-find "$DMG_ROOT" -name '._*' -delete
-xattr -cr "$DMG_ROOT"
-chflags hidden "$DMG_ROOT/.background"
-
-VOLNAME="Mailia"
 DMG="$ROOT/dist/Mailia-${VERSION}-macos.dmg"
 rm -f "$DMG"
-hdiutil create \
-  -volname "$VOLNAME" \
-  -srcfolder "$DMG_ROOT" \
-  -ov \
-  -fs HFS+ \
-  -format UDZO \
-  -imagekey zlib-level=9 \
-  "$DMG" >/dev/null
+APPDMG_JSON="$STAGE/appdmg.json"
+cat >"$APPDMG_JSON" <<EOF
+{
+  "title": "Mailia",
+  "icon": "$ICON_SRC",
+  "background": "$DMG_BACKGROUND",
+  "icon-size": 96,
+  "contents": [
+    { "x": 210, "y": 235, "type": "file", "path": "$APP" },
+    { "x": 590, "y": 235, "type": "link", "path": "/Applications" }
+  ]
+}
+EOF
+
+npx --yes "appdmg@${APPDMG_VERSION:-0.6.6}" "$APPDMG_JSON" "$DMG"
 
 echo "Built $DMG"
