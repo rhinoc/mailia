@@ -1,5 +1,6 @@
 <div align="center">
   <br />
+  <img src="./assets/app-icon-transparent.png" alt="Mailia app icon" width="112" height="112" />
   <h1>Mailia</h1>
   <p>A native macOS email companion that turns multiple mailboxes into a people-first inbox.</p>
   <p>

@@ -14,11 +14,11 @@ if [[ -z "$IDENTITY" ]]; then
   )"
 fi
 
-SIGN_ARGS=()
+USE_HARDENED_RUNTIME=0
 if [[ -n "$IDENTITY" ]]; then
   SIGN_IDENTITY="$IDENTITY"
   if [[ "$IDENTITY" == Developer\ ID* ]]; then
-    SIGN_ARGS=(--options runtime --timestamp)
+    USE_HARDENED_RUNTIME=1
   fi
   echo "Signing with: $IDENTITY"
 elif [[ "${MAILIA_ALLOW_ADHOC_SIGNING:-}" == "1" ]]; then
@@ -30,10 +30,20 @@ else
   exit 1
 fi
 
+sign_target() {
+  local target="$1"
+  shift
+  if [[ "$USE_HARDENED_RUNTIME" == "1" ]]; then
+    codesign --force "$@" --options runtime --timestamp --sign "$SIGN_IDENTITY" "$target"
+  else
+    codesign --force "$@" --sign "$SIGN_IDENTITY" "$target"
+  fi
+}
+
 if [[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]; then
-  codesign --force --deep "${SIGN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP/Contents/Frameworks/Sparkle.framework"
+  sign_target "$APP/Contents/Frameworks/Sparkle.framework" --deep
 fi
 
-codesign --force "${SIGN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP/Contents/MacOS/Mailia"
-codesign --force "${SIGN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$APP"
+sign_target "$APP/Contents/MacOS/Mailia"
+sign_target "$APP"
 codesign --verify --verbose=2 "$APP"
