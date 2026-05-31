@@ -76,6 +76,82 @@ func loadRefreshesWhenLastRefreshIsOlderThanStartupThreshold() async {
 
 @MainActor
 @Test
+func loadPublishesStaleLocalSnapshotBeforeStartupRefreshCompletes() async {
+    let now = Date(timeIntervalSince1970: 1_800_100_000)
+    let localSnapshot = MailiaSnapshot(
+        entities: [mailiaEntitySummary(id: 1, displayName: "Alice")],
+        sendAccounts: [],
+        loadedAt: now
+    )
+    let refreshedSnapshot = MailiaSnapshot(
+        entities: [mailiaEntitySummary(id: 2, displayName: "Bob")],
+        sendAccounts: [],
+        loadedAt: now
+    )
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [localSnapshot],
+        refreshSnapshots: [refreshedSnapshot],
+        lastRefreshFinishedAt: now.addingTimeInterval(-601),
+        refreshDelayNanoseconds: 100_000_000
+    )
+    let viewModel = AppViewModel(provider: provider, now: { now })
+
+    let loadTask = Task {
+        await viewModel.load()
+    }
+    await waitUntil {
+        provider.refreshCallCount == 1
+    }
+
+    #expect(viewModel.entities == localSnapshot.entities)
+
+    await loadTask.value
+
+    #expect(viewModel.entities == refreshedSnapshot.entities)
+}
+
+@MainActor
+@Test
+func startupRefreshReloadsTimelineWhenStaleSelectionIsKept() async {
+    let now = Date(timeIntervalSince1970: 1_800_100_000)
+    let entity = mailiaEntitySummary(id: 1, displayName: "Alice")
+    let localItem = mailiaTimelineItem(id: 10, entityID: entity.id)
+    let refreshedItem = mailiaTimelineItem(id: 11, entityID: entity.id)
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [
+            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: now)
+        ],
+        refreshSnapshots: [
+            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: now)
+        ],
+        timelinePages: [
+            MailiaTimelinePage(items: [localItem], hasMore: false),
+            MailiaTimelinePage(items: [refreshedItem], hasMore: false)
+        ],
+        lastRefreshFinishedAt: now.addingTimeInterval(-601),
+        refreshDelayNanoseconds: 100_000_000
+    )
+    let viewModel = AppViewModel(provider: provider, now: { now })
+
+    let loadTask = Task {
+        await viewModel.load()
+    }
+    await waitUntil {
+        viewModel.timeline == [localItem]
+    }
+
+    #expect(viewModel.timeline == [localItem])
+
+    await loadTask.value
+    await waitUntil {
+        viewModel.timeline == [refreshedItem]
+    }
+
+    #expect(viewModel.timeline == [refreshedItem])
+}
+
+@MainActor
+@Test
 func loadDoesNotRefreshWhenLastRefreshIsWithinStartupThreshold() async {
     let now = Date(timeIntervalSince1970: 1_800_100_000)
     let localSnapshot = MailiaSnapshot(
@@ -453,7 +529,9 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     private var refreshNewerTimelineSnapshots: [MailiaSnapshot]
     private var timelinePages: [MailiaTimelinePage]
     private var bodyResults: [Result<MailiaTimelineBody, Error>]
+    private var storedSendAccounts: [MailiaSendAccount] = []
     private let lastRefreshFinishedAt: Date?
+    private let refreshDelayNanoseconds: UInt64
     private let refreshAfterSendingDelayNanoseconds: UInt64
     private let refreshError: Error?
     private(set) var loadSnapshotCallCount = 0
@@ -475,6 +553,7 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         timelinePages: [MailiaTimelinePage] = [],
         bodyResults: [Result<MailiaTimelineBody, Error>] = [],
         lastRefreshFinishedAt: Date? = nil,
+        refreshDelayNanoseconds: UInt64 = 0,
         refreshAfterSendingDelayNanoseconds: UInt64 = 0,
         refreshError: Error? = nil
     ) {
@@ -484,14 +563,18 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         self.refreshNewerTimelineSnapshots = refreshNewerTimelineSnapshots
         self.timelinePages = timelinePages
         self.bodyResults = bodyResults
+        self.storedSendAccounts = loadSnapshots.first?.sendAccounts ?? []
         self.lastRefreshFinishedAt = lastRefreshFinishedAt
+        self.refreshDelayNanoseconds = refreshDelayNanoseconds
         self.refreshAfterSendingDelayNanoseconds = refreshAfterSendingDelayNanoseconds
         self.refreshError = refreshError
     }
 
     func loadSnapshot(workspace: MailiaWorkspace, searchQuery: String) async throws -> MailiaSnapshot {
         loadSnapshotCallCount += 1
-        return loadSnapshots.removeFirst()
+        let snapshot = loadSnapshots.removeFirst()
+        storedSendAccounts = snapshot.sendAccounts
+        return snapshot
     }
 
     func lastRefreshFinishedAt() async throws -> Date? {
@@ -515,7 +598,12 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
             detail: nil,
             fraction: 1
         ))
-        return refreshSnapshots.removeFirst()
+        if refreshDelayNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: refreshDelayNanoseconds)
+        }
+        let snapshot = refreshSnapshots.removeFirst()
+        storedSendAccounts = snapshot.sendAccounts
+        return snapshot
     }
 
     func recipientSuggestions() async throws -> [MailiaRecipientSuggestion] {
@@ -532,7 +620,9 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         if refreshAfterSendingDelayNanoseconds > 0 {
             try? await Task.sleep(nanoseconds: refreshAfterSendingDelayNanoseconds)
         }
-        return refreshAfterSendingSnapshots.removeFirst()
+        let snapshot = refreshAfterSendingSnapshots.removeFirst()
+        storedSendAccounts = snapshot.sendAccounts
+        return snapshot
     }
 
     func refreshNewerTimelineMessages(
@@ -545,7 +635,9 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         if refreshAfterSendingDelayNanoseconds > 0 {
             try? await Task.sleep(nanoseconds: refreshAfterSendingDelayNanoseconds)
         }
-        return refreshNewerTimelineSnapshots.removeFirst()
+        let snapshot = refreshNewerTimelineSnapshots.removeFirst()
+        storedSendAccounts = snapshot.sendAccounts
+        return snapshot
     }
 
     func syncEntityHistory(
@@ -611,7 +703,7 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     }
 
     func loadSendAccounts() async throws -> [MailiaSendAccount] {
-        []
+        storedSendAccounts
     }
 
     func updateAccountSettings(_ updates: [MailiaAccountSettingsUpdate]) async throws {}

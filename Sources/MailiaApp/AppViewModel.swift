@@ -352,6 +352,7 @@ final class AppViewModel: ObservableObject {
     private var partialRefreshSnapshotTask: Task<Void, Never>?
     private var partialRefreshSnapshotNeedsReload = false
     private var postSendFollowUpRefreshTasks: [UUID: Task<Void, Never>] = [:]
+    private var sendAccountsRefreshTask: Task<Void, Never>?
     private var timelineLoadTask: Task<Void, Never>?
     private var timelinePageTasks: [MailiaTimelinePageDirection: Task<Void, Never>] = [:]
     private var optimisticHiddenEntityIDs: Set<Int64> = []
@@ -384,6 +385,7 @@ final class AppViewModel: ObservableObject {
     deinit {
         reloadTask?.cancel()
         partialRefreshSnapshotTask?.cancel()
+        sendAccountsRefreshTask?.cancel()
         for task in postSendFollowUpRefreshTasks.values {
             task.cancel()
         }
@@ -419,6 +421,7 @@ final class AppViewModel: ObservableObject {
             refreshIfEmpty: true,
             refreshIfStaleAfter: startupRefreshStalenessThreshold
         )
+        refreshSendAccountsInBackground()
     }
 
     func refresh() async {
@@ -1184,6 +1187,7 @@ final class AppViewModel: ObservableObject {
             }
             var snapshot: MailiaSnapshot
             var finalStatusPrefix = statusPrefix
+            var publishedSnapshotBeforeRefresh = false
             if refresh {
                 snapshot = try await provider.refresh(
                     workspace: workspaceSnapshot,
@@ -1200,6 +1204,10 @@ final class AppViewModel: ObservableObject {
                     hasLocalEntities: !snapshot.entities.isEmpty
                 )
                 if shouldRefreshEmptySnapshot || shouldRefreshStaleSnapshot {
+                    if shouldRefreshStaleSnapshot {
+                        applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+                        publishedSnapshotBeforeRefresh = true
+                    }
                     refreshStatus = shouldRefreshEmptySnapshot
                         ? "No local mail. Fetching messages..."
                         : "Mail is stale. Refreshing..."
@@ -1214,7 +1222,7 @@ final class AppViewModel: ObservableObject {
 
             guard generation == requestGeneration else { return }
 
-            applySnapshot(snapshot, reloadTimelineIfSelectionKept: refresh)
+            applySnapshot(snapshot, reloadTimelineIfSelectionKept: refresh || publishedSnapshotBeforeRefresh)
             refreshStatus = "\(finalStatusPrefix) \(Self.statusFormatter.string(from: snapshot.loadedAt))"
         } catch is CancellationError {
             return
@@ -1257,6 +1265,23 @@ final class AppViewModel: ObservableObject {
             return false
         }
         return now().timeIntervalSince(lastRefreshFinishedAt) > stalenessThreshold
+    }
+
+    private func refreshSendAccountsInBackground() {
+        sendAccountsRefreshTask?.cancel()
+        sendAccountsRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let accounts = try await provider.loadSendAccounts()
+                guard !Task.isCancelled else { return }
+                applySendAccounts(accounts)
+            } catch is CancellationError {
+                return
+            } catch {
+                NSLog("Unable to refresh send accounts: \(error.localizedDescription)")
+            }
+            sendAccountsRefreshTask = nil
+        }
     }
 
     private func currentRefreshOptions() -> MailiaRefreshOptions {

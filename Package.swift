@@ -19,6 +19,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.4"),
         .package(url: "https://github.com/scinfu/SwiftSoup.git", from: "2.8.0"),
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0")
     ],
@@ -33,10 +34,22 @@ let package = Package(
         ),
         .executableTarget(
             name: "MailiaApp",
-            dependencies: ["MailiaCore"],
+            dependencies: [
+                "MailiaCore",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
+            exclude: [
+                "Info.plist"
+            ],
             resources: [
                 .process("Resources/AppIcon.icns"),
                 .copy("Resources/TimelineWeb")
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/MailiaApp/Info.plist",
+                ], .when(platforms: [.macOS]))
             ]
         ),
         .testTarget(

@@ -433,7 +433,7 @@ protocol TimelineWebAssetLocating {
 
 struct TimelineWebAssetLocator: TimelineWebAssetLocating {
     func timelineIndexURL() -> URL? {
-        Bundle.module.url(
+        MailiaAppResources.bundle.url(
             forResource: "index",
             withExtension: "html",
             subdirectory: "TimelineWeb"

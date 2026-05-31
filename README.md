@@ -32,7 +32,16 @@ Run the app from the package:
 swift run Mailia
 ```
 
+Build a local release DMG:
+
+```bash
+npm --prefix Web/Timeline ci
+MAILIA_ALLOW_ADHOC_SIGNING=1 scripts/build_release.sh
+```
+
 Current targets:
 
 - `MailiaCore`: shared models, Himalaya bridge, sync policy, database schema, grouping rules, and HTML sanitization.
 - `MailiaApp`: thin native SwiftUI macOS app shell.
+
+Sparkle update signing and GitHub release setup are documented in [SPARKLE.md](SPARKLE.md).

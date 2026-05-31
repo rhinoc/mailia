@@ -1,0 +1,9 @@
+<?xml version="1.0" standalone="yes"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Mailia Changelog</title>
+    <link>https://github.com/rhinoc/mailia</link>
+    <description>Mailia app updates</description>
+    <language>en</language>
+  </channel>
+</rss>

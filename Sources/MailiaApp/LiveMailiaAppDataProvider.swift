@@ -149,7 +149,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
     func loadSnapshot(workspace: MailiaWorkspace, searchQuery: String) async throws -> MailiaSnapshot {
         let entities = try repository.entityList(workspace: workspace.coreWorkspace)
-        let sendAccounts = try await loadSendAccounts()
+        let sendAccounts = try localSendAccounts()
         return MailiaSnapshot(
             entities: filterAndMap(entities, workspace: workspace, searchQuery: searchQuery),
             sendAccounts: sendAccounts,
@@ -256,6 +256,15 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         }
         let storedAccounts = try repository.accounts()
         return storedAccounts.map(MailiaSendAccount.init).sorted { lhs, rhs in
+            if lhs.isDefault != rhs.isDefault {
+                return lhs.isDefault
+            }
+            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+        }
+    }
+
+    private func localSendAccounts() throws -> [MailiaSendAccount] {
+        try repository.accounts().map(MailiaSendAccount.init).sorted { lhs, rhs in
             if lhs.isDefault != rhs.isDefault {
                 return lhs.isDefault
             }

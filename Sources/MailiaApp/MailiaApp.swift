@@ -1,5 +1,6 @@
 import MailiaCore
 import AppKit
+import Sparkle
 import SwiftUI
 
 enum MailiaPreferenceKeys {
@@ -114,6 +115,11 @@ private struct TimelineDisplayOptionsStorage: DynamicProperty {
 @MainActor
 final class MailiaApplication: NSObject, NSApplicationDelegate {
     private let viewModel = AppViewModel()
+    private let updaterController = SPUStandardUpdaterController(
+        startingUpdater: true,
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
     private static var delegateReference: MailiaApplication?
@@ -133,6 +139,9 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureApplicationIcon()
         buildMainMenu()
+        if updaterController.updater.automaticallyChecksForUpdates {
+            updaterController.updater.checkForUpdatesInBackground()
+        }
         showMainWindow()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -172,8 +181,12 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func checkForUpdates(_ sender: Any?) {
+        updaterController.checkForUpdates(sender)
+    }
+
     private func configureApplicationIcon() {
-        guard let iconURL = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+        guard let iconURL = MailiaAppResources.bundle.url(forResource: "AppIcon", withExtension: "icns"),
               let iconImage = NSImage(contentsOf: iconURL) else {
             return
         }
@@ -218,6 +231,14 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
                 keyEquivalent: ","
             )
         )
+        appMenu.addItem(.separator())
+        let updateItem = NSMenuItem(
+            title: "Check for Updates...",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = self
+        appMenu.addItem(updateItem)
         appMenu.addItem(.separator())
         appMenu.addItem(
             NSMenuItem(
