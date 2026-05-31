@@ -5,5 +5,16 @@
     <link>https://github.com/rhinoc/mailia</link>
     <description>Mailia app updates</description>
     <language>en</language>
+
+    <item>
+      <title>Version 0.0.1</title>
+      <sparkle:version>0.0.1</sparkle:version>
+      <pubDate>Sun, 31 May 2026 14:05:37 +0000</pubDate>
+      <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="https://github.com/rhinoc/mailia/releases/download/v0.0.1/Mailia-0.0.1-macos.dmg"
+        sparkle:edSignature="77xiXADDqKIcqvnf4Ym4BqEFYiE3auvgvhgl94e0QSTqAfsUEzMpV7b4R7R1ywZAaCMbc1ahTH3izEP+ld39Bg==" length="8539083"
+        type="application/octet-stream"/>
+    </item>
   </channel>
 </rss>
