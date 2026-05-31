@@ -2369,6 +2369,11 @@ private struct SettingsView: View {
                     )
                 }
 
+                Section("Privacy") {
+                    Toggle("Load remote images", isOn: $appearanceDraft.loadRemoteContent)
+                        .help("Allow message bodies to load remote image URLs.")
+                }
+
                 Section("Accounts") {
                     if viewModel.sendAccounts.isEmpty {
                         ContentUnavailableView {

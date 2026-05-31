@@ -22,6 +22,15 @@ a lightweight IM timeline.
 
 The product requirements live in [docs/requirements.md](docs/requirements.md).
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="./assets/showcase-main.png" width="380" alt="Mailia main timeline with a people-first inbox and message history" /></td>
+    <td align="center"><img src="./assets/showcase-info.png" width="380" alt="Mailia account and sender detail view for a selected conversation" /></td>
+  </tr>
+</table>
+
 ## Features
 
 - People-first inbox across configured Himalaya accounts.
