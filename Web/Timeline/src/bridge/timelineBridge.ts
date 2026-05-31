@@ -1,5 +1,10 @@
 import { devFixtures } from "../dev/fixtures";
-import type { TimelineEntity, TimelineMessage, TimelineState } from "../types";
+import { debugLog, debugLogEnabled } from "../debugLog";
+import type {
+  TimelineEntity,
+  TimelineMessage,
+  TimelineState
+} from "../types";
 
 export type TimelineInboundEvent =
   | { type: "state"; state: TimelineState }
@@ -29,6 +34,7 @@ export type TimelineOutboundEvent =
   | {
       type: "requestBody";
       messageID: TimelineMessage["messageID"];
+      bodyPriority?: number;
       accountKey: string;
       folderName?: string | null;
       himalayaEnvelopeID?: string | null;
@@ -84,12 +90,15 @@ interface NativeTimelineState {
   attachmentDownloadStates: Record<string, NativeAttachmentState>;
   scrollAnchor?: { id: number | string; edge: "top" | "bottom"; generation: number } | null;
   bodyDisplayMode?: string | null;
+  loadRemoteContent?: boolean | null;
+  showTimelineAvatars?: boolean | null;
 }
 
 interface NativeTimelineEntity {
   id: number | string;
   displayName: string;
   primaryEmailAddress?: string | null;
+  emailAddresses?: string[] | null;
   kind: string;
   unreadCount: number;
   latestSubject: string;
@@ -139,19 +148,15 @@ class NativeTimelineBridge implements TimelineBridge {
   ) {
     window.mailiaTimeline = {
       receive: (event) => {
+        if (debugLogEnabled) {
+          debugLog("native receive event", { type: event.type });
+        }
         this.emit(event);
       },
       receiveState: (state) => {
-        console.warn("[MailiaTimelineWebDebug] native receiveState", {
-          entityID: state.entity?.id ?? null,
-          entityName: state.entity?.displayName ?? null,
-          itemCount: state.items.length,
-          firstItemID: state.items[0]?.id ?? null,
-          lastItemID: state.items.at(-1)?.id ?? null,
-          loading: state.isLoadingTimeline,
-          anchor: state.scrollAnchor ?? null,
-          bodyStateCount: Object.keys(state.bodyStates).length
-        });
+        if (debugLogEnabled) {
+          debugLog("native receive state", nativeStateSummary(state));
+        }
         this.emit({ type: "state", state: adaptNativeState(state) });
       }
     };
@@ -165,6 +170,9 @@ class NativeTimelineBridge implements TimelineBridge {
   }
 
   send(event: TimelineOutboundEvent) {
+    if (debugLogEnabled) {
+      debugLog("web send event", outboundEventSummary(event));
+    }
     const envelope = toNativeEnvelope(event);
     if (envelope) {
       this.handler.postMessage(envelope);
@@ -178,6 +186,42 @@ class NativeTimelineBridge implements TimelineBridge {
   }
 }
 
+function nativeStateSummary(state: NativeTimelineState) {
+  return {
+    entityID: state.entity?.id ?? null,
+    items: state.items.length,
+    loading: state.isLoadingTimeline,
+    loadingOlder: state.isLoadingOlderTimeline,
+    hasOlder: state.hasOlderTimeline,
+    anchor: state.scrollAnchor ?? null,
+    bodyStates: bodyStateCounts(state.bodyStates),
+    mode: state.bodyDisplayMode ?? null,
+    remote: state.loadRemoteContent === true,
+    avatars: state.showTimelineAvatars !== false
+  };
+}
+
+function outboundEventSummary(event: TimelineOutboundEvent) {
+  switch (event.type) {
+    case "requestBody":
+      return { type: event.type, messageID: event.messageID, bodyPriority: event.bodyPriority ?? null };
+    case "requestOlderMessages":
+      return { type: event.type, entityID: event.entityID, beforeMessageID: event.beforeMessageID ?? null };
+    case "downloadAttachments":
+      return { type: event.type, messageID: event.messageID };
+    default:
+      return { type: event.type };
+  }
+}
+
+function bodyStateCounts(states: Record<string, NativeBodyState>) {
+  const counts: Record<string, number> = {};
+  for (const state of Object.values(states)) {
+    counts[state.status] = (counts[state.status] ?? 0) + 1;
+  }
+  return counts;
+}
+
 function toNativeEnvelope(event: TimelineOutboundEvent) {
   switch (event.type) {
     case "ready":
@@ -185,7 +229,10 @@ function toNativeEnvelope(event: TimelineOutboundEvent) {
     case "requestOlderMessages":
       return { type: "requestOlder" };
     case "requestBody":
-      return { type: "requestBody", payload: { messageID: event.messageID } };
+      return {
+        type: "requestBody",
+        payload: { messageID: event.messageID, bodyPriority: event.bodyPriority }
+      };
     case "downloadAttachments":
       return { type: "downloadAttachments", payload: { messageID: event.messageID } };
     case "selectEntity":
@@ -196,9 +243,10 @@ function toNativeEnvelope(event: TimelineOutboundEvent) {
 
 function adaptNativeState(nativeState: NativeTimelineState): TimelineState {
   const entity = nativeState.entity;
-  const selectedEntityID = entity ? String(entity.id) : null;
+  const workspace = normalizeWorkspace(entity?.workspace);
+  const selectedEntityID = entity ? `${workspace}:${entity.id}` : null;
   return {
-    workspace: normalizeWorkspace(entity?.workspace),
+    workspace,
     entities: entity
       ? [
           {
@@ -206,22 +254,35 @@ function adaptNativeState(nativeState: NativeTimelineState): TimelineState {
             name: entity.displayName,
             kind: normalizeEntityKind(entity.kind),
             primaryAddress: entity.primaryEmailAddress,
+            emailAddresses: entity.emailAddresses ?? [],
             detail: entity.latestSubject,
             messageCount: nativeState.items.length,
             unreadCount: entity.unreadCount,
             lastMessageAt: entity.latestDate ?? null,
-            sourceAccounts: [entity.accountLabel].filter(Boolean)
+            sourceAccounts: [entity.accountLabel].filter(Boolean),
+            avatarImageDataURL: entity.avatarImageDataURL ?? null
           }
         ]
       : [],
     selectedEntityID,
     messages: nativeState.items.map((item) => adaptNativeMessage(item, nativeState)),
     isLoading: nativeState.isLoadingTimeline,
+    isLoadingOlderMessages: nativeState.isLoadingOlderTimeline,
+    isLoadingNewerMessages: nativeState.isLoadingNewerTimeline,
     error: null,
     syncStatus: entity ? `${entity.displayName} · ${nativeState.items.length} messages` : null,
     hasOlderMessages: nativeState.hasOlderTimeline,
     anchoredToBottom: nativeState.scrollAnchor?.edge === "bottom",
+    scrollAnchor: nativeState.scrollAnchor
+      ? {
+          id: nativeState.scrollAnchor.id,
+          edge: nativeState.scrollAnchor.edge,
+          generation: nativeState.scrollAnchor.generation
+        }
+      : null,
     bodyDisplayMode: normalizeBodyDisplayMode(nativeState.bodyDisplayMode),
+    loadRemoteContent: nativeState.loadRemoteContent === true,
+    showTimelineAvatars: nativeState.showTimelineAvatars !== false,
     attachmentDownloadStates: nativeState.attachmentDownloadStates
   };
 }
@@ -268,7 +329,14 @@ function adaptNativeMessage(
 }
 
 function normalizeWorkspace(value?: string): TimelineState["workspace"] {
-  return value?.toLowerCase() === "junk" ? "junk" : "main";
+  switch (value?.toLowerCase()) {
+    case "junk":
+      return "junk";
+    case "flagged":
+      return "flagged";
+    default:
+      return "main";
+  }
 }
 
 function normalizeEntityKind(value: string): TimelineEntity["kind"] {
@@ -347,6 +415,8 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
       selectedEntityID: entityID,
       messages,
       isLoading: false,
+      isLoadingOlderMessages: false,
+      isLoadingNewerMessages: false,
       syncStatus: `${selected.messageCount} messages from ${selected.name}`,
       anchoredToBottom: true
     };
@@ -374,6 +444,7 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
     this.state = {
       ...this.state,
       messages: [...olderMessages, ...this.state.messages],
+      isLoadingOlderMessages: false,
       hasOlderMessages: this.state.messages.length < 180,
       anchoredToBottom: false
     };
@@ -414,6 +485,7 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
       this.emit({ type: "state", state: this.state });
     }, 700);
   }
+
 }
 
 function getInitialDevFixture() {

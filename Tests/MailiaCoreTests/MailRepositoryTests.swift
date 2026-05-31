@@ -51,7 +51,7 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
     #expect(messageIDs[0] != messageIDs[2])
 
     let mainEntities = try repository.entityList(workspace: .main)
-    #expect(mainEntities.map(\.displayName) == ["Github"])
+    #expect(mainEntities.map(\.displayName) == ["GitHub"])
 
     let mainEntity = try #require(mainEntities.first)
     #expect(mainEntity.primaryEmailAddress == "noreply@github.com")
@@ -84,7 +84,7 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
     let locations = try repository.messageLocations(entityID: mainEntity.id, workspace: .main, sourceRoles: [.normal])
     #expect(locations.map(\.sourceFolderName).sorted() == ["Archive", "INBOX"])
     let flaggedEntities = try repository.entityList(workspace: .flagged)
-    #expect(flaggedEntities.map(\.displayName) == ["Github"])
+    #expect(flaggedEntities.map(\.displayName) == ["GitHub"])
     let flaggedLocations = try repository.messageLocations(entityID: mainEntity.id, workspace: .flagged)
     #expect(flaggedLocations.map(\.sourceFolderName) == ["INBOX"])
     let flaggedMessages = try repository.messages(entityID: mainEntity.id, workspace: .flagged)
@@ -111,6 +111,56 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
 
     let junkEntities = try repository.entityList(workspace: .junk)
     #expect(junkEntities.map(\.latestSubject) == ["Suspicious"])
+}
+
+@Test
+func repositoryKeepsStableEntityWhenSenderDisplayNameChanges() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    let senderWithoutName = MailAddress(emailAddress: "notifications@github.com")
+    let senderWithName = MailAddress(displayName: "wxtsky", emailAddress: "notifications@github.com")
+    let messageDate = "2026-05-31T01:47:00Z"
+
+    let firstIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Build passed",
+            from: senderWithoutName,
+            messageDate: messageDate
+        )
+    ])
+    let firstEntities = try repository.entityList(workspace: .main)
+    #expect(firstEntities.count == 1)
+    #expect(firstEntities[0].displayName == "Github")
+
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Build passed",
+            from: senderWithName,
+            messageDate: messageDate
+        )
+    ])
+
+    let refreshedEntities = try repository.entityList(workspace: .main)
+    #expect(refreshedEntities.count == 1)
+    #expect(refreshedEntities[0].id == firstEntities[0].id)
+
+    let messages = try repository.messages(entityID: refreshedEntities[0].id, workspace: .main)
+    #expect(messages.count == 1)
+    #expect(messages[0].messageID == firstIDs[0])
 }
 
 @Test
@@ -201,4 +251,48 @@ func repositoryPagesTimelineWithKeysetAnchors() throws {
         afterMessageID: messageIDs[2]
     )
     #expect(newer.map(\.subject) == ["Message 4", "Message 5"])
+}
+
+@Test
+func accountEmojiPersistsAcrossUpsert() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "ryan@example.com", isDefault: true)
+    ])
+    try repository.updateAccountEmoji(accountKey: "work", emoji: "💼")
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "ryan@work.com", displayName: "Work", isDefault: true)
+    ])
+
+    let accounts = try repository.accounts()
+    #expect(accounts.count == 1)
+    #expect(accounts[0].emailAddress == "ryan@work.com")
+    #expect(accounts[0].isDefault == true)
+    #expect(accounts[0].emoji == "💼")
+}
+
+@Test
+func accountDefaultPersistsAsStructuredState() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", isDefault: true),
+        DiscoveredAccount(accountKey: "personal", isDefault: false)
+    ])
+
+    var accounts = try repository.accounts()
+    #expect(accounts.first { $0.accountKey == "work" }?.isDefault == true)
+    #expect(accounts.first { $0.accountKey == "personal" }?.isDefault == false)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", isDefault: false),
+        DiscoveredAccount(accountKey: "personal", isDefault: true)
+    ])
+
+    accounts = try repository.accounts()
+    #expect(accounts.first { $0.accountKey == "work" }?.isDefault == false)
+    #expect(accounts.first { $0.accountKey == "personal" }?.isDefault == true)
 }

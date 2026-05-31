@@ -23,23 +23,64 @@ public struct MailRepository {
                 try db.execute(
                     sql: """
                         INSERT INTO accounts (
-                            account_key, email_address, provider_hint, display_name, updated_at
+                            account_key, email_address, provider_hint, display_name, is_default, updated_at
                         )
-                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(account_key) DO UPDATE SET
                             email_address = excluded.email_address,
                             provider_hint = excluded.provider_hint,
                             display_name = excluded.display_name,
+                            is_default = excluded.is_default,
                             updated_at = CURRENT_TIMESTAMP
                         """,
                     arguments: [
                         account.accountKey.trimmed,
                         account.emailAddress?.nilIfBlank,
                         account.providerHint?.nilIfBlank,
-                        account.displayName?.nilIfBlank
+                        account.displayName?.nilIfBlank,
+                        account.isDefault
                     ]
                 )
             }
+        }
+    }
+
+    public func accounts() throws -> [DiscoveredAccount] {
+        try databaseQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT account_key, email_address, provider_hint, display_name, is_default, emoji
+                    FROM accounts
+                    ORDER BY account_key
+                    """
+            )
+            .map { row in
+                DiscoveredAccount(
+                    accountKey: row["account_key"],
+                    emailAddress: row["email_address"],
+                    providerHint: row["provider_hint"],
+                    displayName: row["display_name"],
+                    isDefault: row["is_default"],
+                    emoji: row["emoji"]
+                )
+            }
+        }
+    }
+
+    public func updateAccountEmoji(accountKey: String, emoji: String?) throws {
+        let trimmedKey = accountKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else { return }
+
+        try databaseQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE accounts
+                    SET emoji = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE account_key = ?
+                    """,
+                arguments: [emoji?.nilIfBlank, trimmedKey]
+            )
         }
     }
 
@@ -240,7 +281,13 @@ public struct MailRepository {
                 db,
                 sql: """
                     WITH workspace_messages AS (
-                        SELECT DISTINCT me.entity_id, m.id AS message_id
+                        SELECT DISTINCT
+                            me.entity_id,
+                            m.id AS message_id,
+                            CASE
+                                WHEN LOWER(COALESCE(ml.flags_json, '')) LIKE '%seen%' THEN 0
+                                ELSE 1
+                            END AS is_unread
                         FROM message_entities me
                         JOIN messages m ON m.id = me.message_id
                         JOIN message_locations ml ON ml.message_id = m.id
@@ -279,21 +326,32 @@ public struct MailRepository {
                             ) AS rank
                         FROM entity_senders es
                         JOIN senders s ON s.id = es.sender_id
+                    ),
+                    entity_email_addresses AS (
+                        SELECT
+                            es.entity_id,
+                            GROUP_CONCAT(DISTINCT s.email_address) AS email_addresses
+                        FROM entity_senders es
+                        JOIN senders s ON s.id = es.sender_id
+                        GROUP BY es.entity_id
                     )
                     SELECT
                         e.id AS entity_id,
                         e.display_name,
                         ps.email_address AS primary_email_address,
+                        eea.email_addresses,
                         e.kind,
                         latest.subject AS latest_subject,
                         COALESCE(latest.message_date, latest.created_at) AS latest_message_date,
                         COUNT(DISTINCT wm.message_id) AS message_count,
+                        COUNT(DISTINCT CASE WHEN wm.is_unread = 1 THEN wm.message_id END) AS unread_count,
                         GROUP_CONCAT(DISTINCT latest.account_key) AS account_keys
                     FROM workspace_messages wm
                     JOIN entities e ON e.id = wm.entity_id
                     JOIN latest_messages lm ON lm.entity_id = wm.entity_id
                     JOIN messages latest ON latest.id = lm.message_id
                     LEFT JOIN primary_senders ps ON ps.entity_id = e.id AND ps.rank = 1
+                    LEFT JOIN entity_email_addresses eea ON eea.entity_id = e.id
                     GROUP BY e.id
                     ORDER BY latest_message_date DESC, e.display_name COLLATE NOCASE
                     """,
@@ -305,10 +363,11 @@ public struct MailRepository {
                     id: row["entity_id"],
                     displayName: row["display_name"],
                     primaryEmailAddress: row["primary_email_address"],
+                    emailAddresses: splitCommaSeparatedValues(row["email_addresses"]),
                     latestSubject: row["latest_subject"],
                     latestDate: HimalayaDateParser.parse(row["latest_message_date"] as String?),
-                    unreadCount: 0,
-                    accountKeys: splitAccountKeys(row["account_keys"])
+                    unreadCount: row["unread_count"],
+                    accountKeys: splitCommaSeparatedValues(row["account_keys"])
                 )
             }
         }
@@ -492,12 +551,16 @@ public struct MailRepository {
     public func messageLocations(
         entityID: Int64,
         workspace: Workspace,
-        sourceRoles: [FolderRole]? = nil
+        sourceRoles: [FolderRole]? = nil,
+        onlyUnread: Bool = false
     ) throws -> [MessageLocationTarget] {
         try databaseQueue.read { db in
             let roles = sourceRoles ?? workspaceRoles(workspace)
             guard !roles.isEmpty else { return [] }
             let flagPredicate = workspaceFlagPredicate(alias: "ml", workspace: workspace)
+            let unreadPredicate = onlyUnread
+                ? "AND LOWER(COALESCE(ml.flags_json, '')) NOT LIKE '%seen%'"
+                : ""
 
             var arguments = StatementArguments(roles.map(\.rawValue))
             _ = arguments.append(contentsOf: StatementArguments([entityID]))
@@ -517,6 +580,7 @@ public struct MailRepository {
                     WHERE f.role IN (\(rolePlaceholders(count: roles.count)))
                       AND ml.missing_since_at IS NULL
                       \(flagPredicate)
+                      \(unreadPredicate)
                       AND me.entity_id = ?
                     ORDER BY ml.account_key, f.provider_name, ml.himalaya_envelope_id
                     """,
@@ -929,8 +993,17 @@ public struct MailRepository {
             guard let from = envelope.from else { return }
             let senderID = try upsertSender(db, address: from)
             let entityID = try upsertEntity(db, address: from, senderID: senderID, relationKind: .from)
-            try upsertMessageEntity(db, messageID: messageID, entityID: entityID, relationKind: .from)
+            try replaceMessageEntity(
+                db,
+                messageID: messageID,
+                entityID: entityID,
+                relationKind: .from
+            )
         case .outgoing:
+            try db.execute(
+                sql: "DELETE FROM message_entities WHERE message_id = ? AND relation_kind = ?",
+                arguments: [messageID, RelationKind.to.rawValue]
+            )
             for recipient in envelope.to {
                 let senderID = try upsertSender(db, address: recipient)
                 let entityID = try upsertEntity(db, address: recipient, senderID: senderID, relationKind: .to)
@@ -945,6 +1018,14 @@ public struct MailRepository {
         senderID: Int64,
         relationKind: RelationKind
     ) throws -> Int64 {
+        if let existingEntityID = try existingEntityID(
+            db,
+            senderID: senderID,
+            relationKind: relationKind
+        ) {
+            return existingEntityID
+        }
+
         let grouping = groupingRules.group(
             sender: SenderIdentity(displayName: address.displayName, email: address.emailAddress)
         )
@@ -976,6 +1057,37 @@ public struct MailRepository {
         )
 
         return entityID
+    }
+
+    private func existingEntityID(
+        _ db: Database,
+        senderID: Int64,
+        relationKind: RelationKind
+    ) throws -> Int64? {
+        try Int64.fetchOne(
+            db,
+            sql: """
+                SELECT entity_id
+                FROM entity_senders
+                WHERE sender_id = ? AND relation_kind = ?
+                ORDER BY entity_id ASC
+                LIMIT 1
+                """,
+            arguments: [senderID, relationKind.rawValue]
+        )
+    }
+
+    private func replaceMessageEntity(
+        _ db: Database,
+        messageID: Int64,
+        entityID: Int64,
+        relationKind: RelationKind
+    ) throws {
+        try db.execute(
+            sql: "DELETE FROM message_entities WHERE message_id = ? AND relation_kind = ?",
+            arguments: [messageID, relationKind.rawValue]
+        )
+        try upsertMessageEntity(db, messageID: messageID, entityID: entityID, relationKind: relationKind)
     }
 
     private func upsertMessageEntity(
@@ -1077,7 +1189,7 @@ public struct MailRepository {
         Array(repeating: "?", count: count).joined(separator: ", ")
     }
 
-    private func splitAccountKeys(_ value: String?) -> [String] {
+    private func splitCommaSeparatedValues(_ value: String?) -> [String] {
         guard let value else { return [] }
         return value.split(separator: ",").map(String.init)
     }

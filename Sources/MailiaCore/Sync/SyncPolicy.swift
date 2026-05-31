@@ -19,7 +19,7 @@ public struct SyncPolicy: Sendable, Equatable {
         incrementalPerFolderLimit: Int = 200,
         foregroundInterval: Duration = .minutes(10),
         maxConcurrentAccounts: Int = 2,
-        maxConcurrentFoldersPerAccount: Int = 1,
+        maxConcurrentFoldersPerAccount: Int = 2,
         maxConcurrentHimalayaProcesses: Int = 3
     ) {
         self.mainHistoryWindow = mainHistoryWindow

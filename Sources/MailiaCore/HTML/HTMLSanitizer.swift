@@ -13,13 +13,9 @@ public struct SanitizedHTML: Equatable {
 
 public struct HTMLSanitizer {
     private static let blockedTags = "script, iframe, video, audio, object, embed"
-    private static let transparentPixel = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+    private static let blockedImageLabel = "Remote image blocked"
 
-    private let allowsRemoteContent: Bool
-
-    public init(allowsRemoteContent: Bool = false) {
-        self.allowsRemoteContent = allowsRemoteContent
-    }
+    public init() {}
 
     public func sanitize(_ html: String) throws -> SanitizedHTML {
         let document = try SwiftSoup.parseBodyFragment(html)
@@ -39,11 +35,35 @@ public struct HTMLSanitizer {
                 }
 
                 if element.tagNameNormal() == "img" {
-                    let blockedImage = try sanitizeImage(element)
-                    remoteContentBlocked = remoteContentBlocked || blockedImage
+                    try sanitizeImage(element)
                 } else {
                     try sanitizeURLAttributes(on: element)
                 }
+            }
+
+            return SanitizedHTML(
+                content: try body.html(),
+                remoteContentBlocked: remoteContentBlocked
+            )
+        }
+
+        return SanitizedHTML(content: "", remoteContentBlocked: remoteContentBlocked)
+    }
+
+    public func blockRemoteImages(in html: String) throws -> SanitizedHTML {
+        let document = try SwiftSoup.parseBodyFragment(html)
+        var remoteContentBlocked = false
+
+        if let body = document.body() {
+            for image in try body.select("img").array() {
+                let src = try image.attr("src")
+                let srcset = try image.attr("srcset")
+                guard isRemoteImageURL(src) || srcsetContainsRemoteURL(srcset) else {
+                    continue
+                }
+
+                remoteContentBlocked = true
+                try replaceRemoteImageWithPlaceholder(image, in: document)
             }
 
             return SanitizedHTML(
@@ -140,50 +160,20 @@ public struct HTMLSanitizer {
         }
     }
 
-    private func sanitizeImage(_ image: Element) throws -> Bool {
+    private func sanitizeImage(_ image: Element) throws {
         let src = try image.attr("src")
         let srcset = try image.attr("srcset")
 
-        if allowsRemoteContent {
-            try sanitizeAllowedImage(image, src: src, srcset: srcset)
-            return false
-        }
-
-        let shouldBlock = isRemoteURL(src)
-            || src.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("//")
-            || srcsetContainsRemoteURL(srcset)
-            || classifyURL(src, allowsImageData: true) == .blocked
-
-        guard shouldBlock else {
-            if image.hasAttr("srcset") {
-                try image.removeAttr("srcset")
-            }
-            return false
-        }
-
-        try image.attr("src", Self.transparentPixel)
-        try image.removeAttr("srcset")
-        try image.attr("data-mailia-remote-content-blocked", "true")
-
-        if !image.hasAttr("alt") {
-            try image.attr("alt", "Remote image blocked")
-        }
-
-        try preserveImageBox(on: image)
-        return true
-    }
-
-    private func sanitizeAllowedImage(_ image: Element, src: String, srcset: String) throws {
         switch classifyURL(src, allowsImageData: true) {
         case .httpOrHTTPS, .relativeOrFragment:
-            if src.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("//") {
+            break
+        case .blocked:
+            if !src.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("//") {
                 try image.removeAttr("src")
             }
-        case .blocked:
-            try image.removeAttr("src")
         }
 
-        if image.hasAttr("srcset"), srcsetContainsBlockedURL(srcset) {
+        if image.hasAttr("srcset"), srcsetContainsUnsafeURL(srcset) {
             try image.removeAttr("srcset")
         }
 
@@ -212,6 +202,81 @@ public struct HTMLSanitizer {
                 .joined(separator: "; ")
             try image.attr("style", style)
         }
+    }
+
+    private func replaceRemoteImageWithPlaceholder(_ image: Element, in document: Document) throws {
+        let placeholder = try document.createElement("span")
+        try placeholder.addClass("mailia-remote-image-placeholder")
+        try placeholder.attr("role", "img")
+        try placeholder.attr("aria-label", Self.blockedImageLabel)
+        try placeholder.text(" ")
+
+        let style = try blockedImagePlaceholderStyle(for: image)
+        if !style.isEmpty {
+            try placeholder.attr("style", style)
+        }
+
+        if let imageOnlyLink = try imageOnlyLinkParent(for: image) {
+            try imageOnlyLink.replaceWith(placeholder)
+        } else {
+            try image.replaceWith(placeholder)
+        }
+    }
+
+    private func imageOnlyLinkParent(for image: Element) throws -> Element? {
+        guard let parent = image.parent(),
+              parent.tagNameNormal() == "a",
+              parent.parent() != nil else {
+            return nil
+        }
+
+        for child in parent.getChildNodes() {
+            if child === image {
+                continue
+            }
+
+            if let textNode = child as? TextNode,
+               textNode.getWholeText().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                continue
+            }
+
+            if child.nodeName() == "#comment" {
+                continue
+            }
+
+            return nil
+        }
+
+        return parent
+    }
+
+    private func blockedImagePlaceholderStyle(for image: Element) throws -> String {
+        let width = sanitizedDimension(try image.attr("width"))
+        let height = sanitizedDimension(try image.attr("height"))
+
+        var declarations = safeSizingDeclarations(from: try image.attr("style"))
+        if let width, declarations["width"] == nil {
+            declarations["width"] = width
+        }
+        if let height, declarations["height"] == nil {
+            declarations["height"] = height
+        }
+
+        declarations["display"] = "inline-flex"
+        if declarations["vertical-align"] == nil {
+            declarations["vertical-align"] = "middle"
+        }
+        if declarations["width"] == nil {
+            declarations["min-width"] = declarations["min-width"] ?? "120px"
+        }
+        if declarations["height"] == nil {
+            declarations["min-height"] = declarations["min-height"] ?? "32px"
+        }
+
+        return declarations
+            .map { "\($0.key): \($0.value)" }
+            .sorted()
+            .joined(separator: "; ")
     }
 
     private func safeSizingDeclarations(from style: String) -> [String: String] {
@@ -254,6 +319,7 @@ public struct HTMLSanitizer {
             && !lowercasedValue.contains("@import")
             && !lowercasedValue.contains("expression(")
             && !lowercasedValue.contains("behavior:")
+            && !lowercasedValue.contains("!important")
     }
 
     private func makeExternalSafeLink(_ link: Element) throws {
@@ -302,6 +368,11 @@ public struct HTMLSanitizer {
         }
     }
 
+    private func isRemoteImageURL(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("//") || isRemoteURL(trimmed)
+    }
+
     private func srcsetContainsRemoteURL(_ value: String) -> Bool {
         value
             .split(separator: ",")
@@ -310,11 +381,11 @@ public struct HTMLSanitizer {
                 guard let url = candidate.split(separator: " ").first else {
                     return false
                 }
-                return isRemoteURL(String(url)) || url.hasPrefix("//")
+                return isRemoteImageURL(String(url))
             }
     }
 
-    private func srcsetContainsBlockedURL(_ value: String) -> Bool {
+    private func srcsetContainsUnsafeURL(_ value: String) -> Bool {
         value
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -323,7 +394,7 @@ public struct HTMLSanitizer {
                     return false
                 }
                 let value = String(url)
-                return value.hasPrefix("//") || classifyURL(value, allowsImageData: true) == .blocked
+                return !value.hasPrefix("//") && classifyURL(value, allowsImageData: true) == .blocked
             }
     }
 

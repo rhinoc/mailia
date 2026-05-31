@@ -18,6 +18,8 @@ final class TimelineWebBridgeCoordinator: NSObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var pendingStateJSON: String?
+    private var lastStateJSON: String?
+    private var skippedDuplicateStatePushes = 0
     private var hasFinishedInitialLoad = false
 
     init(
@@ -40,6 +42,7 @@ final class TimelineWebBridgeCoordinator: NSObject {
 
         configureInspectableWebView()
         configureContextMenu()
+        configureWebViewBackground()
         configureScrollView()
         DispatchQueue.main.async { [weak self] in
             self?.configureScrollView()
@@ -54,6 +57,9 @@ final class TimelineWebBridgeCoordinator: NSObject {
 
     func load() {
         hasFinishedInitialLoad = false
+        pendingStateJSON = nil
+        lastStateJSON = nil
+        skippedDuplicateStatePushes = 0
 
         if let indexURL = assetLocator.timelineIndexURL() {
             webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
@@ -68,15 +74,30 @@ final class TimelineWebBridgeCoordinator: NSObject {
         guard let json = String(data: data, encoding: .utf8) else {
             throw TimelineWebBridgeError.unableToEncodeState
         }
-        pushStateJSON(json)
+        pushStateJSON(json, summary: Self.stateSummary(state))
     }
 
-    func pushStateJSON(_ json: String) {
+    func pushStateJSON(_ json: String, summary: String? = nil) {
+        guard json != lastStateJSON else {
+            skippedDuplicateStatePushes += 1
+            logDebug {
+                guard skippedDuplicateStatePushes == 1 || skippedDuplicateStatePushes.isMultiple(of: 50) else {
+                    return nil
+                }
+                return "skip duplicate native state count=\(skippedDuplicateStatePushes) \(summary ?? "")"
+            }
+            return
+        }
+        skippedDuplicateStatePushes = 0
+        lastStateJSON = json
+
         guard hasFinishedInitialLoad else {
             pendingStateJSON = json
+            logDebug { "queue native state before load \(summary ?? "")" }
             return
         }
 
+        logDebug { "push native state \(summary ?? "")" }
         evaluateReceiveState(json)
     }
 
@@ -135,9 +156,28 @@ final class TimelineWebBridgeCoordinator: NSObject {
         }
     }
 
+    private static func stateSummary(_ state: TimelineWebState) -> String {
+        let bodyCounts = Dictionary(grouping: state.bodyStates.values, by: { $0.debugStatus })
+            .mapValues(\.count)
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: ",")
+        let firstID = state.items.first?.id.description ?? "nil"
+        let lastID = state.items.last?.id.description ?? "nil"
+        let anchor: String
+        if let scrollAnchor = state.scrollAnchor {
+            anchor = "\(scrollAnchor.edge.rawValue):\(scrollAnchor.id)#\(scrollAnchor.generation)"
+        } else {
+            anchor = "nil"
+        }
+        return "entity=\(state.entity?.id.description ?? "nil") items=\(state.items.count) first=\(firstID) last=\(lastID) loading=\(state.isLoadingTimeline) older=\(state.hasOlderTimeline)/\(state.isLoadingOlderTimeline) anchor=\(anchor) bodies={\(bodyCounts)} mode=\(state.bodyDisplayMode) remote=\(state.loadRemoteContent)"
+    }
+
     private func configureInspectableWebView() {
+        #if DEBUG
         webView.isInspectable = true
         TimelineWebDebugMenuController.shared.setActiveWebView(webView)
+        #endif
     }
 
     private func configureContextMenu() {
@@ -145,10 +185,21 @@ final class TimelineWebBridgeCoordinator: NSObject {
         webView.contextMenuProvider = contextMenuProvider ?? { NSMenu() }
     }
 
+    private func configureWebViewBackground() {
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.underPageBackgroundColor = .textBackgroundColor
+        webView.wantsLayer = true
+        webView.layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
     private func configureScrollView() {
         guard let scrollView = firstScrollView(in: webView) else { return }
         scrollView.horizontalScrollElasticity = .none
         scrollView.verticalScrollElasticity = .none
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.contentView.drawsBackground = false
+        scrollView.contentView.backgroundColor = .clear
     }
 
     private func firstScrollView(in view: NSView) -> NSScrollView? {
@@ -165,10 +216,13 @@ final class TimelineWebBridgeCoordinator: NSObject {
 
     private static func makeConfiguration() -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
+        configuration.setValue(false, forKey: "drawsBackground")
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         configuration.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        #if DEBUG
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        #endif
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController = WKUserContentController()
         configuration.userContentController.addUserScript(
@@ -179,6 +233,13 @@ final class TimelineWebBridgeCoordinator: NSObject {
             )
         )
         return configuration
+    }
+
+    private func logDebug(_ message: () -> String?) {
+        #if DEBUG
+        guard let message = message() else { return }
+        NSLog("[MailiaTimelineWebDebug] \(message)")
+        #endif
     }
 
     private static let consoleBridgeScript = """
@@ -201,14 +262,9 @@ final class TimelineWebBridgeCoordinator: NSObject {
         } catch (_) {}
       };
       const originalError = console.error;
-      const originalWarn = console.warn;
       console.error = function() {
         post('error', arguments);
         return originalError.apply(this, arguments);
-      };
-      console.warn = function() {
-        post('warn', arguments);
-        return originalWarn.apply(this, arguments);
       };
       window.addEventListener('error', (event) => {
         post('error', [event.message, event.filename, event.lineno, event.colno]);
@@ -517,6 +573,21 @@ enum TimelineWebBridgeError: Error, LocalizedError, Equatable {
             "Timeline web JavaScript evaluation failed: \(message)"
         case .navigationFailed(let message):
             "Timeline web navigation failed: \(message)"
+        }
+    }
+}
+
+private extension TimelineWebState.BodyState {
+    var debugStatus: String {
+        switch self {
+        case .notRequested:
+            "notRequested"
+        case .loading:
+            "loading"
+        case .loaded:
+            "loaded"
+        case .failed:
+            "failed"
         }
     }
 }

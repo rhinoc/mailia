@@ -3,6 +3,11 @@ import Testing
 @testable import MailiaCore
 
 @Test
+func syncPolicyDefaultsAllowTwoFoldersPerAccount() {
+    #expect(SyncPolicy().maxConcurrentFoldersPerAccount == 2)
+}
+
+@Test
 func syncServiceDiscoversAndSyncsBoundedEnvelopesWithFakeBridge() async throws {
     let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
     let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
@@ -45,6 +50,7 @@ func syncServiceDiscoversAndSyncsBoundedEnvelopesWithFakeBridge() async throws {
 
     let accounts = try await service.discoverAccounts()
     #expect(accounts.map(\.accountKey) == ["work"])
+    #expect(accounts.map(\.isDefault) == [true])
 
     let folders = try await service.discoverFolders(accountKey: "work")
     #expect(folders.map(\.role) == [.normal, .junk])
@@ -54,7 +60,7 @@ func syncServiceDiscoversAndSyncsBoundedEnvelopesWithFakeBridge() async throws {
 
     let repository = MailRepository(databaseQueue: databaseQueue)
     let entities = try repository.entityList(workspace: .main)
-    #expect(entities.map(\.displayName) == ["Github"])
+    #expect(entities.map(\.displayName) == ["GitHub"])
 
     let commands = await fakeBridge.commands()
     #expect(commands.map(\.arguments).contains(

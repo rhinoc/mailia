@@ -34,6 +34,16 @@ func databaseMigrationCreatesCoreTables() throws {
 func databaseMigrationCreatesKeyColumns() throws {
     let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
 
+    let accountColumns = try DatabaseSchemaInspector.columnNames(in: "accounts", databaseQueue: databaseQueue)
+    #expect(accountColumns.isSuperset(of: [
+        "account_key",
+        "email_address",
+        "provider_hint",
+        "display_name",
+        "is_default",
+        "emoji"
+    ]))
+
     let messageColumns = try DatabaseSchemaInspector.columnNames(in: "messages", databaseQueue: databaseQueue)
     #expect(messageColumns.isSuperset(of: [
         "account_key",

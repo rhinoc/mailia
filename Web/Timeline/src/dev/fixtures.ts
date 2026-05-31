@@ -147,11 +147,15 @@ export const devFixtures: DevFixture[] = [
       workspace: "main",
       selectedEntityID: "github",
       isLoading: false,
+      isLoadingOlderMessages: false,
+      isLoadingNewerMessages: false,
       error: null,
       syncStatus: "Fixture data loaded",
       hasOlderMessages: true,
       anchoredToBottom: true,
       bodyDisplayMode: "html",
+      loadRemoteContent: false,
+      showTimelineAvatars: true,
       entities: [
         {
           id: "github",
@@ -201,11 +205,15 @@ export const devFixtures: DevFixture[] = [
       workspace: "junk",
       selectedEntityID: "maya",
       isLoading: false,
+      isLoadingOlderMessages: false,
+      isLoadingNewerMessages: false,
       error: null,
       syncStatus: "Junk fixture data loaded",
       hasOlderMessages: false,
       anchoredToBottom: true,
       bodyDisplayMode: "html",
+      loadRemoteContent: false,
+      showTimelineAvatars: true,
       entities: [
         {
           id: "maya",

@@ -28,12 +28,41 @@ public struct EntityGroupingRules: Sendable {
         "googlemail.com",
         "outlook.com",
         "hotmail.com",
+        "live.com",
         "icloud.com",
         "me.com",
         "mac.com",
+        "mail.com",
         "yahoo.com",
+        "aol.com",
+        "fastmail.com",
         "proton.me",
-        "protonmail.com"
+        "protonmail.com",
+        "qq.com",
+        "foxmail.com",
+        "163.com",
+        "126.com",
+        "yeah.net",
+        "sina.com",
+        "sohu.com"
+    ]
+
+    private let compoundPublicSuffixes: Set<String> = [
+        "com.cn",
+        "net.cn",
+        "org.cn",
+        "edu.cn",
+        "gov.cn",
+        "co.uk",
+        "com.au",
+        "net.au",
+        "co.jp",
+        "ne.jp",
+        "co.kr",
+        "com.br",
+        "com.sg",
+        "com.hk",
+        "com.tw"
     ]
 
     public init() {}
@@ -51,40 +80,25 @@ public struct EntityGroupingRules: Sendable {
 
         let localPart = stripPlusAddress(parts[0])
         let domain = parts[1]
+        let rootDomain = registrableDomain(domain)
 
-        if isServiceLocalPart(localPart), !consumerDomains.contains(domain) {
+        if !consumerDomains.contains(rootDomain) {
             return EntityGroupingResult(
-                canonicalKey: "domain:\(domain)",
-                displayName: displayName(forDomain: domain),
-                source: "service-domain-rule"
+                canonicalKey: "domain:\(rootDomain)",
+                displayName: sender.displayName?.nilIfBlank ?? displayName(forDomain: rootDomain),
+                source: "organization-domain-rule"
             )
         }
 
         return EntityGroupingResult(
             canonicalKey: "sender:\(localPart)@\(domain)",
             displayName: sender.displayName?.nilIfBlank ?? "\(localPart)@\(domain)",
-            source: "sender-rule"
+            source: "consumer-sender-rule"
         )
     }
 
     private func stripPlusAddress(_ localPart: String) -> String {
         localPart.split(separator: "+", maxSplits: 1).first.map(String.init) ?? localPart
-    }
-
-    private func isServiceLocalPart(_ localPart: String) -> Bool {
-        [
-            "noreply",
-            "no-reply",
-            "notifications",
-            "notification",
-            "support",
-            "security",
-            "billing",
-            "hello",
-            "newsletter",
-            "updates",
-            "team"
-        ].contains(localPart)
     }
 
     private func displayName(forDomain domain: String) -> String {
@@ -93,6 +107,16 @@ public struct EntityGroupingRules: Sendable {
             .first
             .map { String($0).capitalized }
             ?? domain
+    }
+
+    private func registrableDomain(_ domain: String) -> String {
+        let labels = domain.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return domain }
+        let suffix = labels.suffix(2).joined(separator: ".")
+        if compoundPublicSuffixes.contains(suffix), labels.count >= 3 {
+            return labels.suffix(3).joined(separator: ".")
+        }
+        return labels.suffix(2).joined(separator: ".")
     }
 }
 

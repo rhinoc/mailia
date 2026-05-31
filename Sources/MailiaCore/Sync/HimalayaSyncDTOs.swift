@@ -43,10 +43,16 @@ public struct DynamicCodingKey: CodingKey {
 
 public extension HimalayaAccountDTO {
     var discoveredAccount: DiscoveredAccount {
+        discoveredAccount(metadata: nil)
+    }
+
+    func discoveredAccount(metadata: HimalayaConfigAccountMetadata?) -> DiscoveredAccount {
         DiscoveredAccount(
             accountKey: name,
+            emailAddress: metadata?.emailAddress,
             providerHint: backend,
-            displayName: isDefault ? "\(name) (default)" : name
+            displayName: metadata?.displayName,
+            isDefault: metadata?.isDefault ?? isDefault
         )
     }
 }

@@ -4,12 +4,14 @@ import WebKit
 struct TimelineWebView: NSViewRepresentable {
     let state: TimelineWebState
     let items: [MailiaTimelineItem]
-    let entity: MailiaEntitySummary
-    let onRequestBody: (MailiaTimelineItem) -> Void
+    let entity: MailiaEntitySummary?
+    let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
     let onRequestNewer: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
+    let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
+    let onSelectSendAccount: (String) -> Void
     let onEntityAction: (MailiaEntityAction, MailiaEntitySummary) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -37,11 +39,13 @@ struct TimelineWebView: NSViewRepresentable {
         private var itemsByID: [Int64: MailiaTimelineItem] = [:]
         private var entity: MailiaEntitySummary?
         private var state: TimelineWebState?
-        private var onRequestBody: ((MailiaTimelineItem) -> Void)?
+        private var onRequestBody: ((MailiaTimelineItem, Int?) -> Void)?
         private var onRequestOlder: (() -> Void)?
         private var onRequestNewer: (() -> Void)?
         private var onSetMessageFlag: ((MailiaTimelineItem, Bool) -> Void)?
         private var onDownloadAttachments: ((MailiaTimelineItem) -> Void)?
+        private var onSendReply: ((MailiaTimelineItem, String, Bool, String?) -> Void)?
+        private var onSelectSendAccount: ((String) -> Void)?
         private var onEntityAction: ((MailiaEntityAction, MailiaEntitySummary) -> Void)?
 
         func apply(view: TimelineWebView) {
@@ -53,6 +57,8 @@ struct TimelineWebView: NSViewRepresentable {
             onRequestNewer = view.onRequestNewer
             onSetMessageFlag = view.onSetMessageFlag
             onDownloadAttachments = view.onDownloadAttachments
+            onSendReply = view.onSendReply
+            onSelectSendAccount = view.onSelectSendAccount
             onEntityAction = view.onEntityAction
 
             bridge.onEvent = { [weak self] event in
@@ -83,9 +89,14 @@ struct TimelineWebView: NSViewRepresentable {
                 onRequestOlder?()
             case .requestNewer:
                 onRequestNewer?()
-            case .requestBody(let messageID):
+            case .requestBody(let messageID, let priority):
                 guard let item = itemsByID[messageID] else { return }
-                onRequestBody?(item)
+                onRequestBody?(item, priority)
+            case .sendReply(let messageID, let body, let replyAll, let accountKey):
+                guard let item = itemsByID[messageID] else { return }
+                onSendReply?(item, body, replyAll, accountKey)
+            case .selectSendAccount(let accountKey):
+                onSelectSendAccount?(accountKey)
             case .setMessageFlag(let messageID, let isFlagged):
                 guard let item = itemsByID[messageID] else { return }
                 onSetMessageFlag?(item, isFlagged)

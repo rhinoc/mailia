@@ -5,17 +5,23 @@ public struct DiscoveredAccount: Equatable, Sendable {
     public var emailAddress: String?
     public var providerHint: String?
     public var displayName: String?
+    public var isDefault: Bool
+    public var emoji: String?
 
     public init(
         accountKey: String,
         emailAddress: String? = nil,
         providerHint: String? = nil,
-        displayName: String? = nil
+        displayName: String? = nil,
+        isDefault: Bool = false,
+        emoji: String? = nil
     ) {
         self.accountKey = accountKey
         self.emailAddress = emailAddress
         self.providerHint = providerHint
         self.displayName = displayName
+        self.isDefault = isDefault
+        self.emoji = emoji
     }
 }
 

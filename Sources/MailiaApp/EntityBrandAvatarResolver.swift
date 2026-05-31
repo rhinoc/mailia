@@ -9,8 +9,11 @@ actor EntityBrandAvatarResolver {
         var packageVersion: String = "16.21.0"
     }
 
+    private static let composeDraftIcon = SimpleIcon(slug: "maildotru", color: "005FF9")
+    private static let missingCacheTTL: TimeInterval = 600
+
     private enum CacheEntry {
-        case missing
+        case missing(Date)
         case dataURL(String)
     }
 
@@ -61,13 +64,121 @@ actor EntityBrandAvatarResolver {
         return await avatarDataURL(forDomain: domain)
     }
 
+    func avatarDataURL(
+        primaryEmailAddress: String?,
+        emailAddresses: [String],
+        debugLabel: String? = nil,
+        forceRefresh: Bool = false
+    ) async -> String? {
+        let normalizedAddresses = Self.uniqueValues(
+            [primaryEmailAddress].compactMap { $0 } + emailAddresses
+        )
+        let addressDomains = normalizedAddresses.compactMap { address -> (address: String, domain: String)? in
+            guard let normalizedAddress = Self.normalizedEmailAddress(address),
+                  let domain = Self.domain(fromEmailAddress: normalizedAddress)
+            else {
+                return nil
+            }
+            return (normalizedAddress, domain)
+        }
+        guard !addressDomains.isEmpty else {
+            Self.debugLog(debugLabel, "no usable email domain primary=\(primaryEmailAddress ?? "nil") emails=\(emailAddresses)")
+            return nil
+        }
+
+        let organizationDomains = Self.uniqueValues(
+            addressDomains
+                .map(\.domain)
+                .filter { !Self.isPersonalMailboxDomain($0) }
+                .flatMap { domain in
+                    let rootDomain = Self.registrableDomain(domain)
+                    return rootDomain == domain ? [rootDomain] : [rootDomain, domain]
+                }
+        )
+        Self.debugLog(
+            debugLabel,
+            "addresses=\(addressDomains.map(\.address)) orgDomains=\(organizationDomains)"
+        )
+        for domain in organizationDomains {
+            if let dataURL = await avatarDataURL(
+                forDomain: domain,
+                debugLabel: debugLabel,
+                forceRefresh: forceRefresh
+            ) {
+                Self.debugLog(debugLabel, "resolved domain=\(domain) length=\(dataURL.count)")
+                return dataURL
+            }
+            Self.debugLog(debugLabel, "domain failed domain=\(domain)")
+        }
+
+        for addressDomain in addressDomains where Self.isPersonalMailboxDomain(addressDomain.domain) {
+            if let dataURL = await gravatarDataURL(forEmailAddress: addressDomain.address) {
+                Self.debugLog(debugLabel, "resolved gravatar address=\(addressDomain.address) length=\(dataURL.count)")
+                return dataURL
+            }
+            Self.debugLog(debugLabel, "gravatar failed address=\(addressDomain.address)")
+        }
+
+        Self.debugLog(debugLabel, "no avatar resolved")
+        return nil
+    }
+
+    func cachedAvatarDataURL(
+        primaryEmailAddress: String?,
+        emailAddresses: [String]
+    ) -> String? {
+        let normalizedAddresses = Self.uniqueValues(
+            [primaryEmailAddress].compactMap { $0 } + emailAddresses
+        )
+        let addressDomains = normalizedAddresses.compactMap { address -> (address: String, domain: String)? in
+            guard let normalizedAddress = Self.normalizedEmailAddress(address),
+                  let domain = Self.domain(fromEmailAddress: normalizedAddress)
+            else {
+                return nil
+            }
+            return (normalizedAddress, domain)
+        }
+
+        let organizationDomains = Self.uniqueValues(
+            addressDomains
+                .map(\.domain)
+                .filter { !Self.isPersonalMailboxDomain($0) }
+                .flatMap { domain in
+                    let rootDomain = Self.registrableDomain(domain)
+                    return rootDomain == domain ? [rootDomain] : [rootDomain, domain]
+                }
+        )
+        for domain in organizationDomains {
+            if let dataURL = cachedDataURL(forCacheKey: domain) {
+                return dataURL
+            }
+        }
+
+        for addressDomain in addressDomains where Self.isPersonalMailboxDomain(addressDomain.domain) {
+            let cacheKey = "gravatar-\(Self.gravatarHash(forEmailAddress: addressDomain.address))"
+            if let dataURL = cachedDataURL(forCacheKey: cacheKey) {
+                return dataURL
+            }
+        }
+
+        return nil
+    }
+
+    func composeDraftAvatarDataURL() async -> String? {
+        await simpleIconAvatarDataURL(icon: Self.composeDraftIcon, cacheKey: "compose-draft-maildotru")
+    }
+
     private func gravatarDataURL(forEmailAddress emailAddress: String) async -> String? {
         let hash = Self.gravatarHash(forEmailAddress: emailAddress)
         let cacheKey = "gravatar-\(hash)"
 
         if let cached = cache[cacheKey] {
             switch cached {
-            case .missing:
+            case .missing(let cachedAt):
+                guard Self.isMissingCacheValid(cachedAt) else {
+                    cache[cacheKey] = nil
+                    break
+                }
                 return nil
             case .dataURL(let dataURL):
                 return dataURL
@@ -87,61 +198,102 @@ actor EntityBrandAvatarResolver {
         inFlightTasks[cacheKey] = task
         let dataURL = await task.value
         inFlightTasks[cacheKey] = nil
-        cache[cacheKey] = dataURL.map(CacheEntry.dataURL) ?? .missing
+        cache[cacheKey] = Self.cacheEntry(for: dataURL)
         if let dataURL {
             writeDiskCache(dataURL: dataURL, forCacheKey: cacheKey)
         }
         return dataURL
     }
 
-    private func avatarDataURL(forDomain domain: String) async -> String? {
+    private func avatarDataURL(
+        forDomain domain: String,
+        debugLabel: String? = nil,
+        forceRefresh: Bool = false
+    ) async -> String? {
         if let cached = cache[domain] {
             switch cached {
-            case .missing:
-                return nil
+            case .missing(let cachedAt):
+                if !forceRefresh, Self.isMissingCacheValid(cachedAt) {
+                    Self.debugLog(debugLabel, "memory missing domain=\(domain)")
+                    return nil
+                }
+                cache[domain] = nil
             case .dataURL(let dataURL):
+                Self.debugLog(debugLabel, "memory hit domain=\(domain) length=\(dataURL.count)")
                 return dataURL
             }
         }
         if let diskCached = diskCachedDataURL(forDomain: domain) {
             cache[domain] = .dataURL(diskCached)
+            Self.debugLog(debugLabel, "disk hit domain=\(domain) length=\(diskCached.count)")
             return diskCached
         }
-        if let inFlightTask = inFlightTasks[domain] {
+        if !forceRefresh, let inFlightTask = inFlightTasks[domain] {
+            Self.debugLog(debugLabel, "join in-flight domain=\(domain)")
             return await inFlightTask.value
         }
 
+        Self.debugLog(debugLabel, "resolve domain=\(domain) forceRefresh=\(forceRefresh)")
+        if forceRefresh {
+            let dataURL = await resolveAvatarDataURL(
+                forDomain: domain,
+                debugLabel: debugLabel,
+                forceRefresh: true
+            )
+            cache[domain] = Self.cacheEntry(for: dataURL)
+            if let dataURL {
+                writeDiskCache(dataURL: dataURL, forDomain: domain, debugLabel: debugLabel)
+            }
+            return dataURL
+        }
+
         let task = Task { [weak self] in
-            await self?.resolveAvatarDataURL(forDomain: domain)
+            await self?.resolveAvatarDataURL(
+                forDomain: domain,
+                debugLabel: debugLabel,
+                forceRefresh: forceRefresh
+            )
         }
         inFlightTasks[domain] = task
         let dataURL = await task.value
         inFlightTasks[domain] = nil
-        cache[domain] = dataURL.map(CacheEntry.dataURL) ?? .missing
+        cache[domain] = Self.cacheEntry(for: dataURL)
         if let dataURL {
-            writeDiskCache(dataURL: dataURL, forDomain: domain)
+            writeDiskCache(dataURL: dataURL, forDomain: domain, debugLabel: debugLabel)
         }
         return dataURL
     }
 
-    private func resolveAvatarDataURL(forDomain domain: String) async -> String? {
-        if let simpleIcon = await simpleIconDataURL(forDomain: domain) {
-            NSLog("[MailiaAvatar] resolved Simple Icons avatar domain=\(domain)")
+    private func resolveAvatarDataURL(
+        forDomain domain: String,
+        debugLabel: String? = nil,
+        forceRefresh: Bool = false
+    ) async -> String? {
+        if let simpleIcon = await simpleIconDataURL(
+            forDomain: domain,
+            debugLabel: debugLabel,
+            forceRefresh: forceRefresh
+        ) {
+            Self.debugLog(debugLabel, "simple icon ok domain=\(domain)")
             return simpleIcon
         }
+        Self.debugLog(debugLabel, "simple icon miss domain=\(domain)")
 
         if let bimiURL = await bimiLogoURL(forDomain: domain),
            let dataURL = await imageDataURL(from: bimiURL) {
-            NSLog("[MailiaAvatar] resolved BIMI avatar domain=\(domain) url=\(bimiURL.absoluteString)")
+            Self.debugLog(debugLabel, "bimi ok domain=\(domain) url=\(bimiURL.absoluteString)")
             return dataURL
         }
+        Self.debugLog(debugLabel, "bimi miss domain=\(domain)")
 
         let candidates = await faviconCandidates(forDomain: domain)
+        Self.debugLog(debugLabel, "favicon candidates domain=\(domain) count=\(candidates.count)")
         for candidate in candidates {
             if let dataURL = await imageDataURL(from: candidate) {
-                NSLog("[MailiaAvatar] resolved favicon avatar domain=\(domain) url=\(candidate.absoluteString)")
+                Self.debugLog(debugLabel, "favicon ok domain=\(domain) url=\(candidate.absoluteString)")
                 return dataURL
             }
+            Self.debugLog(debugLabel, "favicon miss url=\(candidate.absoluteString)")
         }
 
         return nil
@@ -157,18 +309,91 @@ actor EntityBrandAvatarResolver {
         guard let url = components?.url else { return nil }
 
         if let dataURL = await imageDataURL(from: url) {
-            NSLog("[MailiaAvatar] resolved Gravatar avatar hash=\(hash.prefix(8))")
             return dataURL
         }
         return nil
     }
 
-    private func simpleIconDataURL(forDomain domain: String) async -> String? {
-        guard let icon = Self.simpleIcon(forDomain: domain),
-              let url = URL(string: "https://cdn.jsdelivr.net/npm/simple-icons@\(icon.packageVersion)/icons/\(icon.slug).svg")
-        else {
+    private func simpleIconDataURL(
+        forDomain domain: String,
+        debugLabel: String? = nil,
+        forceRefresh: Bool = false
+    ) async -> String? {
+        guard let icon = Self.simpleIcon(forDomain: domain) else {
+            Self.debugLog(debugLabel, "simple icon mapping miss domain=\(domain)")
             return nil
         }
+        Self.debugLog(
+            debugLabel,
+            "simple icon mapping domain=\(domain) slug=\(icon.slug) version=\(icon.packageVersion)"
+        )
+        return await simpleIconAvatarDataURL(
+            icon: icon,
+            cacheKey: domain,
+            debugLabel: debugLabel,
+            forceRefresh: forceRefresh
+        )
+    }
+
+    private func simpleIconAvatarDataURL(
+        icon: SimpleIcon,
+        cacheKey: String,
+        debugLabel: String? = nil,
+        forceRefresh: Bool = false
+    ) async -> String? {
+        if let cached = cache[cacheKey] {
+            switch cached {
+            case .missing(let cachedAt):
+                if !forceRefresh, Self.isMissingCacheValid(cachedAt) {
+                    Self.debugLog(debugLabel, "simple icon memory missing key=\(cacheKey)")
+                    return nil
+                }
+                cache[cacheKey] = nil
+            case .dataURL(let dataURL):
+                Self.debugLog(debugLabel, "simple icon memory hit key=\(cacheKey) length=\(dataURL.count)")
+                return dataURL
+            }
+        }
+        if let diskCached = diskCachedDataURL(forCacheKey: cacheKey) {
+            cache[cacheKey] = .dataURL(diskCached)
+            Self.debugLog(debugLabel, "simple icon disk hit key=\(cacheKey) length=\(diskCached.count)")
+            return diskCached
+        }
+        if !forceRefresh, let inFlightTask = inFlightTasks[cacheKey] {
+            Self.debugLog(debugLabel, "simple icon join in-flight key=\(cacheKey)")
+            return await inFlightTask.value
+        }
+
+        Self.debugLog(debugLabel, "simple icon resolve key=\(cacheKey) forceRefresh=\(forceRefresh)")
+        if forceRefresh {
+            let dataURL = await resolveSimpleIconAvatarDataURL(icon: icon, debugLabel: debugLabel)
+            cache[cacheKey] = Self.cacheEntry(for: dataURL)
+            if let dataURL {
+                writeDiskCache(dataURL: dataURL, forCacheKey: cacheKey, debugLabel: debugLabel)
+            }
+            return dataURL
+        }
+
+        let task = Task { [weak self] in
+            await self?.resolveSimpleIconAvatarDataURL(icon: icon, debugLabel: debugLabel)
+        }
+        inFlightTasks[cacheKey] = task
+        let dataURL = await task.value
+        inFlightTasks[cacheKey] = nil
+        cache[cacheKey] = Self.cacheEntry(for: dataURL)
+        if let dataURL {
+            writeDiskCache(dataURL: dataURL, forCacheKey: cacheKey, debugLabel: debugLabel)
+        }
+        return dataURL
+    }
+
+    private func resolveSimpleIconAvatarDataURL(icon: SimpleIcon, debugLabel: String? = nil) async -> String? {
+        guard let url = URL(string: "https://cdn.jsdelivr.net/npm/simple-icons@\(icon.packageVersion)/icons/\(icon.slug).svg")
+        else {
+            Self.debugLog(debugLabel, "simple icon invalid url slug=\(icon.slug)")
+            return nil
+        }
+        Self.debugLog(debugLabel, "simple icon fetch url=\(url.absoluteString)")
 
         var request = URLRequest(url: url)
         request.setValue("Mailia/1.0", forHTTPHeaderField: "User-Agent")
@@ -176,16 +401,31 @@ actor EntityBrandAvatarResolver {
 
         do {
             let (data, response) = try await session.data(for: request)
-            guard Self.isSuccessfulHTTPResponse(response),
-                  data.count <= 200_000,
-                  let svg = String(data: data, encoding: .utf8),
-                  let avatarSVGData = Self.simpleIconAvatarSVGData(svg: svg, color: icon.color)
-            else {
+            guard Self.isSuccessfulHTTPResponse(response) else {
+                Self.debugLog(debugLabel, "simple icon http failed status=\(Self.httpStatusCode(response))")
+                return nil
+            }
+            guard data.count <= 200_000 else {
+                Self.debugLog(debugLabel, "simple icon too large bytes=\(data.count)")
+                return nil
+            }
+            guard let svg = String(data: data, encoding: .utf8) else {
+                Self.debugLog(debugLabel, "simple icon svg decode failed bytes=\(data.count)")
+                return nil
+            }
+            guard let avatarSVGData = Self.simpleIconAvatarSVGData(svg: svg, color: icon.color) else {
+                Self.debugLog(debugLabel, "simple icon svg wrap failed slug=\(icon.slug)")
+                return nil
+            }
+            guard let dataURL = await Self.normalizedImageDataURL(data: avatarSVGData, mimeType: "image/svg+xml") else {
+                Self.debugLog(debugLabel, "simple icon rasterize failed slug=\(icon.slug)")
                 return nil
             }
 
-            return await Self.normalizedImageDataURL(data: avatarSVGData, mimeType: "image/svg+xml")
+            Self.debugLog(debugLabel, "simple icon rasterize ok slug=\(icon.slug) length=\(dataURL.count)")
+            return dataURL
         } catch {
+            Self.debugLog(debugLabel, "simple icon fetch error slug=\(icon.slug) error=\(error.localizedDescription)")
             return nil
         }
     }
@@ -212,9 +452,7 @@ actor EntityBrandAvatarResolver {
                     return logoURL
                 }
             }
-        } catch {
-            NSLog("[MailiaAvatar] BIMI lookup failed domain=\(domain) error=\(error.localizedDescription)")
-        }
+        } catch {}
 
         return nil
     }
@@ -289,13 +527,34 @@ actor EntityBrandAvatarResolver {
         return "data:image/png;base64,\(data.base64EncodedString())"
     }
 
-    private func writeDiskCache(dataURL: String, forDomain domain: String) {
-        writeDiskCache(dataURL: dataURL, forCacheKey: domain)
+    private func cachedDataURL(forCacheKey cacheKey: String) -> String? {
+        if let cached = cache[cacheKey],
+           case .dataURL(let dataURL) = cached {
+            return dataURL
+        }
+        if let diskCached = diskCachedDataURL(forCacheKey: cacheKey) {
+            cache[cacheKey] = .dataURL(diskCached)
+            return diskCached
+        }
+        return nil
     }
 
-    private func writeDiskCache(dataURL: String, forCacheKey cacheKey: String) {
-        guard let data = Self.imageData(fromDataURL: dataURL) else { return }
-        try? data.write(to: diskCacheURL(forCacheKey: cacheKey), options: [.atomic])
+    private func writeDiskCache(dataURL: String, forDomain domain: String, debugLabel: String? = nil) {
+        writeDiskCache(dataURL: dataURL, forCacheKey: domain, debugLabel: debugLabel)
+    }
+
+    private func writeDiskCache(dataURL: String, forCacheKey cacheKey: String, debugLabel: String? = nil) {
+        guard let data = Self.imageData(fromDataURL: dataURL) else {
+            Self.debugLog(debugLabel, "disk write skipped, invalid data url key=\(cacheKey)")
+            return
+        }
+        let url = diskCacheURL(forCacheKey: cacheKey)
+        do {
+            try data.write(to: url, options: [.atomic])
+            Self.debugLog(debugLabel, "disk write ok key=\(cacheKey) path=\(url.path) bytes=\(data.count)")
+        } catch {
+            Self.debugLog(debugLabel, "disk write failed key=\(cacheKey) path=\(url.path) error=\(error.localizedDescription)")
+        }
     }
 
     private func diskCacheURL(forDomain domain: String) -> URL {
@@ -365,6 +624,29 @@ actor EntityBrandAvatarResolver {
         }
     }
 
+    private static func registrableDomain(_ domain: String) -> String {
+        let labels = domain.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return domain }
+        let suffix = labels.suffix(2).joined(separator: ".")
+        if compoundPublicSuffixes.contains(suffix), labels.count >= 3 {
+            return labels.suffix(3).joined(separator: ".")
+        }
+        return labels.suffix(2).joined(separator: ".")
+    }
+
+    private static func uniqueValues(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values.compactMap { value in
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty,
+                  seen.insert(normalized).inserted
+            else {
+                return nil
+            }
+            return normalized
+        }
+    }
+
     private static let personalMailboxDomains: Set<String> = [
         "126.com",
         "163.com",
@@ -393,6 +675,24 @@ actor EntityBrandAvatarResolver {
         "yeah.net",
         "yandex.com",
         "zoho.com"
+    ]
+
+    private static let compoundPublicSuffixes: Set<String> = [
+        "com.cn",
+        "net.cn",
+        "org.cn",
+        "edu.cn",
+        "gov.cn",
+        "co.uk",
+        "com.au",
+        "net.au",
+        "co.jp",
+        "ne.jp",
+        "co.kr",
+        "com.br",
+        "com.sg",
+        "com.hk",
+        "com.tw"
     ]
 
     // Generated from simple-icons 16.21.0 source/guideline domains with domain-to-brand name checks.
@@ -2563,6 +2863,24 @@ actor EntityBrandAvatarResolver {
     private static func isSuccessfulHTTPResponse(_ response: URLResponse) -> Bool {
         guard let httpResponse = response as? HTTPURLResponse else { return true }
         return (200..<300).contains(httpResponse.statusCode)
+    }
+
+    private static func cacheEntry(for dataURL: String?) -> CacheEntry {
+        dataURL.map(CacheEntry.dataURL) ?? .missing(Date())
+    }
+
+    private static func isMissingCacheValid(_ cachedAt: Date) -> Bool {
+        Date().timeIntervalSince(cachedAt) < missingCacheTTL
+    }
+
+    private static func httpStatusCode(_ response: URLResponse) -> String {
+        guard let httpResponse = response as? HTTPURLResponse else { return "non-http" }
+        return String(httpResponse.statusCode)
+    }
+
+    private static func debugLog(_ debugLabel: String?, _ message: String) {
+        guard let debugLabel else { return }
+        NSLog("%@", "[MailiaAvatar] \(debugLabel) \(message)")
     }
 }
 

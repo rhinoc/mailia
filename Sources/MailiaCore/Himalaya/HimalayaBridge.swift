@@ -109,16 +109,26 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
         let executableURL = executableURL
         let environment = environment
         let workingDirectoryURL = workingDirectoryURL
+        let cancellation = ProcessCancellation()
 
-        return try await Task.detached {
+        let task = Task.detached {
             try Self.runSynchronously(
                 command,
                 executableURL: executableURL,
                 environment: environment,
                 workingDirectoryURL: workingDirectoryURL,
-                timeout: timeout
+                timeout: timeout,
+                cancellation: command.allowsProcessCancellation ? cancellation : nil
             )
-        }.value
+        }
+
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            if command.allowsProcessCancellation {
+                cancellation.cancel()
+            }
+        }
     }
 
     private static func runSynchronously(
@@ -126,7 +136,8 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
         executableURL: URL,
         environment bridgeEnvironment: [String: String],
         workingDirectoryURL: URL?,
-        timeout: TimeInterval?
+        timeout: TimeInterval?,
+        cancellation: ProcessCancellation?
     ) throws -> HimalayaResult {
         if let timeout, timeout <= 0 {
             throw HimalayaError.invalidTimeout(timeout)
@@ -164,9 +175,15 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
 
         do {
             try process.run()
+            cancellation?.setProcess(process)
         } catch {
             throw HimalayaError.launchFailed(error.localizedDescription)
         }
+
+        let stdoutReader = PipeDataReader()
+        let stderrReader = PipeDataReader()
+        stdoutReader.start(reading: stdoutPipe.fileHandleForReading)
+        stderrReader.start(reading: stderrPipe.fileHandleForReading)
 
         if let standardInput = command.standardInput, let standardInputPipe {
             standardInputPipe.fileHandleForWriting.write(standardInput)
@@ -187,8 +204,8 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
                 _ = termination.wait(timeout: .now() + 1)
                 #endif
 
-                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                let stdoutData = stdoutReader.waitForData()
+                let stderrData = stderrReader.waitForData()
                 throw HimalayaError.timedOut(
                     command: command,
                     timeout: timeout,
@@ -200,8 +217,8 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
             termination.wait()
         }
 
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdoutData = stdoutReader.waitForData()
+        let stderrData = stderrReader.waitForData()
 
         return HimalayaResult(
             command: command,
@@ -210,6 +227,76 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
             stderrData: stderrData,
             duration: Date().timeIntervalSince(startedAt)
         )
+    }
+}
+
+private final class ProcessCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var isCancelled = false
+
+    func setProcess(_ process: Process) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.process = process
+        if isCancelled, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let process = process
+        lock.unlock()
+
+        guard let process, process.isRunning else { return }
+        process.terminate()
+    }
+}
+
+private final class PipeDataReader: @unchecked Sendable {
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var data = Data()
+
+    func start(reading fileHandle: FileHandle) {
+        group.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let output = fileHandle.readDataToEndOfFile()
+            lock.lock()
+            data = output
+            lock.unlock()
+            group.leave()
+        }
+    }
+
+    func waitForData() -> Data {
+        group.wait()
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
+private extension HimalayaCommand {
+    var allowsProcessCancellation: Bool {
+        let commandArguments = arguments.filter { argument in
+            argument != "--output" && argument != "json" && argument != "--quiet"
+        }
+        guard let command = commandArguments.first else {
+            return false
+        }
+
+        switch command {
+        case "account", "folder", "envelope":
+            return true
+        case "message":
+            guard commandArguments.count > 1 else { return false }
+            return commandArguments[1] == "read" || commandArguments[1] == "export"
+        default:
+            return false
+        }
     }
 }
 
@@ -319,6 +406,46 @@ public extension HimalayaCommand {
             arguments += ["--downloads-dir", downloadsDirectory.path]
         }
         arguments.append(messageID)
+        return HimalayaCommand(arguments: jsonArguments(arguments))
+    }
+
+    static func templateReply(
+        id: String,
+        body: String,
+        folder: String = "INBOX",
+        account: String? = nil,
+        replyAll: Bool = false
+    ) -> HimalayaCommand {
+        var arguments = ["template", "reply", "--folder", folder]
+        if replyAll {
+            arguments.append("--all")
+        }
+        arguments += accountArguments(account)
+        arguments += [id, body]
+        return HimalayaCommand(arguments: jsonArguments(arguments))
+    }
+
+    static func templateWrite(
+        body: String,
+        headers: [String],
+        account: String? = nil
+    ) -> HimalayaCommand {
+        var arguments = ["template", "write"]
+        for header in headers {
+            arguments += ["--header", header]
+        }
+        arguments += accountArguments(account)
+        arguments.append(body)
+        return HimalayaCommand(arguments: jsonArguments(arguments))
+    }
+
+    static func templateSend(
+        template: String,
+        account: String? = nil
+    ) -> HimalayaCommand {
+        var arguments = ["template", "send"]
+        arguments += accountArguments(account)
+        arguments.append(template)
         return HimalayaCommand(arguments: jsonArguments(arguments))
     }
 

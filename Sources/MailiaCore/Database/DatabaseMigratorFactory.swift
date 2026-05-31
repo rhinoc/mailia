@@ -171,6 +171,18 @@ public enum DatabaseMigratorFactory {
                 """)
         }
 
+        migrator.registerMigration("v2_account_emoji") { db in
+            try db.execute(sql: """
+                ALTER TABLE accounts ADD COLUMN emoji TEXT;
+                """)
+        }
+
+        migrator.registerMigration("v3_account_default") { db in
+            try db.execute(sql: """
+                ALTER TABLE accounts ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0;
+                """)
+        }
+
         return migrator
     }
 }

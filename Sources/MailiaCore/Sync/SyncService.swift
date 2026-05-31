@@ -4,6 +4,7 @@ import GRDB
 public struct SyncService {
     private let bridge: any HimalayaBridge
     private let repository: MailRepository
+    private let himalayaConfigStore: HimalayaConfigStore
     private let policy: SyncPolicy
     private let decoder: JSONDecoder
     private let windowCalculator: SyncWindowCalculator
@@ -13,12 +14,14 @@ public struct SyncService {
     public init(
         bridge: any HimalayaBridge,
         databaseQueue: DatabaseQueue,
+        himalayaConfigStore: HimalayaConfigStore = HimalayaConfigStore(),
         policy: SyncPolicy = SyncPolicy(),
         himalayaCommandLimiter: HimalayaCommandLimiter? = nil,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.bridge = bridge
         self.repository = MailRepository(databaseQueue: databaseQueue)
+        self.himalayaConfigStore = himalayaConfigStore
         self.policy = policy
         self.decoder = JSONDecoder()
         self.windowCalculator = SyncWindowCalculator(policy: policy)
@@ -31,8 +34,12 @@ public struct SyncService {
     public func discoverAccounts(timeout: TimeInterval? = nil) async throws -> [DiscoveredAccount] {
         let result = try await runHimalaya(.accountList(), timeout: timeout).requireSuccess()
         let decoded = try result.decodeJSON(as: HimalayaList<HimalayaAccountDTO>.self, decoder: decoder)
+        let configMetadata = (try? himalayaConfigStore.accountMetadata()) ?? [:]
         let accounts = decoded.values
-            .map(\.discoveredAccount)
+            .map { accountDTO in
+                let metadata = configMetadata[accountDTO.name]
+                return accountDTO.discoveredAccount(metadata: metadata)
+            }
             .filter { !$0.accountKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         try repository.upsertAccounts(accounts)
         return accounts
@@ -79,11 +86,40 @@ public struct SyncService {
     @discardableResult
     public func syncWorkspace(
         _ workspace: Workspace,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        onProgress: (@Sendable (SyncWorkspaceProgress) -> Void)? = nil
     ) async throws -> Int {
         let folders = try repository.folders(for: workspace)
         let foldersByAccount = Dictionary(grouping: folders, by: \.accountKey)
         let accountSemaphore = AsyncSemaphore(permits: policy.maxConcurrentAccounts)
+        let totalFolders = folders.count
+        let counter = SyncProgressCounter()
+
+        if let onProgress {
+            onProgress(SyncWorkspaceProgress(
+                workspace: workspace,
+                completedFolders: 0,
+                totalFolders: totalFolders,
+                syncedMessages: 0
+            ))
+        }
+
+        let onFolderSynced: (@Sendable (Int) -> Void)?
+        if let onProgress {
+            onFolderSynced = { messages in
+                Task {
+                    let snapshot = await counter.record(messages: messages)
+                    onProgress(SyncWorkspaceProgress(
+                        workspace: workspace,
+                        completedFolders: snapshot.completedFolders,
+                        totalFolders: totalFolders,
+                        syncedMessages: snapshot.syncedMessages
+                    ))
+                }
+            }
+        } else {
+            onFolderSynced = nil
+        }
 
         return try await withThrowingTaskGroup(of: Int.self) { group in
             for accountKey in foldersByAccount.keys.sorted() {
@@ -95,7 +131,8 @@ public struct SyncService {
                         let syncedCount = try await syncFolders(
                             accountFolders,
                             workspace: workspace,
-                            timeout: timeout
+                            timeout: timeout,
+                            onFolderSynced: onFolderSynced
                         )
 
                         if !accountFolders.isEmpty {
@@ -122,7 +159,8 @@ public struct SyncService {
     public func syncFolder(
         _ folder: StoredFolder,
         workspace: Workspace,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        onFolderSynced: (@Sendable (Int) -> Void)? = nil
     ) async throws -> Int {
         let lastSuccessfulSyncAt = try repository.lastSuccessfulSyncAt(
             accountKey: folder.accountKey,
@@ -162,18 +200,25 @@ public struct SyncService {
             workspace: workspace,
             at: nowProvider()
         )
+        onFolderSynced?(ids.count)
         return ids.count
     }
 
     private func syncFolders(
         _ folders: [StoredFolder],
         workspace: Workspace,
-        timeout: TimeInterval?
+        timeout: TimeInterval?,
+        onFolderSynced: (@Sendable (Int) -> Void)? = nil
     ) async throws -> Int {
         guard policy.maxConcurrentFoldersPerAccount > 1 else {
             var syncedCount = 0
             for folder in folders {
-                syncedCount += try await syncFolder(folder, workspace: workspace, timeout: timeout)
+                syncedCount += try await syncFolder(
+                    folder,
+                    workspace: workspace,
+                    timeout: timeout,
+                    onFolderSynced: onFolderSynced
+                )
             }
             return syncedCount
         }
@@ -183,7 +228,12 @@ public struct SyncService {
             for folder in folders {
                 group.addTask {
                     try await withPermit(folderSemaphore) {
-                        try await syncFolder(folder, workspace: workspace, timeout: timeout)
+                        try await syncFolder(
+                            folder,
+                            workspace: workspace,
+                            timeout: timeout,
+                            onFolderSynced: onFolderSynced
+                        )
                     }
                 }
             }
@@ -200,7 +250,12 @@ public struct SyncService {
         _ command: HimalayaCommand,
         timeout: TimeInterval?
     ) async throws -> HimalayaResult {
-        try await himalayaCommandLimiter.run(command, bridge: bridge, timeout: timeout)
+        try await himalayaCommandLimiter.run(
+            command,
+            bridge: bridge,
+            timeout: timeout,
+            priority: .backgroundSync
+        )
     }
 
     private func syncQuery(startDate: Date) -> String {
@@ -216,32 +271,105 @@ public struct SyncService {
     }
 }
 
+public struct SyncWorkspaceProgress: Equatable, Sendable {
+    public let workspace: Workspace
+    public let completedFolders: Int
+    public let totalFolders: Int
+    public let syncedMessages: Int
+
+    public init(
+        workspace: Workspace,
+        completedFolders: Int,
+        totalFolders: Int,
+        syncedMessages: Int
+    ) {
+        self.workspace = workspace
+        self.completedFolders = completedFolders
+        self.totalFolders = totalFolders
+        self.syncedMessages = syncedMessages
+    }
+}
+
+private actor SyncProgressCounter {
+    struct Snapshot: Sendable {
+        let completedFolders: Int
+        let syncedMessages: Int
+    }
+
+    private var completedFolders = 0
+    private var syncedMessages = 0
+
+    func record(messages: Int) -> Snapshot {
+        completedFolders += 1
+        syncedMessages += messages
+        return Snapshot(completedFolders: completedFolders, syncedMessages: syncedMessages)
+    }
+}
+
 private actor AsyncSemaphore {
     private var permits: Int
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [Waiter] = []
 
     init(permits: Int) {
         self.permits = max(1, permits)
     }
 
-    func wait() async {
+    func withPermit<T: Sendable>(
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await wait()
+        defer { signal() }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    private func wait() async throws {
+        try Task.checkCancellation()
+
         if permits > 0 {
             permits -= 1
             return
         }
 
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        let id = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    waiters.append(Waiter(id: id, continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(id: id)
+            }
+        }
+
+        if !acquired {
+            throw CancellationError()
         }
     }
 
-    func signal() {
+    private func signal() {
         guard !waiters.isEmpty else {
             permits += 1
             return
         }
 
-        waiters.removeFirst().resume()
+        waiters.removeFirst().continuation.resume(returning: true)
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        waiters.remove(at: index).continuation.resume(returning: false)
+    }
+
+    private struct Waiter {
+        var id: UUID
+        var continuation: CheckedContinuation<Bool, Never>
     }
 }
 
@@ -249,15 +377,7 @@ private func withPermit<T: Sendable>(
     _ semaphore: AsyncSemaphore,
     operation: @Sendable () async throws -> T
 ) async throws -> T {
-    await semaphore.wait()
-    do {
-        let value = try await operation()
-        await semaphore.signal()
-        return value
-    } catch {
-        await semaphore.signal()
-        throw error
-    }
+    try await semaphore.withPermit(operation: operation)
 }
 
 extension SyncService: @unchecked Sendable {}

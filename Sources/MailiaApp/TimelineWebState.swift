@@ -11,9 +11,13 @@ struct TimelineWebState: Codable, Equatable, Sendable {
     var hasNewerTimeline: Bool
     var bodyStates: [String: BodyState]
     var attachmentDownloadStates: [String: AttachmentDownloadState]
+    var replySendState: ReplySendState
+    var sendAccounts: [SendAccount]
+    var selectedSendAccountKey: String?
     var scrollAnchor: ScrollAnchor?
     var bodyDisplayMode: String
     var loadRemoteContent: Bool
+    var showTimelineAvatars: Bool
 
     init(
         entity: Entity?,
@@ -25,9 +29,13 @@ struct TimelineWebState: Codable, Equatable, Sendable {
         hasNewerTimeline: Bool,
         bodyStates: [String: BodyState] = [:],
         attachmentDownloadStates: [String: AttachmentDownloadState] = [:],
+        replySendState: ReplySendState = .idle,
+        sendAccounts: [SendAccount] = [],
+        selectedSendAccountKey: String? = nil,
         scrollAnchor: ScrollAnchor? = nil,
         bodyDisplayMode: String = "html",
-        loadRemoteContent: Bool = false
+        loadRemoteContent: Bool = false,
+        showTimelineAvatars: Bool = true
     ) {
         self.entity = entity
         self.items = items
@@ -38,9 +46,13 @@ struct TimelineWebState: Codable, Equatable, Sendable {
         self.hasNewerTimeline = hasNewerTimeline
         self.bodyStates = bodyStates
         self.attachmentDownloadStates = attachmentDownloadStates
+        self.replySendState = replySendState
+        self.sendAccounts = sendAccounts
+        self.selectedSendAccountKey = selectedSendAccountKey
         self.scrollAnchor = scrollAnchor
         self.bodyDisplayMode = bodyDisplayMode
         self.loadRemoteContent = loadRemoteContent
+        self.showTimelineAvatars = showTimelineAvatars
     }
 }
 
@@ -49,6 +61,7 @@ extension TimelineWebState {
         var id: Int64
         var displayName: String
         var primaryEmailAddress: String?
+        var emailAddresses: [String]
         var kind: String
         var unreadCount: Int
         var latestSubject: String
@@ -73,6 +86,14 @@ extension TimelineWebState {
         var fromLabel: String
         var toLabel: String
         var hasAttachments: Bool
+    }
+
+    struct SendAccount: Codable, Equatable, Sendable {
+        var id: String
+        var label: String
+        var emailAddress: String?
+        var isDefault: Bool
+        var emoji: String?
     }
 
     enum BodyState: Codable, Equatable, Sendable {
@@ -187,6 +208,55 @@ extension TimelineWebState {
         var fileNames: [String]
     }
 
+    enum ReplySendState: Codable, Equatable, Sendable {
+        case idle
+        case sending
+        case sent
+        case failed(String)
+
+        private enum CodingKeys: String, CodingKey {
+            case status
+            case message
+        }
+
+        private enum Status: String, Codable {
+            case idle
+            case sending
+            case sent
+            case failed
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let status = try container.decode(Status.self, forKey: .status)
+            switch status {
+            case .idle:
+                self = .idle
+            case .sending:
+                self = .sending
+            case .sent:
+                self = .sent
+            case .failed:
+                self = .failed(try container.decode(String.self, forKey: .message))
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .idle:
+                try container.encode(Status.idle, forKey: .status)
+            case .sending:
+                try container.encode(Status.sending, forKey: .status)
+            case .sent:
+                try container.encode(Status.sent, forKey: .status)
+            case .failed(let message):
+                try container.encode(Status.failed, forKey: .status)
+                try container.encode(message, forKey: .message)
+            }
+        }
+    }
+
     struct ScrollAnchor: Codable, Equatable, Sendable {
         enum Edge: String, Codable, Sendable {
             case top
@@ -210,9 +280,13 @@ extension TimelineWebState {
         hasNewerTimeline: Bool,
         bodyStates: [Int64: MailiaTimelineBodyState],
         attachmentDownloadStates: [Int64: MailiaAttachmentDownloadState],
+        replySendState: MailiaReplySendState = .idle,
+        sendAccounts: [MailiaSendAccount] = [],
+        selectedSendAccountKey: String? = nil,
         scrollAnchor: MailiaTimelineScrollAnchor?,
         bodyDisplayMode: String = "html",
-        loadRemoteContent: Bool = false
+        loadRemoteContent: Bool = false,
+        showTimelineAvatars: Bool = true
     ) {
         self.init(
             entity: entity.map(Entity.init),
@@ -228,9 +302,25 @@ extension TimelineWebState {
             attachmentDownloadStates: attachmentDownloadStates.reduce(into: [:]) { result, entry in
                 result[String(entry.key)] = AttachmentDownloadState(entry.value)
             },
+            replySendState: ReplySendState(replySendState),
+            sendAccounts: sendAccounts.map(SendAccount.init),
+            selectedSendAccountKey: selectedSendAccountKey,
             scrollAnchor: scrollAnchor.map(ScrollAnchor.init),
             bodyDisplayMode: bodyDisplayMode,
-            loadRemoteContent: loadRemoteContent
+            loadRemoteContent: loadRemoteContent,
+            showTimelineAvatars: showTimelineAvatars
+        )
+    }
+}
+
+extension TimelineWebState.SendAccount {
+    init(_ account: MailiaSendAccount) {
+        self.init(
+            id: account.id,
+            label: account.label,
+            emailAddress: account.emailAddress,
+            isDefault: account.isDefault,
+            emoji: account.emoji
         )
     }
 }
@@ -241,6 +331,7 @@ extension TimelineWebState.Entity {
             id: entity.id,
             displayName: entity.displayName,
             primaryEmailAddress: entity.primaryEmailAddress,
+            emailAddresses: entity.emailAddresses,
             kind: entity.kind.rawValue,
             unreadCount: entity.unreadCount,
             latestSubject: entity.latestSubject,
@@ -315,6 +406,21 @@ extension TimelineWebState.AttachmentDownloadState {
 extension TimelineWebState.AttachmentDownloadResult {
     init(_ result: MailiaAttachmentDownloadResult) {
         self.init(directoryPath: result.directoryPath, fileNames: result.fileNames)
+    }
+}
+
+extension TimelineWebState.ReplySendState {
+    init(_ state: MailiaReplySendState) {
+        switch state {
+        case .idle:
+            self = .idle
+        case .sending:
+            self = .sending
+        case .sent:
+            self = .sent
+        case .failed(let message):
+            self = .failed(message)
+        }
     }
 }
 
@@ -520,7 +626,9 @@ enum TimelineWebEvent: Equatable, Sendable {
     case ready
     case requestOlder
     case requestNewer
-    case requestBody(messageID: Int64)
+    case requestBody(messageID: Int64, priority: Int?)
+    case sendReply(messageID: Int64, body: String, replyAll: Bool, accountKey: String?)
+    case selectSendAccount(accountKey: String)
     case setMessageFlag(messageID: Int64, isFlagged: Bool)
     case downloadAttachments(messageID: Int64)
     case entityAction(action: String, entityID: Int64?)
@@ -545,7 +653,18 @@ extension TimelineWebEvent {
             self = .requestNewer
         case "requestBody":
             let payload = try envelope.payloadObject(as: MessagePayload.self)
-            self = .requestBody(messageID: payload.messageID)
+            self = .requestBody(messageID: payload.messageID, priority: payload.bodyPriority)
+        case "sendReply":
+            let payload = try envelope.payloadObject(as: SendReplyPayload.self)
+            self = .sendReply(
+                messageID: payload.messageID,
+                body: payload.body,
+                replyAll: payload.replyAll ?? false,
+                accountKey: payload.accountKey
+            )
+        case "selectSendAccount":
+            let payload = try envelope.payloadObject(as: SelectSendAccountPayload.self)
+            self = .selectSendAccount(accountKey: payload.accountKey)
         case "setMessageFlag":
             let payload = try envelope.payloadObject(as: SetMessageFlagPayload.self)
             self = .setMessageFlag(messageID: payload.messageID, isFlagged: payload.isFlagged)
@@ -568,10 +687,12 @@ extension TimelineWebEvent {
 
     private struct MessagePayload: Decodable {
         var messageID: Int64
+        var bodyPriority: Int?
 
         private enum CodingKeys: String, CodingKey {
             case messageID
             case id
+            case bodyPriority
         }
 
         init(from decoder: Decoder) throws {
@@ -581,6 +702,7 @@ extension TimelineWebEvent {
             } else {
                 self.messageID = try container.decode(Int64.self, forKey: .id)
             }
+            self.bodyPriority = try container.decodeIfPresent(Int.self, forKey: .bodyPriority)
         }
     }
 
@@ -603,6 +725,37 @@ extension TimelineWebEvent {
             }
             self.isFlagged = try container.decode(Bool.self, forKey: .isFlagged)
         }
+    }
+
+    private struct SendReplyPayload: Decodable {
+        var messageID: Int64
+        var body: String
+        var replyAll: Bool?
+        var accountKey: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case messageID
+            case id
+            case body
+            case replyAll
+            case accountKey
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if let messageID = try container.decodeIfPresent(Int64.self, forKey: .messageID) {
+                self.messageID = messageID
+            } else {
+            self.messageID = try container.decode(Int64.self, forKey: .id)
+            }
+            self.body = try container.decode(String.self, forKey: .body)
+            self.replyAll = try container.decodeIfPresent(Bool.self, forKey: .replyAll)
+            self.accountKey = try container.decodeIfPresent(String.self, forKey: .accountKey)
+        }
+    }
+
+    private struct SelectSendAccountPayload: Decodable {
+        var accountKey: String
     }
 
     private struct EntityActionPayload: Decodable {
