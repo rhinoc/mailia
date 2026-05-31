@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef } from "react";
+import { memo, useLayoutEffect, useMemo, useRef } from "react";
 import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
@@ -151,7 +151,7 @@ interface MessageBodyProps {
   onMeasuredHeight?(height: number): void;
 }
 
-export function MessageBody({
+export const MessageBody = memo(function MessageBody({
   html,
   text,
   mode,
@@ -214,9 +214,9 @@ export function MessageBody({
   }
 
   return <HTMLMessageBody displayHTML={displayHTML} onMeasuredHeight={onMeasuredHeight} />;
-}
+});
 
-function HTMLMessageBody({
+const HTMLMessageBody = memo(function HTMLMessageBody({
   displayHTML,
   onMeasuredHeight
 }: {
@@ -225,6 +225,10 @@ function HTMLMessageBody({
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const dangerousHTML = useMemo(
+    () => ({ __html: displayHTML }),
+    [displayHTML]
+  );
 
   useHTMLBodyFit(frameRef, contentRef, displayHTML);
 
@@ -234,7 +238,7 @@ function HTMLMessageBody({
         <div
           ref={contentRef}
           className="mail-body__content"
-          dangerouslySetInnerHTML={{ __html: displayHTML }}
+          dangerouslySetInnerHTML={dangerousHTML}
         />
       </div>
       <MeasuredHeightReporter
@@ -244,7 +248,7 @@ function HTMLMessageBody({
       />
     </div>
   );
-}
+});
 
 function MeasuredHeightReporter({
   targetRef,
@@ -312,6 +316,7 @@ function useHTMLBodyFit(
 
     let cancelled = false;
     let rafID = 0;
+    let observedFrameWidth = Math.round(frame.getBoundingClientRect().width);
 
     const applyFit = () => {
       if (cancelled) return;
@@ -335,7 +340,13 @@ function useHTMLBodyFit(
 
     scheduleFit();
 
-    const resizeObserver = new ResizeObserver(scheduleFit);
+    const resizeObserver = new ResizeObserver((entries) => {
+      const width = Math.round(entries[0]?.contentRect.width ?? frame.getBoundingClientRect().width);
+      if (Math.abs(width - observedFrameWidth) <= 1) return;
+
+      observedFrameWidth = width;
+      scheduleFit();
+    });
     resizeObserver.observe(frame);
 
     const mutationObserver = new MutationObserver(scheduleFit);
