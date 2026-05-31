@@ -14,17 +14,23 @@ public struct SanitizedHTML: Equatable {
 public struct HTMLSanitizer {
     private static let blockedTags = "script, iframe, video, audio, object, embed"
     private static let blockedImageLabel = "Remote image blocked"
+    private static let sanitizerBaseURI = "https://mailia.invalid/"
 
     public init() {}
 
     public func sanitize(_ html: String) throws -> SanitizedHTML {
         let document = try SwiftSoup.parseBodyFragment(html)
-        var remoteContentBlocked = false
 
         try document.select(Self.blockedTags).remove()
-        remoteContentBlocked = try removeRemoteStylesheets(from: document)
+        let remoteContentBlocked = try removeRemoteStylesheets(from: document)
+        let cleanedHTML = try SwiftSoup.clean(
+            try document.body()?.html() ?? "",
+            Self.sanitizerBaseURI,
+            Self.emailWhitelist()
+        ) ?? ""
+        let cleanedDocument = try SwiftSoup.parseBodyFragment(cleanedHTML)
 
-        if let body = document.body() {
+        if let body = cleanedDocument.body() {
             for element in try body.getAllElements() {
                 try removeEventHandlerAttributes(from: element)
                 try sanitizeInlineStyle(on: element)
@@ -48,6 +54,64 @@ public struct HTMLSanitizer {
         }
 
         return SanitizedHTML(content: "", remoteContentBlocked: remoteContentBlocked)
+    }
+
+    private static func emailWhitelist() throws -> Whitelist {
+        let whitelist = try Whitelist.relaxed()
+            .removeProtocols("a", "href", "ftp")
+            .addProtocols("a", "href", "#")
+            .addProtocols("img", "src", "data")
+            .preserveRelativeLinks(true)
+            .urlWhitespace(.trim)
+
+        try whitelist
+            .addTags(
+                "address", "article", "aside", "center", "del", "font", "hr", "ins",
+                "main", "mark", "section", "time"
+            )
+            .addAttributes(
+                ":all",
+                "aria-hidden", "aria-label", "class", "dir", "id", "lang", "role", "style", "title"
+            )
+            .addAttributes("a", "href", "name", "rel", "target", "title")
+            .addAttributes("font", "color", "face", "size")
+            .addAttributes(
+                "img",
+                "align", "alt", "border", "height", "hspace", "loading", "src", "srcset",
+                "title", "vspace", "width"
+            )
+            .addAttributes(
+                "table",
+                "align", "bgcolor", "border", "cellpadding", "cellspacing", "height",
+                "role", "summary", "width"
+            )
+            .addAttributes("tbody", "align", "valign")
+            .addAttributes("thead", "align", "valign")
+            .addAttributes("tfoot", "align", "valign")
+            .addAttributes("tr", "align", "bgcolor", "height", "valign")
+            .addAttributes(
+                "td",
+                "abbr", "align", "axis", "bgcolor", "colspan", "height", "rowspan", "valign", "width"
+            )
+            .addAttributes(
+                "th",
+                "abbr", "align", "axis", "bgcolor", "colspan", "height", "rowspan", "scope", "valign", "width"
+            )
+            .addCSSProperties(
+                ":all",
+                "background", "background-color", "border", "border-bottom", "border-collapse",
+                "border-color", "border-left", "border-radius", "border-right", "border-spacing",
+                "border-style", "border-top", "border-width", "box-sizing", "clear", "color",
+                "direction", "display", "font", "font-family", "font-size", "font-style",
+                "font-variant", "font-weight", "height", "letter-spacing", "line-height",
+                "margin", "margin-bottom", "margin-left", "margin-right", "margin-top",
+                "max-height", "max-width", "min-height", "min-width", "opacity", "overflow",
+                "padding", "padding-bottom", "padding-left", "padding-right", "padding-top",
+                "text-align", "text-decoration", "text-indent", "text-transform", "vertical-align",
+                "white-space", "width", "word-break", "word-spacing", "word-wrap"
+            )
+
+        return whitelist
     }
 
     public func blockRemoteImages(in html: String) throws -> SanitizedHTML {
@@ -148,6 +212,10 @@ public struct HTMLSanitizer {
                 if element.tagNameNormal() == "a", attribute == "href" {
                     try makeExternalSafeLink(element)
                 }
+            case .mailto:
+                if element.tagNameNormal() != "a" || attribute != "href" {
+                    try element.removeAttr(attribute)
+                }
             case .relativeOrFragment:
                 break
             case .blocked:
@@ -167,7 +235,7 @@ public struct HTMLSanitizer {
         switch classifyURL(src, allowsImageData: true) {
         case .httpOrHTTPS, .relativeOrFragment:
             break
-        case .blocked:
+        case .mailto, .blocked:
             if !src.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("//") {
                 try image.removeAttr("src")
             }
@@ -352,6 +420,8 @@ public struct HTMLSanitizer {
         switch scheme {
         case "http", "https":
             return .httpOrHTTPS
+        case "mailto":
+            return .mailto
         case "data":
             return allowsImageData && isSafeImageDataURL(trimmed) ? .relativeOrFragment : .blocked
         default:
@@ -363,7 +433,7 @@ public struct HTMLSanitizer {
         switch classifyURL(value, allowsImageData: true) {
         case .httpOrHTTPS:
             return true
-        case .relativeOrFragment, .blocked:
+        case .mailto, .relativeOrFragment, .blocked:
             return false
         }
     }
@@ -394,7 +464,10 @@ public struct HTMLSanitizer {
                     return false
                 }
                 let value = String(url)
-                return !value.hasPrefix("//") && classifyURL(value, allowsImageData: true) == .blocked
+                let classification = classifyURL(value, allowsImageData: true)
+                return !value.hasPrefix("//")
+                    && classification != .httpOrHTTPS
+                    && classification != .relativeOrFragment
             }
     }
 
@@ -407,6 +480,7 @@ public struct HTMLSanitizer {
 
     private enum URLClassification {
         case httpOrHTTPS
+        case mailto
         case relativeOrFragment
         case blocked
     }

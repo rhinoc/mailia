@@ -13,7 +13,7 @@ let package = Package(
             targets: ["MailiaCore"]
         ),
         .executable(
-            name: "MailiaApp",
+            name: "Mailia",
             targets: ["MailiaApp"]
         )
     ],
@@ -35,12 +35,17 @@ let package = Package(
             name: "MailiaApp",
             dependencies: ["MailiaCore"],
             resources: [
-                .process("Resources")
+                .process("Resources/AppIcon.icns"),
+                .copy("Resources/TimelineWeb")
             ]
         ),
         .testTarget(
             name: "MailiaCoreTests",
             dependencies: ["MailiaCore"]
+        ),
+        .testTarget(
+            name: "MailiaAppTests",
+            dependencies: ["MailiaApp"]
         )
     ]
 )

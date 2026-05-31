@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import MailiaCore
 
 struct TimelineWebView: NSViewRepresentable {
     let state: TimelineWebState
@@ -7,7 +8,6 @@ struct TimelineWebView: NSViewRepresentable {
     let entity: MailiaEntitySummary?
     let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
-    let onRequestNewer: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
     let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
@@ -41,7 +41,6 @@ struct TimelineWebView: NSViewRepresentable {
         private var state: TimelineWebState?
         private var onRequestBody: ((MailiaTimelineItem, Int?) -> Void)?
         private var onRequestOlder: (() -> Void)?
-        private var onRequestNewer: (() -> Void)?
         private var onSetMessageFlag: ((MailiaTimelineItem, Bool) -> Void)?
         private var onDownloadAttachments: ((MailiaTimelineItem) -> Void)?
         private var onSendReply: ((MailiaTimelineItem, String, Bool, String?) -> Void)?
@@ -49,12 +48,14 @@ struct TimelineWebView: NSViewRepresentable {
         private var onEntityAction: ((MailiaEntityAction, MailiaEntitySummary) -> Void)?
 
         func apply(view: TimelineWebView) {
-            itemsByID = Dictionary(uniqueKeysWithValues: view.items.map { ($0.id, $0) })
+            itemsByID = Dictionary(view.items.map { ($0.id, $0) }, uniquingKeysWith: { current, duplicate in
+                NSLog("[MailiaTimelineWeb] Duplicate timeline item id \(duplicate.id); keeping first item.")
+                return current
+            })
             entity = view.entity
             state = view.state
             onRequestBody = view.onRequestBody
             onRequestOlder = view.onRequestOlder
-            onRequestNewer = view.onRequestNewer
             onSetMessageFlag = view.onSetMessageFlag
             onDownloadAttachments = view.onDownloadAttachments
             onSendReply = view.onSendReply
@@ -87,8 +88,6 @@ struct TimelineWebView: NSViewRepresentable {
                 }
             case .requestOlder:
                 onRequestOlder?()
-            case .requestNewer:
-                onRequestNewer?()
             case .requestBody(let messageID, let priority):
                 guard let item = itemsByID[messageID] else { return }
                 onRequestBody?(item, priority)
@@ -109,7 +108,9 @@ struct TimelineWebView: NSViewRepresentable {
             case .scrollAnchor:
                 break
             case .log(let level, let message):
-                NSLog("[MailiaTimelineWeb:\(level)] \(message)")
+                if level.lowercased() == "error" {
+                    NSLog("[MailiaTimelineWeb:\(level)] \(message)")
+                }
             case .unknown(let type, _):
                 NSLog("[MailiaTimelineWeb] Ignoring event '\(type)'")
             }

@@ -14,6 +14,12 @@ Build the Swift package and app executable:
 swift build
 ```
 
+Rebuild the timeline web island and copy it into the app bundle resources:
+
+```bash
+npm --prefix Web/Timeline run build:app
+```
+
 Run the core test suite:
 
 ```bash
@@ -23,7 +29,7 @@ swift test
 Run the app from the package:
 
 ```bash
-swift run MailiaApp
+swift run Mailia
 ```
 
 Current targets:

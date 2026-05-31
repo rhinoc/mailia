@@ -1,83 +1,130 @@
-import type { TimelineMessage, TimelineState } from "../types";
+import type { EntityKind, TimelineEntity, TimelineItem, TimelineState, WorkspaceKind } from "../types";
 
 interface DevFixture {
   id: string;
   label: string;
+  entities: TimelineEntity[];
+  itemsByEntity: Record<string, TimelineItem[]>;
   state: TimelineState;
-  messagesByEntity: Record<string, TimelineMessage[]>;
 }
 
 const accounts = ["gmail", "gmail-imseonwong", "outlook"];
 
-function address(displayName: string, emailAddress: string) {
-  return { displayName, emailAddress };
+const githubEntity = entity({
+  id: 1,
+  displayName: "GitHub",
+  primaryEmailAddress: "notifications@github.com",
+  kind: "service",
+  unreadCount: 7,
+  latestSubject: "Pull requests, CI, security alerts",
+  accountLabel: "gmail",
+  workspace: "main"
+});
+
+const newsletterEntity = entity({
+  id: 2,
+  displayName: "The Pragmatic Engineer",
+  primaryEmailAddress: "pragmaticengineer@substack.com",
+  kind: "newsletter",
+  unreadCount: 2,
+  latestSubject: "Newsletter",
+  accountLabel: "gmail-imseonwong",
+  workspace: "main"
+});
+
+const personEntity = entity({
+  id: 3,
+  displayName: "Maya Chen",
+  primaryEmailAddress: "maya.chen@example.net",
+  kind: "person",
+  unreadCount: 1,
+  latestSubject: "Direct conversation",
+  accountLabel: "gmail",
+  workspace: "main"
+});
+
+function entity(input: {
+  id: number;
+  displayName: string;
+  primaryEmailAddress: string;
+  kind: EntityKind;
+  unreadCount: number;
+  latestSubject: string;
+  accountLabel: string;
+  workspace: WorkspaceKind;
+}): TimelineEntity {
+  return {
+    ...input,
+    emailAddresses: [input.primaryEmailAddress],
+    latestDate: null,
+    avatarImageDataURL: null
+  };
 }
 
 function isoHoursAgo(hours: number) {
   return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 }
 
-function buildConversation(entityID: string, count: number): TimelineMessage[] {
+function buildConversation(entity: TimelineEntity, count: number): TimelineItem[] {
+  const slug = slugForEntity(entity);
   return Array.from({ length: count }, (_, index) => {
     const outgoing = index % 7 === 4;
-    const accountKey = accounts[index % accounts.length];
+    const accountLabel = accounts[index % accounts.length];
     const subject =
-      entityID === "github"
+      slug === "github"
         ? index % 5 === 0
           ? "[mailia] CI run completed"
           : "Pull request activity"
-        : entityID === "pragmatic-engineer"
+        : slug === "pragmatic-engineer"
           ? "The Pragmatic Engineer: deep dive"
           : index % 4 === 0
             ? "Planning notes and next steps"
             : "Re: Checking in";
 
     return {
-      messageID: `${entityID}-${index + 1}`,
-      accountKey,
-      folderName: outgoing ? "Sent" : index % 6 === 0 ? "Updates" : "Inbox",
-      folderRole: outgoing ? "sent" : "normal",
-      himalayaEnvelopeID: `${accountKey}-${entityID}-${index + 1000}`,
-      flags: index % 9 === 0 ? ["Seen", "Flagged"] : index % 3 === 0 ? ["Seen"] : [],
-      subject,
-      from: outgoing
-        ? address("Ryan", "ryan@example.com")
-        : entityID === "github"
-          ? address("GitHub", "notifications@github.com")
-          : entityID === "pragmatic-engineer"
-            ? address("The Pragmatic Engineer", "pragmaticengineer@substack.com")
-            : address("Maya Chen", "maya.chen@example.net"),
-      to: outgoing
-        ? [
-            entityID === "github"
-              ? address("GitHub", "notifications@github.com")
-              : entityID === "pragmatic-engineer"
-                ? address("The Pragmatic Engineer", "pragmaticengineer@substack.com")
-                : address("Maya Chen", "maya.chen@example.net")
-          ]
-        : [address("Ryan", "ryan@example.com")],
-      cc: index % 11 === 0 ? [address("Ops", "ops@example.com")] : [],
-      messageDate: isoHoursAgo(count - index),
+      id: entity.id * 10_000 + index + 1,
+      entityID: entity.id,
       direction: outgoing ? "outgoing" : "incoming",
-      hasAttachments: index % 13 === 0,
-      sanitizedHTML: bodyFor(entityID, index, subject),
-      textFallback: `Fallback text for ${subject}`,
-      avatarSeed: `${entityID}-${entityName(entityID)}`,
-      avatarName: entityName(entityID)
+      subject,
+      preview: `Fallback text for ${subject}`,
+      html: bodyFor(slug, index, subject),
+      date: isoHoursAgo(count - index),
+      accountLabel,
+      accountEmoji: outgoing ? accountEmoji(accountLabel) : null,
+      accountAvatarImageDataURL: null,
+      folderLabel: outgoing ? "Sent" : index % 6 === 0 ? "Updates" : "Inbox",
+      envelopeID: `${accountLabel}-${slug}-${index + 1000}`,
+      isFlagged: index % 9 === 0,
+      fromLabel: outgoing ? "Ryan" : entity.displayName,
+      toLabel: outgoing ? entity.displayName : "Ryan",
+      hasAttachments: index % 13 === 0
     };
   });
 }
 
-function entityName(entityID: string) {
-  switch (entityID) {
-    case "github":
-      return "GitHub";
-    case "pragmatic-engineer":
-      return "The Pragmatic Engineer";
-    case "maya":
-      return "Maya Chen";
+function slugForEntity(entity: TimelineEntity) {
+  switch (entity.id) {
+    case githubEntity.id:
+      return "github";
+    case newsletterEntity.id:
+      return "pragmatic-engineer";
+    case personEntity.id:
+      return "maya";
     default:
-      return entityID;
+      return String(entity.id);
+  }
+}
+
+function accountEmoji(accountLabel: string) {
+  switch (accountLabel) {
+    case "gmail":
+      return "G";
+    case "gmail-imseonwong":
+      return "I";
+    case "outlook":
+      return "O";
+    default:
+      return null;
   }
 }
 
@@ -128,126 +175,182 @@ function bodyFor(entityID: string, index: number, subject: string) {
   `;
 }
 
-const githubMessages = buildConversation("github", 92);
-const newsletterMessages = buildConversation("pragmatic-engineer", 36);
-const personMessages = buildConversation("maya", 58);
-const junkGithubMessages = githubMessages.slice(-18).map(toJunkMessage);
-const junkPersonMessages = personMessages.slice(-22).map(toJunkMessage);
+const githubItems = buildConversation(githubEntity, 92);
+const newsletterItems = buildConversation(newsletterEntity, 36);
+const personItems = buildConversation(personEntity, 58);
+const junkGithubItems = githubItems.slice(-18).map(toJunkItem);
+const junkPersonItems = personItems.slice(-22).map(toJunkItem);
+const quotedReplyItems = buildQuotedReplyItems();
 
 export const devFixtures: DevFixture[] = [
   {
     id: "main",
     label: "Main timeline",
-    messagesByEntity: {
-      github: githubMessages,
-      "pragmatic-engineer": newsletterMessages,
-      maya: personMessages
+    entities: withLatestDates([githubEntity, newsletterEntity, personEntity], {
+      [githubEntity.id]: githubItems,
+      [newsletterEntity.id]: newsletterItems,
+      [personEntity.id]: personItems
+    }),
+    itemsByEntity: {
+      [githubEntity.id]: githubItems,
+      [newsletterEntity.id]: newsletterItems,
+      [personEntity.id]: personItems
     },
-    state: {
-      workspace: "main",
-      selectedEntityID: "github",
-      isLoading: false,
-      isLoadingOlderMessages: false,
-      isLoadingNewerMessages: false,
-      error: null,
-      syncStatus: "Fixture data loaded",
-      hasOlderMessages: true,
-      anchoredToBottom: true,
-      bodyDisplayMode: "html",
-      loadRemoteContent: false,
-      showTimelineAvatars: true,
-      entities: [
-        {
-          id: "github",
-          name: "GitHub",
-          kind: "service",
-          primaryAddress: "notifications@github.com",
-          detail: "Pull requests, CI, security alerts",
-          messageCount: githubMessages.length,
-          unreadCount: 7,
-          lastMessageAt: githubMessages.at(-1)?.messageDate,
-          sourceAccounts: ["gmail", "outlook"]
-        },
-        {
-          id: "pragmatic-engineer",
-          name: "The Pragmatic Engineer",
-          kind: "newsletter",
-          primaryAddress: "pragmaticengineer@substack.com",
-          detail: "Newsletter",
-          messageCount: newsletterMessages.length,
-          unreadCount: 2,
-          lastMessageAt: newsletterMessages.at(-1)?.messageDate,
-          sourceAccounts: ["gmail-imseonwong"]
-        },
-        {
-          id: "maya",
-          name: "Maya Chen",
-          kind: "person",
-          primaryAddress: "maya.chen@example.net",
-          detail: "Direct conversation",
-          messageCount: personMessages.length,
-          unreadCount: 1,
-          lastMessageAt: personMessages.at(-1)?.messageDate,
-          sourceAccounts: ["gmail", "gmail-imseonwong"]
+    state: stateFor(githubEntity, githubItems, { hasOlderTimeline: true })
+  },
+  {
+    id: "quoted-replies",
+    label: "Quoted reply samples",
+    entities: withLatestDates(
+      [{ ...personEntity, unreadCount: 0, latestSubject: "Quoted reply samples" }],
+      { [personEntity.id]: quotedReplyItems }
+    ),
+    itemsByEntity: {
+      [personEntity.id]: quotedReplyItems
+    },
+    state: stateFor(
+      { ...personEntity, unreadCount: 0, latestSubject: "Quoted reply samples" },
+      quotedReplyItems,
+      {
+        displayOptions: {
+          hideQuotedReplyText: true,
+          hideReplySubjects: true
         }
-      ],
-      messages: githubMessages
-    }
+      }
+    )
   },
   {
     id: "junk-review",
     label: "Junk review",
-    messagesByEntity: {
-      github: junkGithubMessages,
-      maya: junkPersonMessages
-    },
-    state: {
-      workspace: "junk",
-      selectedEntityID: "maya",
-      isLoading: false,
-      isLoadingOlderMessages: false,
-      isLoadingNewerMessages: false,
-      error: null,
-      syncStatus: "Junk fixture data loaded",
-      hasOlderMessages: false,
-      anchoredToBottom: true,
-      bodyDisplayMode: "html",
-      loadRemoteContent: false,
-      showTimelineAvatars: true,
-      entities: [
-        {
-          id: "maya",
-          name: "Maya Chen",
-          kind: "person",
-          primaryAddress: "maya.chen@example.net",
-          detail: "Potential false-positive Junk sender",
-          messageCount: 22,
-          unreadCount: 22,
-          lastMessageAt: personMessages.at(-1)?.messageDate,
-          sourceAccounts: ["gmail"]
-        },
-        {
-          id: "github",
-          name: "GitHub",
-          kind: "service",
-          primaryAddress: "notifications@github.com",
-          detail: "Security notifications in Junk",
-          messageCount: 18,
-          unreadCount: 18,
-          lastMessageAt: githubMessages.at(-1)?.messageDate,
-          sourceAccounts: ["outlook"]
-        }
+    entities: withLatestDates(
+      [
+        { ...personEntity, unreadCount: 22, latestSubject: "Potential false-positive Junk sender", workspace: "junk" },
+        { ...githubEntity, unreadCount: 18, latestSubject: "Security notifications in Junk", workspace: "junk" }
       ],
-      messages: junkPersonMessages
-    }
+      {
+        [personEntity.id]: junkPersonItems,
+        [githubEntity.id]: junkGithubItems
+      }
+    ),
+    itemsByEntity: {
+      [personEntity.id]: junkPersonItems,
+      [githubEntity.id]: junkGithubItems
+    },
+    state: stateFor(
+      { ...personEntity, unreadCount: 22, latestSubject: "Potential false-positive Junk sender", workspace: "junk" },
+      junkPersonItems
+    )
   }
 ];
 
-function toJunkMessage(message: TimelineMessage): TimelineMessage {
-  return {
-    ...message,
-    folderName: "Junk",
-    folderRole: "junk",
-    flags: message.flags.filter((flag) => flag !== "Seen")
+function stateFor(
+  selectedEntity: TimelineEntity,
+  items: TimelineItem[],
+  options: {
+    hasOlderTimeline?: boolean;
+    displayOptions?: Partial<TimelineState["displayOptions"]>;
+  } = {}
+): TimelineState {
+  const entityWithLatestDate = {
+    ...selectedEntity,
+    latestDate: items.at(-1)?.date ?? selectedEntity.latestDate ?? null
   };
+
+  return {
+    entity: entityWithLatestDate,
+    items,
+    isLoadingTimeline: false,
+    isLoadingOlderTimeline: false,
+    isLoadingNewerTimeline: false,
+    hasOlderTimeline: options.hasOlderTimeline ?? false,
+    hasNewerTimeline: false,
+    bodyStates: Object.fromEntries(
+      items
+        .filter((item) => !item.html && item.preview)
+        .map((item) => [
+          String(item.id),
+          { status: "loaded", body: { html: null, text: item.preview } }
+        ])
+    ),
+    attachmentDownloadStates: {},
+    replySendState: { status: "idle" },
+    sendAccounts: [],
+    selectedSendAccountKey: null,
+    scrollAnchor: { id: items.at(-1)?.id ?? entityWithLatestDate.id, edge: "bottom", generation: 0 },
+    displayOptions: {
+      bodyDisplayMode: "html",
+      loadRemoteContent: false,
+      showTimelineAvatars: true,
+      showOwnTimelineAvatars: true,
+      hideQuotedReplyText: false,
+      hideReplySubjects: false,
+      ...options.displayOptions
+    },
+    windowState: {
+      bottomOverlayHeight: 0
+    }
+  };
+}
+
+function withLatestDates(
+  entities: TimelineEntity[],
+  itemsByEntity: Record<string, TimelineItem[]>
+) {
+  return entities.map((candidate) => ({
+    ...candidate,
+    latestDate: itemsByEntity[String(candidate.id)]?.at(-1)?.date ?? null
+  }));
+}
+
+function toJunkItem(item: TimelineItem): TimelineItem {
+  return {
+    ...item,
+    folderLabel: "Junk",
+    isFlagged: false
+  };
+}
+
+function buildQuotedReplyItems(): TimelineItem[] {
+  const baseItem = buildConversation(personEntity, 2)[0];
+  const textReply: TimelineItem = {
+    ...baseItem,
+    id: 90_001,
+    envelopeID: "gmail-maya-quoted-text",
+    accountLabel: "gmail",
+    accountEmoji: "G",
+    folderLabel: "[Gmail]/Sent Mail",
+    subject: "Re: Plain quoted reply",
+    preview: "I will handle this today.",
+    date: isoHoursAgo(2),
+    direction: "outgoing",
+    html: null
+  };
+  const htmlReply: TimelineItem = {
+    ...baseItem,
+    id: 90_002,
+    envelopeID: "outlook-maya-quoted-html",
+    accountLabel: "outlook",
+    accountEmoji: "O",
+    folderLabel: "Sent",
+    subject: "Re: Outlook quoted reply",
+    preview: "I cleaned up the draft and sent the latest version.",
+    date: isoHoursAgo(1),
+    direction: "outgoing",
+    html: `
+      <div class="elementToProof">I cleaned up the draft and sent the latest version.</div>
+      <div id="appendonsend"></div>
+      <hr>
+      <div id="divRplyFwdMsg" dir="ltr">
+        <b>发件人:</b> Maya Chen<br>
+        <b>发送时间:</b> Sunday, May 31, 2026 16:36<br>
+        <b>收件人:</b> Ryan<br>
+        <b>主题:</b> Outlook quoted reply
+      </div>
+      <div>
+        <div dir="ltr">Previous message body that should not appear when quote hiding is enabled.</div>
+      </div>
+    `
+  };
+
+  return [textReply, htmlReply];
 }

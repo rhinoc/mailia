@@ -3,9 +3,12 @@ import Foundation
 public struct SyncPolicy: Sendable, Equatable {
     public var mainHistoryWindow: Duration
     public var junkHistoryWindow: Duration
+    /// Overlap subtracted from the previous checkpoint high-water to produce queryStart.
+    /// The 24-hour default matches current date-only provider queries.
     public var checkpointOverlap: Duration
     public var initialPerFolderLimit: Int
     public var incrementalPerFolderLimit: Int
+    public var fullHistoryPerFolderPageSize: Int
     public var foregroundInterval: Duration
     public var maxConcurrentAccounts: Int
     public var maxConcurrentFoldersPerAccount: Int
@@ -17,6 +20,7 @@ public struct SyncPolicy: Sendable, Equatable {
         checkpointOverlap: Duration = .hours(24),
         initialPerFolderLimit: Int = 500,
         incrementalPerFolderLimit: Int = 200,
+        fullHistoryPerFolderPageSize: Int = 500,
         foregroundInterval: Duration = .minutes(10),
         maxConcurrentAccounts: Int = 2,
         maxConcurrentFoldersPerAccount: Int = 2,
@@ -27,6 +31,7 @@ public struct SyncPolicy: Sendable, Equatable {
         self.checkpointOverlap = checkpointOverlap
         self.initialPerFolderLimit = initialPerFolderLimit
         self.incrementalPerFolderLimit = incrementalPerFolderLimit
+        self.fullHistoryPerFolderPageSize = fullHistoryPerFolderPageSize
         self.foregroundInterval = foregroundInterval
         self.maxConcurrentAccounts = maxConcurrentAccounts
         self.maxConcurrentFoldersPerAccount = maxConcurrentFoldersPerAccount

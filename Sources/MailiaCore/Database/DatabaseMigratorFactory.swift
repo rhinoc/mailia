@@ -72,7 +72,6 @@ public enum DatabaseMigratorFactory {
                     to_recipients_json TEXT,
                     cc_recipients_json TEXT,
                     message_date TEXT,
-                    direction TEXT NOT NULL DEFAULT 'incoming',
                     has_attachments INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -107,6 +106,7 @@ public enum DatabaseMigratorFactory {
                     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                     entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
                     relation_kind TEXT NOT NULL,
+                    timeline_direction TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (message_id, entity_id, relation_kind)
                 );
@@ -137,6 +137,10 @@ public enum DatabaseMigratorFactory {
                     folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
                     workspace TEXT NOT NULL,
                     last_successful_sync_at TEXT,
+                    last_successful_sync_started_at TEXT,
+                    last_successful_sync_finished_at TEXT,
+                    last_successful_query_start_at TEXT,
+                    oldest_synced_message_date TEXT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -181,6 +185,22 @@ public enum DatabaseMigratorFactory {
             try db.execute(sql: """
                 ALTER TABLE accounts ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0;
                 """)
+        }
+
+        migrator.registerMigration("v4_sync_checkpoint_metadata") { db in
+            let columns = Set(try db.columns(in: "sync_checkpoints").map(\.name))
+            if !columns.contains("last_successful_sync_started_at") {
+                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN last_successful_sync_started_at TEXT")
+            }
+            if !columns.contains("last_successful_sync_finished_at") {
+                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN last_successful_sync_finished_at TEXT")
+            }
+            if !columns.contains("last_successful_query_start_at") {
+                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN last_successful_query_start_at TEXT")
+            }
+            if !columns.contains("oldest_synced_message_date") {
+                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN oldest_synced_message_date TEXT")
+            }
         }
 
         return migrator

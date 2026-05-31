@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import type { TimelineBridge } from "../bridge/timelineBridge";
-import { debugLog, debugLogEnabled } from "../debugLog";
-import type { TimelineMessage, TimelineState } from "../types";
+import type { BodyDisplayMode, TimelineItem, TimelineMessageView, TimelineState } from "../types";
 import { MessageCard } from "./MessageCard";
 
 interface TimelineViewProps {
@@ -11,7 +10,14 @@ interface TimelineViewProps {
 }
 
 export function TimelineView({ bridge, state }: TimelineViewProps) {
-  const selectedEntityID = state.selectedEntityID ?? undefined;
+  const selectedEntityID = state.entity?.id;
+  const displayOptions = state.displayOptions;
+  const windowState = state.windowState;
+  const messageViews = useMemo(
+    () => state.items.map((item) => toMessageView(item, state)),
+    [state]
+  );
+  const bodyDisplayMode = normalizeBodyDisplayMode(displayOptions.bodyDisplayMode);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollSettleTimerRef = useRef<number | null>(null);
   const isScrollSettlingRef = useRef(false);
@@ -21,6 +27,9 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   const [bodyHeightCache, setBodyHeightCache] = useState<Record<string, number>>({});
   const useNativeChrome = bridge.mode === "native";
   const topAnchorOffset = useNativeChrome ? -86 : -34;
+  const bottomOverlayHeight = useNativeChrome ? Math.max(0, windowState.bottomOverlayHeight) : 0;
+  const bottomChromeReserve = useNativeChrome ? Math.max(104, bottomOverlayHeight + 28) : 0;
+  const anchoredToBottom = state.scrollAnchor?.edge === "bottom";
   const TimelineTopReserveHeader = useMemo(
     () =>
       function TimelineTopReserveHeader() {
@@ -37,9 +46,9 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   const BottomChromeReserveFooter = useMemo(
     () =>
       function BottomChromeReserveFooter() {
-        return <div aria-hidden="true" style={{ height: 80 }} />;
+        return <div aria-hidden="true" style={{ height: bottomChromeReserve }} />;
       },
-    []
+    [bottomChromeReserve]
   );
   const virtuosoComponents = useMemo(
     () => ({
@@ -48,9 +57,8 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     }),
     [useNativeChrome, BottomChromeReserveFooter, TimelineTopReserveHeader]
   );
-
   const requestBody = useCallback(
-    (message: TimelineMessage, bodyPriority: number) => {
+    (message: TimelineMessageView, bodyPriority: number) => {
       bridge.send({
         type: "requestBody",
         messageID: message.messageID,
@@ -64,7 +72,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   );
 
   const downloadAttachments = useCallback(
-    (message: TimelineMessage) => {
+    (message: TimelineMessageView) => {
       bridge.send({
         type: "downloadAttachments",
         messageID: message.messageID
@@ -72,33 +80,6 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     },
     [bridge]
   );
-
-  useEffect(() => {
-    if (!debugLogEnabled) return;
-    debugLog("timeline state", {
-      entityID: selectedEntityID ?? null,
-      messages: state.messages.length,
-      first: state.messages[0]?.messageID ?? null,
-      last: state.messages.at(-1)?.messageID ?? null,
-      loading: state.isLoading,
-      loadingOlder: state.isLoadingOlderMessages,
-      hasOlder: state.hasOlderMessages,
-      anchored: state.anchoredToBottom,
-      mode: state.bodyDisplayMode,
-      remote: state.loadRemoteContent,
-      avatars: state.showTimelineAvatars
-    });
-  }, [
-    selectedEntityID,
-    state.anchoredToBottom,
-    state.bodyDisplayMode,
-    state.hasOlderMessages,
-    state.isLoading,
-    state.isLoadingOlderMessages,
-    state.loadRemoteContent,
-    state.showTimelineAvatars,
-    state.messages
-  ]);
 
   useEffect(() => {
     return () => {
@@ -110,9 +91,6 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   }, []);
 
   const handleScrolling = useCallback((isScrolling: boolean) => {
-    if (debugLogEnabled) {
-      debugLog("virtuoso scrolling", { isScrolling });
-    }
     if (scrollSettleTimerRef.current !== null) {
       window.clearTimeout(scrollSettleTimerRef.current);
       scrollSettleTimerRef.current = null;
@@ -130,9 +108,6 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     scrollSettleTimerRef.current = window.setTimeout(() => {
       scrollSettleTimerRef.current = null;
       isScrollSettlingRef.current = false;
-      if (debugLogEnabled) {
-        debugLog("scroll settled, wake body requests");
-      }
       setBodyRequestWakeToken((value) => value + 1);
     }, 160);
   }, []);
@@ -156,9 +131,6 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     (atBottom: boolean) => {
       if (lastAtBottomRef.current === atBottom) return;
       lastAtBottomRef.current = atBottom;
-      if (debugLogEnabled) {
-        debugLog("virtuoso at bottom", { atBottom });
-      }
       bridge.send({ type: "setScrolledToBottom", atBottom });
     },
     [bridge]
@@ -182,8 +154,8 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
 
     const index =
       anchor.edge === "bottom"
-        ? state.messages.length - 1
-        : state.messages.findIndex((message) => String(message.messageID) === String(anchor.id));
+        ? state.items.length - 1
+        : state.items.findIndex((item) => item.id === anchor.id);
     if (index < 0) {
       return;
     }
@@ -199,17 +171,13 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     });
 
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [state.messages, state.scrollAnchor, topAnchorOffset]);
-
-  if (state.error) {
-    return <main className="timeline timeline--empty">{state.error}</main>;
-  }
+  }, [state.items, state.scrollAnchor, topAnchorOffset]);
 
   return (
     <main
       className="timeline"
       aria-label="Mail timeline"
-      aria-busy={state.isLoading && state.messages.length === 0 ? true : undefined}
+      aria-busy={state.isLoadingTimeline && state.items.length === 0 ? true : undefined}
     >
       <div className="timeline__list-shell">
         <Virtuoso
@@ -217,31 +185,23 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
           key={selectedEntityID ?? "none"}
           className="timeline__list"
           style={{ height: "100%", minHeight: 0, width: "100%" }}
-          data={state.messages}
+          data={messageViews}
           components={virtuosoComponents}
           alignToBottom
           defaultItemHeight={360}
-          followOutput={state.anchoredToBottom ? "auto" : false}
+          followOutput={anchoredToBottom ? "auto" : false}
           increaseViewportBy={{ top: 720, bottom: 720 }}
-          initialTopMostItemIndex={Math.max(0, state.messages.length - 1)}
+          initialTopMostItemIndex={Math.max(0, messageViews.length - 1)}
           computeItemKey={(index, message) =>
             message?.messageID ?? `missing-message-${selectedEntityID ?? "none"}-${index}`
           }
           isScrolling={handleScrolling}
           startReached={() => {
-            if (debugLogEnabled) {
-              debugLog("virtuoso start reached", {
-                hasOlder: state.hasOlderMessages,
-                loadingOlder: state.isLoadingOlderMessages,
-                entityID: selectedEntityID ?? null,
-                beforeMessageID: state.messages[0]?.messageID ?? null
-              });
-            }
-            if (state.hasOlderMessages && !state.isLoadingOlderMessages && selectedEntityID) {
+            if (state.hasOlderTimeline && !state.isLoadingOlderTimeline && selectedEntityID !== undefined) {
               bridge.send({
                 type: "requestOlderMessages",
                 entityID: selectedEntityID,
-                beforeMessageID: state.messages[0]?.messageID
+                beforeMessageID: state.items[0]?.id
               });
             }
           }}
@@ -251,13 +211,15 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
               return null;
             }
 
-            const previousMessage = index > 0 ? state.messages[index - 1] : undefined;
+            const previousMessage = index > 0 ? messageViews[index - 1] : undefined;
             const nextMessage =
-              index < state.messages.length - 1 ? state.messages[index + 1] : undefined;
+              index < messageViews.length - 1 ? messageViews[index + 1] : undefined;
             const bodyHeightCacheKey = messageBodyHeightCacheKey(
               message,
-              state.bodyDisplayMode,
-              state.loadRemoteContent
+              bodyDisplayMode,
+              displayOptions.loadRemoteContent,
+              displayOptions.hideQuotedReplyText,
+              displayOptions.hideReplySubjects
             );
 
             return (
@@ -270,17 +232,26 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
                 <MessageCard
                   message={message}
                   cluster={messageCluster(message, previousMessage, nextMessage)}
-                  showSubject={shouldShowSubject(message, previousMessage)}
-                  bodyDisplayMode={state.bodyDisplayMode}
-                  loadRemoteContent={state.loadRemoteContent}
-                  showAvatar={state.showTimelineAvatars}
+                  showSubject={shouldShowSubject(
+                    message,
+                    previousMessage,
+                    displayOptions.hideReplySubjects
+                  )}
+                  bodyDisplayMode={bodyDisplayMode}
+                  loadRemoteContent={displayOptions.loadRemoteContent}
+                  hideQuotedReplyText={displayOptions.hideQuotedReplyText}
+                  showAvatar={
+                    message.direction === "outgoing"
+                      ? displayOptions.showOwnTimelineAvatars
+                      : displayOptions.showTimelineAvatars
+                  }
                   bodyRequestWakeToken={bodyRequestWakeToken}
                   bodyRequestPriority={bodyRequestWakeToken * 1_000_000 + index}
                   reservedBodyHeight={bodyHeightCache[bodyHeightCacheKey]}
                   bodyHeightCacheKey={bodyHeightCacheKey}
                   shouldDeferBodyRequest={shouldDeferBodyRequest}
                   attachmentState={
-                    state.attachmentDownloadStates?.[String(message.messageID)] ?? {
+                    state.attachmentDownloadStates[String(message.messageID)] ?? {
                       status: "idle"
                     }
                   }
@@ -297,21 +268,63 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   );
 }
 
+function normalizeBodyDisplayMode(value: string): BodyDisplayMode {
+  return value === "markdown" ? "markdown" : "html";
+}
+
+function toMessageView(item: TimelineItem, state: TimelineState): TimelineMessageView {
+  const bodyState = state.bodyStates[String(item.id)];
+  const loadedBody = bodyState?.status === "loaded" ? bodyState.body : undefined;
+  const bodyStatus = item.html ? "loaded" : (bodyState?.status ?? "notRequested");
+  const direction = item.direction === "outgoing" ? "outgoing" : "incoming";
+
+  return {
+    messageID: item.id,
+    accountKey: item.accountLabel,
+    folderName: item.folderLabel,
+    himalayaEnvelopeID: item.envelopeID,
+    flags: item.isFlagged ? ["flagged"] : [],
+    subject: item.subject,
+    fromLabel: item.fromLabel,
+    toLabel: item.toLabel,
+    messageDate: item.date ?? null,
+    direction,
+    hasAttachments: item.hasAttachments,
+    bodyStatus,
+    sanitizedHTML: loadedBody?.html ?? item.html ?? null,
+    textFallback: loadedBody?.text ?? (bodyState?.status === "failed" ? item.preview : null),
+    avatarSeed: state.entity
+      ? `${state.entity.id}-${state.entity.displayName}`
+      : null,
+    avatarName: direction === "outgoing"
+      ? item.accountLabel
+      : (state.entity?.displayName ?? item.fromLabel),
+    avatarEmoji: direction === "outgoing" ? (item.accountEmoji ?? null) : null,
+    avatarImageDataURL: direction === "outgoing"
+      ? (item.accountAvatarImageDataURL ?? null)
+      : (state.entity?.avatarImageDataURL ?? null)
+  };
+}
+
 function messageBodyHeightCacheKey(
-  message: TimelineMessage,
+  message: TimelineMessageView,
   bodyDisplayMode: string,
-  loadRemoteContent: boolean
+  loadRemoteContent: boolean,
+  hideQuotedReplyText: boolean,
+  hideReplySubjects: boolean
 ) {
   return [
     message.messageID,
     bodyDisplayMode,
-    loadRemoteContent ? "remote" : "blocked"
+    loadRemoteContent ? "remote" : "blocked",
+    hideQuotedReplyText ? "quotes-hidden" : "quotes-shown",
+    hideReplySubjects ? "reply-subjects-hidden" : "reply-subjects-shown"
   ].join(":");
 }
 
 function shouldShowDateSeparator(
-  message: TimelineMessage,
-  previousMessage?: TimelineMessage
+  message: TimelineMessageView,
+  previousMessage?: TimelineMessageView
 ) {
   if (!message.messageDate) return false;
   if (!previousMessage?.messageDate) return true;
@@ -319,25 +332,34 @@ function shouldShowDateSeparator(
   return dateKey(message.messageDate) !== dateKey(previousMessage.messageDate);
 }
 
-function shouldShowSubject(message: TimelineMessage, previousMessage?: TimelineMessage) {
+function shouldShowSubject(
+  message: TimelineMessageView,
+  previousMessage: TimelineMessageView | undefined,
+  hideReplySubjects: boolean
+) {
   if (!message.subject) return false;
+  if (hideReplySubjects && isReplySubject(message.subject)) return false;
   if (!previousMessage?.subject) return true;
 
   return normalizeSubject(message.subject) !== normalizeSubject(previousMessage.subject);
 }
 
+function isReplySubject(subject: string) {
+  return /^\s*(re|回复|答复|回覆)\s*[:：]/i.test(subject);
+}
+
 function normalizeSubject(subject: string) {
   return subject
-    .replace(/^(\s*(re|fw|fwd)\s*:\s*)+/i, "")
+    .replace(/^(\s*(re|fw|fwd|回复|答复|回覆)\s*[:：]\s*)+/i, "")
     .replace(/\s+/g, " ")
     .trim()
     .toLocaleLowerCase();
 }
 
 function messageCluster(
-  message: TimelineMessage,
-  previousMessage?: TimelineMessage,
-  nextMessage?: TimelineMessage
+  message: TimelineMessageView,
+  previousMessage?: TimelineMessageView,
+  nextMessage?: TimelineMessageView
 ) {
   const continuesPrevious = isSameVisualGroup(message, previousMessage);
   const continuesNext = isSameVisualGroup(message, nextMessage);
@@ -348,7 +370,7 @@ function messageCluster(
   return "single";
 }
 
-function isSameVisualGroup(message: TimelineMessage, other?: TimelineMessage) {
+function isSameVisualGroup(message: TimelineMessageView, other?: TimelineMessageView) {
   if (!other || message.direction !== other.direction) return false;
   if (!message.messageDate || !other.messageDate) return true;
 

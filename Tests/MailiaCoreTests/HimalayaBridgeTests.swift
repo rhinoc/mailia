@@ -120,15 +120,16 @@ func buildsMessageMutationAndAttachmentCommands() {
         "Hello there"
     ])
 
-    #expect(HimalayaCommand.templateSend(
+    let sendTemplateCommand = HimalayaCommand.templateSend(
         template: "From: me@example.com\n\nHello",
         account: "work"
-    ).arguments == [
+    )
+    #expect(sendTemplateCommand.arguments == [
         "--output", "json", "--quiet",
         "template", "send",
-        "--account", "work",
-        "From: me@example.com\n\nHello"
+        "--account", "work"
     ])
+    #expect(sendTemplateCommand.standardInput == Data("From: me@example.com\n\nHello".utf8))
 }
 
 @Test
@@ -146,6 +147,22 @@ func decodesJSONFromResultStdout() throws {
     )
 
     #expect(try result.decodeJSON(as: Payload.self) == Payload(name: "work"))
+}
+
+@Test
+func nonZeroExitErrorDescriptionIncludesHimalayaOutput() {
+    let result = HimalayaResult(
+        command: .templateSend(template: "bad", account: "work"),
+        exitCode: 1,
+        stdoutData: Data(),
+        stderrData: "Error: cannot parse template".data(using: .utf8)!,
+        duration: 0.01
+    )
+
+    let error = HimalayaError.nonZeroExit(result)
+
+    #expect(error.localizedDescription.contains("Himalaya exited with status 1"))
+    #expect(error.localizedDescription.contains("cannot parse template"))
 }
 
 @Test

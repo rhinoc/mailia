@@ -72,12 +72,34 @@ public struct HimalayaResult: Equatable, Sendable {
     }
 }
 
-public enum HimalayaError: Error, Equatable, Sendable {
+public enum HimalayaError: LocalizedError, Equatable, Sendable {
     case invalidTimeout(TimeInterval)
     case launchFailed(String)
     case timedOut(command: HimalayaCommand, timeout: TimeInterval, stdout: String, stderr: String)
     case nonZeroExit(HimalayaResult)
     case jsonDecodeFailed(message: String, stdout: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .invalidTimeout(timeout):
+            "Invalid Himalaya timeout: \(timeout)."
+        case let .launchFailed(message):
+            "Unable to launch Himalaya: \(message)"
+        case let .timedOut(command, timeout, stdout, stderr):
+            "Himalaya timed out after \(timeout)s while running \(command.arguments.joined(separator: " ")). \(Self.outputDescription(stdout: stdout, stderr: stderr))"
+        case let .nonZeroExit(result):
+            "Himalaya exited with status \(result.exitCode) while running \(result.command.arguments.joined(separator: " ")). \(Self.outputDescription(stdout: result.stdout, stderr: result.stderr))"
+        case let .jsonDecodeFailed(message, stdout):
+            "Unable to decode Himalaya JSON: \(message). Output: \(stdout)"
+        }
+    }
+
+    private static func outputDescription(stdout: String, stderr: String) -> String {
+        let output = [stderr, stdout]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        return output.map { "Output: \($0)" } ?? "No output was captured."
+    }
 }
 
 public protocol HimalayaBridge: Sendable {
@@ -445,8 +467,10 @@ public extension HimalayaCommand {
     ) -> HimalayaCommand {
         var arguments = ["template", "send"]
         arguments += accountArguments(account)
-        arguments.append(template)
-        return HimalayaCommand(arguments: jsonArguments(arguments))
+        return HimalayaCommand(
+            arguments: jsonArguments(arguments),
+            standardInput: template.data(using: .utf8)
+        )
     }
 
     private static func jsonArguments(_ arguments: [String]) -> [String] {

@@ -1,12 +1,23 @@
 import Foundation
 
 public struct SyncWindow: Sendable, Equatable {
-    public var startDate: Date
+    public var queryStart: Date
+    public var checkpointHighWater: Date?
     public var pageSize: Int
 
-    public init(startDate: Date, pageSize: Int) {
-        self.startDate = startDate
+    public var startDate: Date {
+        get { queryStart }
+        set { queryStart = newValue }
+    }
+
+    public init(queryStart: Date, checkpointHighWater: Date?, pageSize: Int) {
+        self.queryStart = queryStart
+        self.checkpointHighWater = checkpointHighWater
         self.pageSize = pageSize
+    }
+
+    public init(startDate: Date, pageSize: Int) {
+        self.init(queryStart: startDate, checkpointHighWater: nil, pageSize: pageSize)
     }
 }
 
@@ -22,20 +33,34 @@ public struct SyncWindowCalculator: Sendable {
     public func initialWindow(now: Date, isJunk: Bool) -> SyncWindow {
         let duration = isJunk ? policy.junkHistoryWindow : policy.mainHistoryWindow
         return SyncWindow(
-            startDate: now - duration.timeIntervalApproximation,
+            queryStart: now - duration.timeIntervalApproximation,
+            checkpointHighWater: now,
             pageSize: policy.initialPerFolderLimit
         )
     }
 
+    public func fullHistoryWindow(checkpointHighWater: Date? = nil) -> SyncWindow {
+        SyncWindow(
+            queryStart: Date(timeIntervalSince1970: 0),
+            checkpointHighWater: checkpointHighWater,
+            pageSize: policy.fullHistoryPerFolderPageSize
+        )
+    }
+
     public func incrementalWindow(now: Date, lastSuccessfulSyncAt: Date?, isJunk: Bool) -> SyncWindow {
-        guard let lastSuccessfulSyncAt else {
+        incrementalWindow(now: now, lastCheckpointHighWater: lastSuccessfulSyncAt, isJunk: isJunk)
+    }
+
+    public func incrementalWindow(now: Date, lastCheckpointHighWater: Date?, isJunk: Bool) -> SyncWindow {
+        guard let lastCheckpointHighWater else {
             return initialWindow(now: now, isJunk: isJunk)
         }
 
         let historicalStart = initialWindow(now: now, isJunk: isJunk).startDate
-        let overlappedStart = lastSuccessfulSyncAt - policy.checkpointOverlap.timeIntervalApproximation
+        let overlappedStart = lastCheckpointHighWater - policy.checkpointOverlap.timeIntervalApproximation
         return SyncWindow(
-            startDate: max(historicalStart, overlappedStart),
+            queryStart: max(historicalStart, overlappedStart),
+            checkpointHighWater: now,
             pageSize: policy.incrementalPerFolderLimit
         )
     }

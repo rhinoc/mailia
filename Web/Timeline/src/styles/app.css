@@ -120,11 +120,72 @@ button {
 }
 
 .entity-list {
+  position: relative;
   min-height: 0;
   overflow: auto;
   border-right: 1px solid var(--mailia-separator);
   background: var(--mailia-canvas);
   padding: 6px 0;
+}
+
+.elastic-pull {
+  --pull-distance: 0px;
+  --pull-opacity: 0;
+  position: sticky;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 0;
+  overflow: visible;
+  color: var(--mailia-secondary-text);
+  opacity: var(--pull-opacity);
+  pointer-events: none;
+  transform: translateY(0);
+  transition: opacity 120ms ease;
+}
+
+.elastic-pull[data-visible="true"] {
+  opacity: var(--pull-opacity);
+}
+
+.elastic-pull--top {
+  top: 0;
+  margin-bottom: -1px;
+  padding-top: min(var(--pull-distance), 42px);
+  transform: translateY(calc(min(var(--pull-distance), 42px) * -1));
+}
+
+.pull-spinner {
+  --pull-spinner-color: color-mix(in srgb, CanvasText 58%, Canvas);
+  position: relative;
+  display: block;
+  width: 25px;
+  height: 25px;
+  color: var(--pull-spinner-color);
+}
+
+.pull-spinner[data-refreshing="true"] {
+  animation: mailia-spin 860ms linear infinite;
+}
+
+.pull-spinner__bar {
+  position: absolute;
+  top: 0;
+  left: 11px;
+  width: 3px;
+  height: 8px;
+  border-radius: 10px;
+  background: currentColor;
+  opacity: var(--bar-opacity);
+  transform: rotate(var(--bar-angle));
+  transform-origin: 1.5px 12.5px;
+}
+
+@keyframes mailia-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .entity-list__item {
@@ -268,12 +329,14 @@ button {
 .timeline__list {
   height: 100%;
   overflow-x: hidden;
-  overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: auto;
 }
 
 .timeline__list [data-virtuoso-scroller] {
   overflow-x: hidden;
-  overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: auto;
 }
 
 .timeline__list [data-testid="virtuoso-item-list"] {
@@ -320,7 +383,8 @@ button {
 }
 
 .message-row[data-direction="outgoing"] {
-  justify-content: flex-end;
+  flex-direction: row-reverse;
+  justify-content: flex-start;
 }
 
 .message-avatar {
@@ -334,13 +398,26 @@ button {
   z-index: 2;
 }
 
-.message-avatar img {
+.message-avatar img,
+.message-avatar__emoji {
   display: block;
   width: 34px;
   height: 34px;
   border-radius: 50%;
   background: var(--mailia-canvas);
+}
+
+.message-avatar img {
   object-fit: cover;
+}
+
+.message-avatar__emoji {
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: color-mix(in srgb, CanvasText 8%, Canvas);
+  font-size: 18px;
+  line-height: 1;
 }
 
 .message-avatar:empty {
@@ -348,7 +425,7 @@ button {
 }
 
 .message-row[data-direction="outgoing"] .message-avatar {
-  display: none;
+  margin-right: 0;
 }
 
 .message-row[data-cluster="start"],
@@ -465,8 +542,8 @@ button {
 }
 
 .message-row[data-direction="outgoing"] .message-card__header {
-  justify-content: flex-end;
-  text-align: right;
+  justify-content: flex-start;
+  text-align: left;
 }
 
 .message-card__subject {
@@ -535,16 +612,16 @@ button {
 
 .mail-body-frame {
   position: relative;
-  min-height: 48px;
+  min-height: 0;
   overflow: hidden;
   background: transparent;
 }
 
 .mail-body-reserve {
-  min-height: 120px;
+  min-height: 0;
 }
 
-.mail-body-reserve > .mail-body-frame {
+.mail-body-reserve > .mail-body--placeholder {
   min-height: inherit;
 }
 
@@ -567,9 +644,11 @@ button {
 .mail-body__content {
   box-sizing: border-box;
   min-width: 100%;
-  padding: 16px;
+  padding: 8px 10px;
   overflow-wrap: anywhere;
   color: CanvasText;
+  font-size: 14px;
+  line-height: 1.42;
 }
 
 .mail-body__content img,
@@ -584,7 +663,8 @@ button {
   height: auto;
 }
 
-.mail-body__blocked-image {
+.mail-body__blocked-image,
+.mailia-remote-image-placeholder {
   align-items: center !important;
   justify-content: center !important;
   overflow: hidden !important;
@@ -805,6 +885,43 @@ button {
   color: #dbeafe;
 }
 
+.message-row[data-direction="outgoing"] .mail-body--html .mail-body__content :where(
+  p,
+  span,
+  div,
+  li,
+  ul,
+  ol,
+  td,
+  th,
+  tr,
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  label,
+  font,
+  b,
+  i,
+  em,
+  strong,
+  small,
+  blockquote,
+  pre,
+  code
+):not(a):not(img):not(svg):not(table) {
+  color: inherit !important;
+}
+
+.message-row[data-direction="outgoing"] .mail-body__content img[data-mailia-remote-content-blocked="true"],
+.message-row[data-direction="outgoing"] .mail-body__blocked-image,
+.message-row[data-direction="outgoing"] .mailia-remote-image-placeholder {
+  background: rgb(255 255 255 / 18%) !important;
+  color: rgb(255 255 255 / 82%) !important;
+}
+
 .message-row[data-direction="outgoing"] .mail-markdown {
   color: #ffffff;
 }
@@ -946,7 +1063,9 @@ button {
     background: rgb(255 255 255 / 26%);
   }
 
-  .message-row[data-direction="incoming"] .mail-body__content img[data-mailia-remote-content-blocked="true"] {
+  .message-row[data-direction="incoming"] .mail-body__content img[data-mailia-remote-content-blocked="true"],
+  .message-row[data-direction="incoming"] .mail-body__blocked-image,
+  .message-row[data-direction="incoming"] .mailia-remote-image-placeholder {
     background: rgb(255 255 255 / 18%);
     color: rgb(255 255 255 / 82%);
   }

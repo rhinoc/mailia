@@ -1,12 +1,17 @@
 import MailiaCore
 import AppKit
 import SwiftUI
-import WebKit
 
 enum MailiaPreferenceKeys {
     static let timelineBodyDisplayMode = "MailiaTimelineBodyDisplayMode"
     static let loadRemoteContent = "MailiaLoadRemoteContent"
     static let showTimelineAvatars = "MailiaShowTimelineAvatars"
+    static let showOwnTimelineAvatars = "MailiaShowOwnTimelineAvatars"
+    static let hideQuotedReplyText = "MailiaHideQuotedReplyText"
+    static let hideReplySubjects = "MailiaHideReplySubjects"
+    static let autoSyncEnabled = "MailiaAutoSyncEnabled"
+    static let autoSyncIntervalMinutes = "MailiaAutoSyncIntervalMinutes"
+    static let downloadsDirectoryPath = "MailiaDownloadsDirectoryPath"
 }
 
 private enum MailiaTopChrome {
@@ -64,6 +69,43 @@ private enum TimelineBodyDisplayMode: String, CaseIterable, Identifiable {
             "HTML"
         case .markdown:
             "Markdown"
+        }
+    }
+}
+
+@propertyWrapper
+private struct TimelineDisplayOptionsStorage: DynamicProperty {
+    @AppStorage(MailiaPreferenceKeys.timelineBodyDisplayMode)
+    private var bodyDisplayMode = TimelineBodyDisplayMode.html.rawValue
+    @AppStorage(MailiaPreferenceKeys.loadRemoteContent)
+    private var loadRemoteContent = false
+    @AppStorage(MailiaPreferenceKeys.showTimelineAvatars)
+    private var showTimelineAvatars = true
+    @AppStorage(MailiaPreferenceKeys.showOwnTimelineAvatars)
+    private var showOwnTimelineAvatars = true
+    @AppStorage(MailiaPreferenceKeys.hideQuotedReplyText)
+    private var hideQuotedReplyText = false
+    @AppStorage(MailiaPreferenceKeys.hideReplySubjects)
+    private var hideReplySubjects = false
+
+    var wrappedValue: TimelineDisplayOptions {
+        get {
+            TimelineDisplayOptions(
+                bodyDisplayMode: bodyDisplayMode,
+                loadRemoteContent: loadRemoteContent,
+                showTimelineAvatars: showTimelineAvatars,
+                showOwnTimelineAvatars: showOwnTimelineAvatars,
+                hideQuotedReplyText: hideQuotedReplyText,
+                hideReplySubjects: hideReplySubjects
+            )
+        }
+        nonmutating set {
+            bodyDisplayMode = newValue.bodyDisplayMode
+            loadRemoteContent = newValue.loadRemoteContent
+            showTimelineAvatars = newValue.showTimelineAvatars
+            showOwnTimelineAvatars = newValue.showOwnTimelineAvatars
+            hideQuotedReplyText = newValue.hideQuotedReplyText
+            hideReplySubjects = newValue.hideReplySubjects
         }
     }
 }
@@ -242,6 +284,10 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
 
 private struct ContentView: View {
     @ObservedObject var viewModel: AppViewModel
+    @AppStorage(MailiaPreferenceKeys.autoSyncEnabled)
+    private var autoSyncEnabled = true
+    @AppStorage(MailiaPreferenceKeys.autoSyncIntervalMinutes)
+    private var autoSyncIntervalMinutes = 10
     @State private var columnVisibility: NavigationSplitViewVisibility
     @State private var sidebarWasCollapsedByResize = false
 
@@ -267,13 +313,13 @@ private struct ContentView: View {
             EntityListPane(viewModel: viewModel)
                 .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 430)
                 .toolbar {
-                    ToolbarItemGroup(placement: .primaryAction) {
-                        RefreshButton(viewModel: viewModel) {
-                            Task {
-                                await viewModel.refresh()
-                            }
-                        }
-                    }
+                    RefreshToolbarContent(
+                        isRefreshing: viewModel.isRefreshing,
+                        refreshStatus: viewModel.refreshStatus,
+                        refreshActivity: viewModel.refreshActivity,
+                        avatarResolutionActivity: viewModel.avatarResolutionActivity,
+                        onRefresh: refresh
+                    )
                 }
         } detail: {
             TimelinePane(
@@ -298,14 +344,14 @@ private struct ContentView: View {
                     viewModel.loadBodyIfNeeded(for: item, priority: priority)
                 },
                 onRequestOlder: viewModel.loadOlderTimelineIfNeeded,
-                onRequestNewer: viewModel.loadNewerTimelineIfNeeded,
                 onSetMessageFlag: viewModel.setMessageFlag,
                 onDownloadAttachments: viewModel.downloadAttachments,
                 onSendReply: viewModel.sendReply,
                 onSendNewMessage: viewModel.sendNewMessage,
                 onSelectSendAccount: viewModel.selectSendAccount,
                 onComposerEdited: viewModel.clearReplySendFailure,
-                onEntityAction: viewModel.performEntityAction
+                onEntityAction: viewModel.performEntityAction,
+                onSyncEntityHistory: viewModel.syncEntityHistory
             )
             .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -317,37 +363,32 @@ private struct ContentView: View {
             updateSidebarVisibility(for: width)
         }
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                if !viewModel.isComposingNewMessage {
-                    Button {
-                        viewModel.startComposingNewMessage()
-                    } label: {
-                        Label("New Message", systemImage: "square.and.pencil")
-                    }
-                    .help("New Message")
-                }
-            }
-
-            ToolbarItem(placement: .primaryAction) {
-                if viewModel.isComposingNewMessage {
-                    Button {
-                        viewModel.cancelComposingNewMessage()
-                    } label: {
-                        Text("Cancel")
-                    }
-                    .help("Discard new message")
-                }
-            }
+            ComposeToolbarContent(
+                isComposingNewMessage: viewModel.isComposingNewMessage,
+                onStartComposing: viewModel.startComposingNewMessage,
+                onCancelComposing: viewModel.cancelComposingNewMessage
+            )
         }
         .task {
             await viewModel.load()
+        }
+        .task(id: autoSyncTaskID) {
+            guard autoSyncEnabled else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(600))
+                try? await Task.sleep(for: .seconds(autoSyncDelaySeconds))
                 if !Task.isCancelled {
                     await viewModel.refresh()
                 }
             }
         }
+    }
+
+    private var autoSyncTaskID: String {
+        "\(autoSyncEnabled)-\(autoSyncDelaySeconds)"
+    }
+
+    private var autoSyncDelaySeconds: Int64 {
+        Int64(max(1, autoSyncIntervalMinutes) * 60)
     }
 
     private var columnVisibilityBinding: Binding<NavigationSplitViewVisibility> {
@@ -381,6 +422,12 @@ private struct ContentView: View {
     private static func saveSidebarVisibility(_ visibility: NavigationSplitViewVisibility) {
         let value = visibility == .detailOnly ? sidebarHiddenPreference : sidebarVisiblePreference
         UserDefaults.standard.set(value, forKey: sidebarVisibilityPreferenceKey)
+    }
+
+    private func refresh() {
+        Task {
+            await viewModel.refresh()
+        }
     }
 }
 
@@ -450,12 +497,13 @@ private struct EntityListPane: View {
     private static let searchOverlayTopPadding: CGFloat = MailiaTopChrome.controlTopPadding
     private static let searchOverlayBottomPadding: CGFloat = 6
     private static let searchOverlayHeight = searchOverlayTopPadding + SidebarSearchField.preferredHeight + searchOverlayBottomPadding
-    private static let searchGlassHeight = searchOverlayTopPadding + SidebarSearchField.preferredHeight
     private static let topScrollAnchorID = "sidebar-top-anchor"
 
     @ObservedObject var viewModel: AppViewModel
-    @State private var showsTopFade = false
-    @State private var showsBottomFade = false
+    @AppStorage(MailiaPreferenceKeys.hideQuotedReplyText)
+    private var hideQuotedReplyText = false
+    @AppStorage(MailiaPreferenceKeys.hideReplySubjects)
+    private var hideReplySubjects = false
 
     private var sidebarSelection: Binding<SidebarListSelection?> {
         Binding(
@@ -510,6 +558,8 @@ private struct EntityListPane: View {
                             EntityRow(
                                 entity: entity,
                                 isSelected: viewModel.selectedEntityID == entity.id,
+                                hideQuotedReplyText: hideQuotedReplyText,
+                                hideReplySubjects: hideReplySubjects,
                                 onAppear: {
                                     viewModel.resolveAvatarForVisibleEntity(entity.id)
                                 }
@@ -536,21 +586,9 @@ private struct EntityListPane: View {
                         .frame(height: WorkspaceTabBar.floatingReserveHeight)
                         .accessibilityHidden(true)
                 }
-                .overlay {
-                    SidebarScrollStateObserver(
-                        showsTopFade: $showsTopFade,
-                        showsBottomFade: $showsBottomFade
-                    )
-                    .frame(width: 0, height: 0)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-                }
                 .overlay(alignment: .top) {
                     sidebarSearchOverlay
                 }
-                // .overlay(alignment: .bottom) {
-                //     LiquidGlassFade(edge: .bottom, height: 72, opacity: showsBottomFade ? 1 : 0)
-                // }
                 .onChange(of: viewModel.isComposingNewMessage) { _, isComposing in
                     guard isComposing else { return }
                     DispatchQueue.main.async {
@@ -577,7 +615,6 @@ private struct EntityListPane: View {
 
     private var sidebarSearchOverlay: some View {
         ZStack(alignment: .top) {
-            // LiquidGlassFade(edge: .top, height: Self.searchGlassHeight, opacity: showsTopFade ? 1 : 0)
             WindowDragRegion()
                 .frame(height: Self.searchOverlayTopPadding)
                 .frame(maxWidth: .infinity, alignment: .top)
@@ -615,10 +652,10 @@ private struct WorkspaceTabBar: View {
         let itemCount = CGFloat(MailiaWorkspace.allCases.count)
         return itemSize * itemCount + itemSpacing * max(0, itemCount - 1)
     }
-    private static var barHeight: CGFloat {
+    static var barHeight: CGFloat {
         itemSize + capsulePadding * 2
     }
-    private static var barWidth: CGFloat {
+    static var barWidth: CGFloat {
         trackWidth + capsulePadding * 2
     }
 
@@ -635,17 +672,8 @@ private struct WorkspaceTabBar: View {
     @ViewBuilder
     private var glassBar: some View {
         ZStack(alignment: .leading) {
-            GlassEffectContainer(spacing: Self.itemSize + Self.itemSpacing) {
-                ZStack(alignment: .leading) {
-                    Capsule(style: .continuous)
-                        .fill(.clear)
-                        .frame(width: Self.barWidth, height: Self.barHeight)
-                        .background {
-                            OuterGlassShadow(shape: AnyShape(Capsule(style: .continuous)))
-                        }
-                        .glassEffect(.regular.interactive(), in: Capsule(style: .continuous))
-                }
-            }
+            WorkspaceTabGlassBackground()
+                .equatable()
 
             WorkspaceTabSelectionBlob(
                 selection: selection,
@@ -668,6 +696,7 @@ private struct WorkspaceTabBar: View {
                 ) {
                     select(workspace)
                 }
+                .equatable()
             }
         }
     }
@@ -678,7 +707,23 @@ private struct WorkspaceTabBar: View {
     }
 }
 
-private struct WorkspaceTabButton: View {
+private struct WorkspaceTabGlassBackground: View, Equatable {
+    var body: some View {
+        GlassEffectContainer(spacing: WorkspaceTabBar.itemSize + WorkspaceTabBar.itemSpacing) {
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(.clear)
+                    .frame(width: WorkspaceTabBar.barWidth, height: WorkspaceTabBar.barHeight)
+                    .background {
+                        OuterGlassShadow(shape: AnyShape(Capsule(style: .continuous)))
+                    }
+                    .glassEffect(.regular.interactive(), in: Capsule(style: .continuous))
+            }
+        }
+    }
+}
+
+private struct WorkspaceTabButton: View, Equatable {
     let workspace: MailiaWorkspace
     let isSelected: Bool
     let action: () -> Void
@@ -699,6 +744,11 @@ private struct WorkspaceTabButton: View {
         .help(workspace.tabLabel)
         .accessibilityLabel(workspace.tabLabel)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    nonisolated static func == (lhs: WorkspaceTabButton, rhs: WorkspaceTabButton) -> Bool {
+        lhs.workspace == rhs.workspace &&
+            lhs.isSelected == rhs.isSelected
     }
 }
 
@@ -779,277 +829,16 @@ private extension MailiaWorkspace {
     }
 }
 
-private struct SidebarScrollStateObserver: NSViewRepresentable {
-    @Binding var showsTopFade: Bool
-    @Binding var showsBottomFade: Bool
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(showsTopFade: $showsTopFade, showsBottomFade: $showsBottomFade)
-    }
-
-    func makeNSView(context: Context) -> ObserverView {
-        let view = ObserverView(frame: .zero)
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.onMove = { view in
-            context.coordinator.attach(from: view)
-        }
-        return view
-    }
-
-    func updateNSView(_ view: ObserverView, context: Context) {
-        context.coordinator.showsTopFade = $showsTopFade
-        context.coordinator.showsBottomFade = $showsBottomFade
-        view.onMove = { view in
-            context.coordinator.attach(from: view)
-        }
-        DispatchQueue.main.async {
-            context.coordinator.attach(from: view)
-            context.coordinator.updateFadeVisibility()
-        }
-    }
-
-    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) {
-        coordinator.detach()
-    }
-
-    final class ObserverView: NSView {
-        var onMove: ((NSView) -> Void)?
-
-        override func viewDidMoveToSuperview() {
-            super.viewDidMoveToSuperview()
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.onMove?(self)
-            }
-        }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.onMove?(self)
-            }
-        }
-    }
-
-    @MainActor
-    final class Coordinator: NSObject {
-        var showsTopFade: Binding<Bool>
-        var showsBottomFade: Binding<Bool>
-        private weak var scrollView: NSScrollView?
-        private var observers: [NSObjectProtocol] = []
-        private var remainingAttachAttempts = 8
-
-        init(showsTopFade: Binding<Bool>, showsBottomFade: Binding<Bool>) {
-            self.showsTopFade = showsTopFade
-            self.showsBottomFade = showsBottomFade
-        }
-
-        func attach(from view: NSView) {
-            guard let scrollView = firstNearbyScrollView(from: view) else {
-                retryAttach(from: view)
-                return
-            }
-
-            remainingAttachAttempts = 8
-
-            guard scrollView !== self.scrollView else {
-                return
-            }
-
-            detach()
-            self.scrollView = scrollView
-
-            scrollView.contentView.postsBoundsChangedNotifications = true
-            observers.append(
-                NotificationCenter.default.addObserver(
-                    forName: NSView.boundsDidChangeNotification,
-                    object: scrollView.contentView,
-                    queue: .main
-                ) { [weak self] _ in
-                    Task { @MainActor in
-                        self?.updateFadeVisibility()
-                    }
-                }
-            )
-
-            let frameChangeViews = [scrollView.contentView, scrollView.documentView].compactMap { $0 }
-            for view in frameChangeViews {
-                view.postsFrameChangedNotifications = true
-                observers.append(
-                    NotificationCenter.default.addObserver(
-                        forName: NSView.frameDidChangeNotification,
-                        object: view,
-                        queue: .main
-                    ) { [weak self] _ in
-                        Task { @MainActor in
-                            self?.updateFadeVisibility()
-                        }
-                    }
-                )
-            }
-
-            updateFadeVisibility()
-        }
-
-        private func retryAttach(from view: NSView) {
-            guard remainingAttachAttempts > 0 else { return }
-
-            remainingAttachAttempts -= 1
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak view] in
-                guard let self, let view else { return }
-                self.attach(from: view)
-            }
-        }
-
-        func detach() {
-            for observer in observers {
-                NotificationCenter.default.removeObserver(observer)
-            }
-            observers.removeAll()
-            scrollView = nil
-        }
-
-        func updateFadeVisibility() {
-            guard let scrollView, let documentView = scrollView.documentView else {
-                setFadeVisibility(top: false, bottom: false)
-                return
-            }
-
-            let visibleBounds = scrollView.contentView.bounds
-            let documentHeight = documentView.bounds.height
-            let isScrollable = documentHeight > visibleBounds.height + 1
-            guard isScrollable else {
-                setFadeVisibility(top: false, bottom: false)
-                return
-            }
-
-            let tolerance: CGFloat = 1
-            let atTop: Bool
-            let atBottom: Bool
-            if documentView.isFlipped {
-                atTop = visibleBounds.minY <= tolerance
-                atBottom = visibleBounds.maxY >= documentHeight - tolerance
-            } else {
-                atTop = visibleBounds.maxY >= documentHeight - tolerance
-                atBottom = visibleBounds.minY <= tolerance
-            }
-
-            setFadeVisibility(top: !atTop, bottom: !atBottom)
-        }
-
-        private func setFadeVisibility(top: Bool, bottom: Bool) {
-            if showsTopFade.wrappedValue != top {
-                showsTopFade.wrappedValue = top
-            }
-            if showsBottomFade.wrappedValue != bottom {
-                showsBottomFade.wrappedValue = bottom
-            }
-        }
-
-        private func firstNearbyScrollView(from view: NSView) -> NSScrollView? {
-            var currentView: NSView? = view
-            var remainingAncestorChecks = 8
-            while let view = currentView, remainingAncestorChecks > 0 {
-                if let scrollView = firstScrollView(in: view) {
-                    return scrollView
-                }
-                currentView = view.superview
-                remainingAncestorChecks -= 1
-            }
-            return nil
-        }
-
-        private func firstScrollView(in view: NSView) -> NSScrollView? {
-            if let scrollView = view as? NSScrollView {
-                return scrollView
-            }
-
-            for subview in view.subviews {
-                if let scrollView = firstScrollView(in: subview) {
-                    return scrollView
-                }
-            }
-
-            return nil
-        }
-    }
-}
-
-private struct LiquidGlassFade: View {
-    enum Edge {
-        case top
-        case bottom
-    }
-
-    let edge: Edge
-    let height: CGFloat
-    let opacity: Double
-
-    var body: some View {
-        glassLayer
-            .frame(height: height)
-            .mask {
-                LinearGradient(
-                    stops: gradientStops,
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
-            .opacity(opacity)
-            .allowsHitTesting(false)
-            .animation(.easeOut(duration: 0.16), value: opacity)
-    }
-
-    @ViewBuilder
-    private var glassLayer: some View {
-        Rectangle()
-            .fill(.clear)
-            .glassEffect(.regular, in: Rectangle())
-            .overlay {
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(0.16),
-                        Color.white.opacity(0.04),
-                        Color.clear
-                    ],
-                    startPoint: edge == .top ? .top : .bottom,
-                    endPoint: edge == .top ? .bottom : .top
-                )
-                .blendMode(.plusLighter)
-            }
-    }
-
-    private var gradientStops: [Gradient.Stop] {
-        switch edge {
-        case .top:
-            [
-                .init(color: .white, location: 0),
-                .init(color: .white.opacity(0.82), location: 0.36),
-                .init(color: .white.opacity(0.32), location: 0.76),
-                .init(color: .clear, location: 1)
-            ]
-        case .bottom:
-            [
-                .init(color: .clear, location: 0),
-                .init(color: .white.opacity(0.32), location: 0.24),
-                .init(color: .white.opacity(0.82), location: 0.64),
-                .init(color: .white, location: 1)
-            ]
-        }
-    }
-}
-
 private struct RotatingRefreshSymbol: View {
     let isActive: Bool
     let period: TimeInterval
     @State private var rotation = 0.0
 
     var body: some View {
-        Image(systemName: "arrow.triangle.2.circlepath.circle")
-            .font(.system(size: 15, weight: .medium))
+        Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
+            .font(.system(size: 12, weight: .medium))
             .symbolRenderingMode(.monochrome)
-            .frame(width: 18, height: 18, alignment: .center)
+            .frame(width: 15, height: 15, alignment: .center)
             .rotationEffect(.degrees(rotation), anchor: .center)
             .onAppear {
                 updateRotation(isActive)
@@ -1098,8 +887,62 @@ private struct TimelineEdgeFade: View {
     }
 }
 
-private struct RefreshButton: View {
-    @ObservedObject var viewModel: AppViewModel
+private struct RefreshToolbarContent: ToolbarContent {
+    let isRefreshing: Bool
+    let refreshStatus: String
+    let refreshActivity: MailiaRefreshProgress?
+    let avatarResolutionActivity: MailiaRefreshProgress?
+    let onRefresh: () -> Void
+
+    var body: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            RefreshButton(
+                isRefreshing: isRefreshing,
+                refreshStatus: refreshStatus,
+                refreshActivity: refreshActivity,
+                avatarResolutionActivity: avatarResolutionActivity,
+                action: onRefresh
+            )
+            .equatable()
+        }
+    }
+}
+
+private struct ComposeToolbarContent: ToolbarContent {
+    let isComposingNewMessage: Bool
+    let onStartComposing: () -> Void
+    let onCancelComposing: () -> Void
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            if !isComposingNewMessage {
+                Button {
+                    onStartComposing()
+                } label: {
+                    Label("New Message", systemImage: "square.and.pencil")
+                }
+                .help("New Message")
+            }
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+            if isComposingNewMessage {
+                Button {
+                    onCancelComposing()
+                } label: {
+                    Text("Cancel")
+                }
+                .help("Discard new message")
+            }
+        }
+    }
+}
+
+private struct RefreshButton: View, Equatable {
+    let isRefreshing: Bool
+    let refreshStatus: String
+    let refreshActivity: MailiaRefreshProgress?
+    let avatarResolutionActivity: MailiaRefreshProgress?
     let action: () -> Void
     @State private var isHovering = false
 
@@ -1116,11 +959,11 @@ private struct RefreshButton: View {
 
     var body: some View {
         Button {
-            guard !viewModel.isRefreshing else { return }
+            guard !isRefreshing else { return }
             action()
         } label: {
             RotatingRefreshSymbol(
-                isActive: viewModel.isRefreshing,
+                isActive: isRefreshing,
                 period: 1.1
             )
         }
@@ -1129,24 +972,37 @@ private struct RefreshButton: View {
             isHovering = hovering
         }
         .popover(isPresented: isShowingStatusPopover, arrowEdge: .top) {
-            RefreshStatusPopover(viewModel: viewModel)
+            RefreshStatusPopover(
+                refreshStatus: refreshStatus,
+                refreshActivity: refreshActivity,
+                avatarResolutionActivity: avatarResolutionActivity
+            )
         }
-        .help("Refresh\n\(viewModel.refreshStatus)")
+        .help("Refresh\n\(refreshStatus)")
+    }
+
+    nonisolated static func == (lhs: RefreshButton, rhs: RefreshButton) -> Bool {
+        lhs.isRefreshing == rhs.isRefreshing &&
+            lhs.refreshStatus == rhs.refreshStatus &&
+            lhs.refreshActivity == rhs.refreshActivity &&
+            lhs.avatarResolutionActivity == rhs.avatarResolutionActivity
     }
 }
 
 private struct RefreshStatusPopover: View {
-    @ObservedObject var viewModel: AppViewModel
+    let refreshStatus: String
+    let refreshActivity: MailiaRefreshProgress?
+    let avatarResolutionActivity: MailiaRefreshProgress?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let activity = viewModel.refreshActivity {
+            if let activity = refreshActivity {
                 RefreshProgressSection(activity: activity)
             } else {
-                RefreshStatusSection(status: viewModel.refreshStatus)
+                RefreshStatusSection(status: refreshStatus)
             }
 
-            if let avatarActivity = viewModel.avatarResolutionActivity {
+            if let avatarActivity = avatarResolutionActivity {
                 Divider()
                 RefreshProgressSection(activity: avatarActivity)
             }
@@ -1273,7 +1129,27 @@ private struct SidebarSearchField: View {
 private struct EntityRow: View {
     let entity: MailiaEntitySummary
     let isSelected: Bool
+    let hideQuotedReplyText: Bool
+    let hideReplySubjects: Bool
     let onAppear: () -> Void
+
+    var body: some View {
+        EntityRowContent(
+            entity: entity,
+            isSelected: isSelected,
+            hideQuotedReplyText: hideQuotedReplyText,
+            hideReplySubjects: hideReplySubjects
+        )
+        .equatable()
+        .onAppear(perform: onAppear)
+    }
+}
+
+private struct EntityRowContent: View, Equatable {
+    let entity: MailiaEntitySummary
+    let isSelected: Bool
+    let hideQuotedReplyText: Bool
+    let hideReplySubjects: Bool
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
@@ -1319,15 +1195,111 @@ private struct EntityRow: View {
                 .accessibilityHidden(true)
         }
         .accessibilityElement(children: .combine)
-        .onAppear(perform: onAppear)
     }
 
     private var previewText: String {
-        if !entity.latestSubject.isEmpty {
-            return entity.latestSubject
+        EntitySidebarPreviewCache.shared.preview(
+            for: entity,
+            hideReplySubjects: hideReplySubjects,
+            hideQuotedReplyText: hideQuotedReplyText
+        )
+    }
+
+    nonisolated static func == (lhs: EntityRowContent, rhs: EntityRowContent) -> Bool {
+        lhs.entity.id == rhs.entity.id &&
+            lhs.entity.displayName == rhs.entity.displayName &&
+            lhs.entity.unreadCount == rhs.entity.unreadCount &&
+            lhs.entity.latestSubject == rhs.entity.latestSubject &&
+            lhs.entity.latestBodyPreview == rhs.entity.latestBodyPreview &&
+            lhs.entity.latestDate == rhs.entity.latestDate &&
+            lhs.entity.primaryEmailAddress == rhs.entity.primaryEmailAddress &&
+            lhs.entity.kind == rhs.entity.kind &&
+            lhs.entity.avatarImageDataURL == rhs.entity.avatarImageDataURL &&
+            lhs.isSelected == rhs.isSelected &&
+            lhs.hideQuotedReplyText == rhs.hideQuotedReplyText &&
+            lhs.hideReplySubjects == rhs.hideReplySubjects
+    }
+}
+
+@MainActor
+private final class EntitySidebarPreviewCache {
+    static let shared = EntitySidebarPreviewCache()
+
+    private let cache = NSCache<EntitySidebarPreviewCacheKey, NSString>()
+
+    private init() {
+        cache.countLimit = 1024
+    }
+
+    func preview(
+        for entity: MailiaEntitySummary,
+        hideReplySubjects: Bool,
+        hideQuotedReplyText: Bool
+    ) -> String {
+        guard hideReplySubjects else {
+            return entity.sidebarPreview(
+                hideReplySubjects: false,
+                hideQuotedReplyText: hideQuotedReplyText
+            )
         }
 
-        return entity.primaryEmailAddress ?? entity.kind.rawValue
+        let key = EntitySidebarPreviewCacheKey(
+            entity: entity,
+            hideQuotedReplyText: hideQuotedReplyText
+        )
+        if let preview = cache.object(forKey: key) {
+            return preview as String
+        }
+
+        let preview = entity.sidebarPreview(
+            hideReplySubjects: true,
+            hideQuotedReplyText: hideQuotedReplyText
+        )
+        cache.setObject(preview as NSString, forKey: key)
+        return preview
+    }
+}
+
+private final class EntitySidebarPreviewCacheKey: NSObject {
+    private let entityID: Int64
+    private let latestSubject: String
+    private let latestBodyPreview: String?
+    private let primaryEmailAddress: String?
+    private let kind: EntityKind
+    private let hideQuotedReplyText: Bool
+    private let cachedHash: Int
+
+    init(entity: MailiaEntitySummary, hideQuotedReplyText: Bool) {
+        self.entityID = entity.id
+        self.latestSubject = entity.latestSubject
+        self.latestBodyPreview = entity.latestBodyPreview
+        self.primaryEmailAddress = entity.primaryEmailAddress
+        self.kind = entity.kind
+        self.hideQuotedReplyText = hideQuotedReplyText
+        var hasher = Hasher()
+        hasher.combine(entityID)
+        hasher.combine(latestSubject)
+        hasher.combine(latestBodyPreview)
+        hasher.combine(primaryEmailAddress)
+        hasher.combine(kind.rawValue)
+        hasher.combine(hideQuotedReplyText)
+        self.cachedHash = hasher.finalize()
+    }
+
+    override var hash: Int {
+        cachedHash
+    }
+
+    override func isEqual(_ object: Any?) -> Bool {
+        guard let other = object as? EntitySidebarPreviewCacheKey else {
+            return false
+        }
+        return entityID == other.entityID &&
+            latestSubject == other.latestSubject &&
+            latestBodyPreview == other.latestBodyPreview &&
+            primaryEmailAddress == other.primaryEmailAddress &&
+            kind == other.kind &&
+            hideQuotedReplyText == other.hideQuotedReplyText
     }
 }
 
@@ -1434,16 +1406,101 @@ private struct EntityAvatar: View {
     }
 
     private var avatarImage: NSImage? {
-        if let dataURL = entity.avatarImageDataURL,
-           let image = NSImage.mailiaImage(dataURL: dataURL) {
+        EntityAvatarImageCache.shared.image(for: entity, size: size)
+    }
+}
+
+@MainActor
+private final class EntityAvatarImageCache {
+    static let shared = EntityAvatarImageCache()
+
+    private let cache = NSCache<EntityAvatarImageCacheKey, NSImage>()
+
+    private init() {
+        cache.countLimit = 512
+    }
+
+    func image(for entity: MailiaEntitySummary, size: CGFloat) -> NSImage? {
+        if let dataURL = entity.avatarImageDataURL {
+            return cachedImage(
+                for: EntityAvatarImageCacheKey(
+                    kind: .remote(entityID: entity.id, dataURL: dataURL),
+                    size: size
+                )
+            ) {
+                NSImage.mailiaImage(dataURL: dataURL)
+            }
+        }
+
+        return cachedImage(
+            for: EntityAvatarImageCacheKey(
+                kind: .fallback(entityID: entity.id, displayName: entity.displayName),
+                size: size
+            )
+        ) {
+            EntityAvatarRenderer.image(
+                id: entity.id,
+                displayName: entity.displayName,
+                size: size
+            )
+        }
+    }
+
+    private func cachedImage(
+        for key: EntityAvatarImageCacheKey,
+        load: () -> NSImage?
+    ) -> NSImage? {
+        if let image = cache.object(forKey: key) {
             return image
         }
 
-        return EntityAvatarRenderer.image(
-            id: entity.id,
-            displayName: entity.displayName,
-            size: size
-        )
+        guard let image = load() else {
+            return nil
+        }
+
+        image.cacheMode = .always
+        cache.setObject(image, forKey: key)
+        return image
+    }
+}
+
+private final class EntityAvatarImageCacheKey: NSObject {
+    enum Kind: Equatable {
+        case remote(entityID: Int64, dataURL: String)
+        case fallback(entityID: Int64, displayName: String)
+    }
+
+    private let kind: Kind
+    private let size: CGFloat
+    private let cachedHash: Int
+
+    init(kind: Kind, size: CGFloat) {
+        self.kind = kind
+        self.size = size
+        var hasher = Hasher()
+        hasher.combine(size)
+        switch kind {
+        case .remote(let entityID, let dataURL):
+            hasher.combine("remote")
+            hasher.combine(entityID)
+            hasher.combine(dataURL)
+        case .fallback(let entityID, let displayName):
+            hasher.combine("fallback")
+            hasher.combine(entityID)
+            hasher.combine(displayName)
+        }
+        self.cachedHash = hasher.finalize()
+    }
+
+    override var hash: Int {
+        cachedHash
+    }
+
+    override func isEqual(_ object: Any?) -> Bool {
+        guard let other = object as? EntityAvatarImageCacheKey else {
+            return false
+        }
+        return kind == other.kind && size == other.size
     }
 }
 
@@ -1514,7 +1571,6 @@ private struct TimelinePane: View {
     let scrollAnchor: MailiaTimelineScrollAnchor?
     let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
-    let onRequestNewer: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
     let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
@@ -1522,6 +1578,7 @@ private struct TimelinePane: View {
     let onSelectSendAccount: (String) -> Void
     let onComposerEdited: () -> Void
     let onEntityAction: (MailiaEntityAction, MailiaEntitySummary) -> Void
+    let onSyncEntityHistory: (MailiaEntitySummary) -> Void
 
     var body: some View {
         Group {
@@ -1554,13 +1611,13 @@ private struct TimelinePane: View {
                     scrollAnchor: scrollAnchor,
                     onRequestBody: onRequestBody,
                     onRequestOlder: onRequestOlder,
-                    onRequestNewer: onRequestNewer,
                     onSetMessageFlag: onSetMessageFlag,
                     onDownloadAttachments: onDownloadAttachments,
                     onSendReply: onSendReply,
                     onSelectSendAccount: onSelectSendAccount,
                     onComposerEdited: onComposerEdited,
-                    onEntityAction: onEntityAction
+                    onEntityAction: onEntityAction,
+                    onSyncEntityHistory: onSyncEntityHistory
                 )
             } else if isLoadingEntityList {
                 TimelineTransitionPlaceholderView()
@@ -1673,6 +1730,7 @@ private struct EntityDetailDrawer: View {
     let workspace: MailiaWorkspace
     let onClose: () -> Void
     let onAction: (MailiaEntityAction, MailiaEntitySummary) -> Void
+    let onSyncHistory: (MailiaEntitySummary) -> Void
     @State private var copiedEmailAddress: String?
 
     private var emailAddresses: [String] {
@@ -1685,6 +1743,7 @@ private struct EntityDetailDrawer: View {
                 VStack(spacing: 20) {
                     drawerIdentity
                     emailSection
+                    syncHistoryButton
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, MailiaTopChrome.controlTopPadding + 22)
@@ -1791,30 +1850,44 @@ private struct EntityDetailDrawer: View {
         }
     }
 
+    private var syncHistoryButton: some View {
+        Button {
+            onSyncHistory(entity)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 14, weight: .semibold))
+
+                Text("Sync all history")
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+            }
+            .foregroundStyle(emailAddresses.isEmpty ? Color.secondary : Color.primary)
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .background {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(emailAddresses.isEmpty)
+        .help(emailAddresses.isEmpty ? "No email address is available for this entity." : "Sync older messages matching this entity's email addresses.")
+    }
+
     private var drawerActions: some View {
         HStack(spacing: 10) {
-            EntityDrawerActionButton(
-                label: workspace == .junk ? "Inbox" : "Junk",
-                systemImage: workspace == .junk ? "tray.and.arrow.down" : "nosign",
-                role: nil
-            ) {
-                onAction(workspace == .junk ? .moveToInbox : .moveToJunk, entity)
-            }
-
-            EntityDrawerActionButton(
-                label: workspace == .flagged ? "Unflag" : "Flag",
-                systemImage: workspace == .flagged ? "flag.slash" : "flag",
-                role: nil
-            ) {
-                onAction(workspace == .flagged ? .removeFlag : .flagImportant, entity)
-            }
-
-            EntityDrawerActionButton(
-                label: "Trash",
-                systemImage: "trash",
-                role: .destructive
-            ) {
-                onAction(.moveToTrash, entity)
+            ForEach(EntityActionPolicy.visibleActions(for: workspace.coreWorkspace), id: \.self) { action in
+                EntityDrawerActionButton(
+                    label: action.label,
+                    systemImage: action.systemImage,
+                    role: action.buttonRole
+                ) {
+                    onAction(action, entity)
+                }
             }
         }
         .padding(.horizontal, 18)
@@ -1881,21 +1954,18 @@ private struct TimelineBody: View {
     let scrollAnchor: MailiaTimelineScrollAnchor?
     let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
-    let onRequestNewer: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
     let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
     let onSelectSendAccount: (String) -> Void
     let onComposerEdited: () -> Void
     let onEntityAction: (MailiaEntityAction, MailiaEntitySummary) -> Void
+    let onSyncEntityHistory: (MailiaEntitySummary) -> Void
     @State private var isPreparingInitialPosition = true
     @State private var isShowingEntityDrawer = false
-    @AppStorage(MailiaPreferenceKeys.timelineBodyDisplayMode)
-    private var bodyDisplayMode = TimelineBodyDisplayMode.html.rawValue
-    @AppStorage(MailiaPreferenceKeys.loadRemoteContent)
-    private var loadRemoteContent = false
-    @AppStorage(MailiaPreferenceKeys.showTimelineAvatars)
-    private var showTimelineAvatars = true
+    @State private var replyComposerHeight: CGFloat = 0
+    @TimelineDisplayOptionsStorage
+    private var displayOptions
 
     private var showsReplyComposer: Bool {
         entity != nil
@@ -1914,7 +1984,6 @@ private struct TimelineBody: View {
                 entity: entity,
                 onRequestBody: onRequestBody,
                 onRequestOlder: onRequestOlder,
-                onRequestNewer: onRequestNewer,
                 onSetMessageFlag: onSetMessageFlag,
                 onDownloadAttachments: onDownloadAttachments,
                 onSendReply: onSendReply,
@@ -1925,11 +1994,6 @@ private struct TimelineBody: View {
             timelineFades
 
             VStack(spacing: 0) {
-                // LiquidGlassFade(edge: .top, height: Self.topGlassHeight, opacity: 1)
-                //     .overlay(alignment: .top) {
-                //         WindowDragRegion()
-                //             .frame(height: Self.topDragRegionHeight)
-                //     }
                 WindowDragRegion()
                     .frame(height: Self.topDragRegionHeight)
 
@@ -1959,6 +2023,17 @@ private struct TimelineBody: View {
                     onEdited: onComposerEdited
                 )
                 .id(timelineContextID)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: ComposerHeightPreferenceKey.self,
+                            value: ComposerHeightPreference(
+                                contextID: timelineContextID,
+                                height: proxy.size.height
+                            )
+                        )
+                    }
+                }
             }
 
             if let entity, isShowingEntityDrawer {
@@ -1980,7 +2055,8 @@ private struct TimelineBody: View {
                             isShowingEntityDrawer = false
                         }
                     },
-                    onAction: onEntityAction
+                    onAction: onEntityAction,
+                    onSyncHistory: onSyncEntityHistory
                 )
                 .transition(.move(edge: .trailing).combined(with: .opacity))
                 .zIndex(4)
@@ -1989,6 +2065,15 @@ private struct TimelineBody: View {
         }
         .onChange(of: timelineContextID) { _, _ in
             isShowingEntityDrawer = false
+            replyComposerHeight = 0
+        }
+        .onPreferenceChange(ComposerHeightPreferenceKey.self) { preference in
+            guard let preference,
+                  preference.contextID == timelineContextID,
+                  abs(replyComposerHeight - preference.height) > 1 else {
+                return
+            }
+            replyComposerHeight = preference.height
         }
         .ignoresSafeArea(.container, edges: .top)
         .background(Color(nsColor: .textBackgroundColor))
@@ -2058,771 +2143,11 @@ private struct TimelineBody: View {
             sendAccounts: sendAccounts,
             selectedSendAccountKey: selectedSendAccountKey,
             scrollAnchor: scrollAnchor,
-            bodyDisplayMode: bodyDisplayMode,
-            loadRemoteContent: loadRemoteContent,
-            showTimelineAvatars: showTimelineAvatars
+            displayOptions: displayOptions,
+            windowState: TimelineWindowState(
+                bottomOverlayHeight: showsReplyComposer ? replyComposerHeight : 0
+            )
         )
-    }
-}
-
-private struct TimelinePageMarker: View {
-    let isLoading: Bool
-    var body: some View {
-        HStack {
-            Spacer()
-            if isLoading {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Color.clear
-                    .frame(width: 1, height: 1)
-            }
-            Spacer()
-        }
-        .frame(height: 32)
-    }
-}
-
-private struct TimelineCollectionView: NSViewRepresentable {
-    let entityID: Int64
-    let items: [MailiaTimelineItem]
-    let isLoadingTimeline: Bool
-    let isLoadingOlderTimeline: Bool
-    let isLoadingNewerTimeline: Bool
-    let hasOlderTimeline: Bool
-    let hasNewerTimeline: Bool
-    let bodyStates: [Int64: MailiaTimelineBodyState]
-    let attachmentDownloadStates: [Int64: MailiaAttachmentDownloadState]
-    let scrollAnchor: MailiaTimelineScrollAnchor?
-    let canRequestTop: Bool
-    let canRequestBottom: Bool
-    let onRequestTop: () -> Void
-    let onRequestBottom: () -> Void
-    let onRequestBody: (MailiaTimelineItem) -> Void
-    let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
-    let onDownloadAttachments: (MailiaTimelineItem) -> Void
-    let renderedHTMLMessageIDs: Set<Int64>
-    let measuredHTMLHeightsByMessageID: [Int64: CGFloat]
-    let canRequestBody: Bool
-    let maximumHTMLHeight: CGFloat
-    let onHTMLRendered: (Int64, CGFloat) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let layout = NSCollectionViewFlowLayout()
-        layout.scrollDirection = .vertical
-        layout.minimumLineSpacing = 12
-        layout.minimumInteritemSpacing = 0
-        layout.sectionInset = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 8)
-
-        let collectionView = NSCollectionView()
-        collectionView.collectionViewLayout = layout
-        collectionView.dataSource = context.coordinator
-        collectionView.delegate = context.coordinator
-        collectionView.isSelectable = false
-        collectionView.backgroundColors = [.textBackgroundColor]
-        collectionView.register(TimelineMessageCollectionItem.self, forItemWithIdentifier: TimelineMessageCollectionItem.identifier)
-        collectionView.register(TimelineMarkerCollectionItem.self, forItemWithIdentifier: TimelineMarkerCollectionItem.identifier)
-
-        let scrollView = NSScrollView()
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
-        scrollView.verticalScrollElasticity = .automatic
-        scrollView.horizontalScrollElasticity = .none
-        scrollView.contentView.postsBoundsChangedNotifications = true
-        scrollView.documentView = collectionView
-
-        context.coordinator.collectionView = collectionView
-        context.coordinator.observe(scrollView: scrollView)
-        context.coordinator.apply(view: self, to: scrollView)
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        context.coordinator.apply(view: self, to: scrollView)
-    }
-
-    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
-        coordinator.stopObserving()
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout {
-        fileprivate weak var collectionView: NSCollectionView?
-        private var entries: [TimelineCollectionEntry] = []
-        private var entrySignature: String = ""
-        private var bodyStates: [Int64: MailiaTimelineBodyState] = [:]
-        private var attachmentDownloadStates: [Int64: MailiaAttachmentDownloadState] = [:]
-        private var renderedHTMLMessageIDs: Set<Int64> = []
-        private var measuredHTMLHeightsByMessageID: [Int64: CGFloat] = [:]
-        private var measuredRowHeightsByMessageID: [Int64: CGFloat] = [:]
-        private var pendingMeasuredRowHeightsByMessageID: [Int64: CGFloat] = [:]
-        private var isApplyingMeasuredRowHeights = false
-        private var messagesByID: [Int64: MailiaTimelineItem] = [:]
-        private var onRequestTop: (() -> Void)?
-        private var onRequestBottom: (() -> Void)?
-        private var onRequestBody: ((MailiaTimelineItem) -> Void)?
-        private var onSetMessageFlag: ((MailiaTimelineItem, Bool) -> Void)?
-        private var onDownloadAttachments: ((MailiaTimelineItem) -> Void)?
-        private var onHTMLRendered: ((Int64, CGFloat) -> Void)?
-        private var canRequestTop = false
-        private var canRequestBottom = false
-        private var canRequestBody = false
-        private var maximumHTMLHeight: CGFloat = 1024
-        private var currentEntityID: Int64?
-        private var lastAppliedAnchorGeneration: Int?
-        private var applyCount = 0
-        private var heightUpdateCount = 0
-        private var lastRequestedTopTriggerID: Int64?
-        private var lastRequestedBottomTriggerID: Int64?
-        private weak var observedScrollView: NSScrollView?
-        private var isAdjustingScroll = false
-        private let edgeThreshold: CGFloat = 96
-
-        fileprivate func apply(view: TimelineCollectionView, to scrollView: NSScrollView) {
-            guard let collectionView else { return }
-            let previousEntityID = currentEntityID
-            let entityChanged = previousEntityID != view.entityID
-            let previousAnchorGeneration = lastAppliedAnchorGeneration
-            let anchorChanged = view.scrollAnchor?.generation != nil && view.scrollAnchor?.generation != previousAnchorGeneration
-            let anchorSnapshot = captureRestoreAnchor(
-                for: view.scrollAnchor,
-                anchorChanged: anchorChanged,
-                entityChanged: entityChanged,
-                in: scrollView
-            )
-            let wasAtBottom = metrics(in: scrollView).wasAtBottom
-            applyCount += 1
-            TimelineDebugLog.log(
-                "apply #\(applyCount) entity=\(view.entityID) entityChanged=\(entityChanged) items=\(view.items.count) loading=\(view.isLoadingTimeline) older=\(view.hasOlderTimeline)/\(view.isLoadingOlderTimeline) newer=\(view.hasNewerTimeline)/\(view.isLoadingNewerTimeline) anchor=\(Self.describe(view.scrollAnchor)) anchorChanged=\(anchorChanged) wasAtBottom=\(wasAtBottom) visible=\(describeVisible(in: scrollView))"
-            )
-
-            currentEntityID = view.entityID
-            onRequestTop = view.onRequestTop
-            onRequestBottom = view.onRequestBottom
-            onRequestBody = view.onRequestBody
-            onSetMessageFlag = view.onSetMessageFlag
-            onDownloadAttachments = view.onDownloadAttachments
-            onHTMLRendered = view.onHTMLRendered
-            canRequestTop = view.canRequestTop
-            canRequestBottom = view.canRequestBottom
-            canRequestBody = view.canRequestBody
-            maximumHTMLHeight = view.maximumHTMLHeight
-            bodyStates = view.bodyStates
-            attachmentDownloadStates = view.attachmentDownloadStates
-            renderedHTMLMessageIDs = view.renderedHTMLMessageIDs
-            measuredHTMLHeightsByMessageID = view.measuredHTMLHeightsByMessageID
-            messagesByID = Dictionary(uniqueKeysWithValues: view.items.map { ($0.id, $0) })
-
-            if entityChanged {
-                measuredRowHeightsByMessageID = measuredRowHeightsByMessageID.filter { id, _ in
-                    view.items.contains { $0.id == id }
-                }
-                lastRequestedTopTriggerID = nil
-                lastRequestedBottomTriggerID = nil
-            }
-
-            let nextEntries = Self.makeEntries(
-                items: view.items,
-                isLoadingTimeline: view.isLoadingTimeline,
-                isLoadingOlderTimeline: view.isLoadingOlderTimeline,
-                isLoadingNewerTimeline: view.isLoadingNewerTimeline,
-                hasOlderTimeline: view.hasOlderTimeline,
-                hasNewerTimeline: view.hasNewerTimeline
-            )
-            let nextEntrySignature = Self.entrySignature(
-                entries: nextEntries,
-                bodyStates: bodyStates,
-                attachmentDownloadStates: attachmentDownloadStates,
-                measuredHTMLHeightsByMessageID: measuredHTMLHeightsByMessageID
-            )
-            let needsReload = nextEntrySignature != entrySignature
-            entries = nextEntries
-
-            if needsReload {
-                entrySignature = nextEntrySignature
-                collectionView.reloadData()
-            } else {
-                collectionView.collectionViewLayout?.invalidateLayout()
-            }
-            collectionView.layoutSubtreeIfNeeded()
-
-            if anchorChanged, let scrollAnchor = view.scrollAnchor {
-                lastAppliedAnchorGeneration = scrollAnchor.generation
-                switch scrollAnchor.edge {
-                case .top:
-                    if let anchorSnapshot {
-                        TimelineDebugLog.log("restore top anchor message=\(anchorSnapshot.messageID) offset=\(Int(anchorSnapshot.offsetFromVisibleTop))")
-                        restore(anchorSnapshot, in: scrollView)
-                    } else {
-                        TimelineDebugLog.log("missing top anchor id=\(scrollAnchor.id)")
-                    }
-                case .bottom:
-                    TimelineDebugLog.log("restore bottom anchor id=\(scrollAnchor.id)")
-                    scrollToBottom(in: scrollView)
-                }
-            } else if entityChanged {
-                TimelineDebugLog.log("entity changed, scroll to bottom")
-                scrollToBottom(in: scrollView)
-            } else if wasAtBottom {
-                TimelineDebugLog.log("kept bottom after update")
-                scrollToBottom(in: scrollView)
-            } else if let anchorSnapshot {
-                TimelineDebugLog.log("preserve visible anchor message=\(anchorSnapshot.messageID) offset=\(Int(anchorSnapshot.offsetFromVisibleTop))")
-                restore(anchorSnapshot, in: scrollView)
-            }
-
-            requestPagesIfNeeded(in: scrollView)
-        }
-
-        fileprivate func observe(scrollView: NSScrollView) {
-            observedScrollView = scrollView
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(boundsDidChange(_:)),
-                name: NSView.boundsDidChangeNotification,
-                object: scrollView.contentView,
-            )
-        }
-
-        fileprivate func stopObserving() {
-            NotificationCenter.default.removeObserver(self)
-            observedScrollView = nil
-        }
-
-        @objc private func boundsDidChange(_ notification: Notification) {
-            guard let observedScrollView, !isAdjustingScroll else { return }
-            requestPagesIfNeeded(in: observedScrollView)
-        }
-
-        fileprivate func numberOfSections(in collectionView: NSCollectionView) -> Int {
-            1
-        }
-
-        fileprivate func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
-            entries.count
-        }
-
-        fileprivate func collectionView(
-            _ collectionView: NSCollectionView,
-            itemForRepresentedObjectAt indexPath: IndexPath
-        ) -> NSCollectionViewItem {
-            let entry = entries[indexPath.item]
-            switch entry.kind {
-            case .marker(let isLoading):
-                let item = collectionView.makeItem(
-                    withIdentifier: TimelineMarkerCollectionItem.identifier,
-                    for: indexPath
-                ) as? TimelineMarkerCollectionItem ?? TimelineMarkerCollectionItem()
-                item.configure(isLoading: isLoading)
-                return item
-            case .message(let message):
-                let item = collectionView.makeItem(
-                    withIdentifier: TimelineMessageCollectionItem.identifier,
-                    for: indexPath
-                ) as? TimelineMessageCollectionItem ?? TimelineMessageCollectionItem()
-                let row = TimelineMessageRow(
-                    item: message,
-                    bodyState: bodyStates[message.id] ?? .notRequested,
-                    attachmentDownloadState: attachmentDownloadStates[message.id] ?? .idle,
-                    maxHTMLHeight: maximumHTMLHeight,
-                    canRequestBody: canRequestBody,
-                    renderHTMLImmediately: renderedHTMLMessageIDs.contains(message.id),
-                    cachedHTMLHeight: measuredHTMLHeightsByMessageID[message.id],
-                    onRequestBody: { [weak self] item in
-                        self?.onRequestBody?(item)
-                    },
-                    onSetMessageFlag: { [weak self] item, isFlagged in
-                        self?.onSetMessageFlag?(item, isFlagged)
-                    },
-                    onDownloadAttachments: { [weak self] item in
-                        self?.onDownloadAttachments?(item)
-                    },
-                    onHTMLRendered: { [weak self] messageID, height in
-                        self?.onHTMLRendered?(messageID, height)
-                    }
-                )
-                item.configure(messageID: message.id, row: row) { [weak self] messageID, height in
-                    self?.recordMeasuredRowHeight(messageID: messageID, height: height)
-                }
-                return item
-            }
-        }
-
-        fileprivate func collectionView(
-            _ collectionView: NSCollectionView,
-            layout collectionViewLayout: NSCollectionViewLayout,
-            sizeForItemAt indexPath: IndexPath
-        ) -> NSSize {
-            let horizontalInsets: CGFloat = 20
-            let width = max(collectionView.enclosingScrollView?.contentView.bounds.width ?? collectionView.bounds.width, 1)
-            let itemWidth = max(width - horizontalInsets, 1)
-            let entry = entries[indexPath.item]
-            switch entry.kind {
-            case .marker:
-                return NSSize(width: itemWidth, height: 32)
-            case .message(let message):
-                return NSSize(width: itemWidth, height: layoutHeight(for: message, itemWidth: itemWidth))
-            }
-        }
-
-        private func layoutHeight(for message: MailiaTimelineItem, itemWidth: CGFloat) -> CGFloat {
-            let attachmentHeight: CGFloat = message.hasAttachments ? 42 : 0
-            switch bodyStates[message.id] ?? .notRequested {
-            case .notRequested:
-                return 106 + attachmentHeight
-            case .loading:
-                return 410 + attachmentHeight
-            case .failed:
-                return 180 + attachmentHeight
-            case .loaded(let body):
-                if body.html != nil || message.html != nil {
-                    let htmlHeight = measuredHTMLHeightsByMessageID[message.id] ?? 320
-                    return min(max(htmlHeight, 1), maximumHTMLHeight) + 90 + attachmentHeight
-                }
-                let text = body.text ?? message.preview
-                return textRowHeight(text: text, itemWidth: itemWidth) + attachmentHeight
-            }
-        }
-
-        private func textRowHeight(text: String, itemWidth: CGFloat) -> CGFloat {
-            let bubbleWidth = min(max(itemWidth - 56, 240), 640)
-            let textWidth = max(bubbleWidth - 24, 1)
-            let font = NSFont.preferredFont(forTextStyle: .body)
-            let attributes: [NSAttributedString.Key: Any] = [.font: font]
-            let measured = (text as NSString).boundingRect(
-                with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: attributes
-            )
-            return min(max(ceil(measured.height) + 88, 106), 520)
-        }
-
-        private func recordMeasuredRowHeight(messageID: Int64, height: CGFloat) {
-            guard height > 1 else { return }
-            let roundedHeight = ceil(height)
-            guard let message = messagesByID[messageID] else { return }
-            let width = max((collectionView?.enclosingScrollView?.contentView.bounds.width ?? collectionView?.bounds.width ?? 1) - 20, 1)
-            let expectedHeight = layoutHeight(for: message, itemWidth: width)
-            if abs(expectedHeight - roundedHeight) > 16 {
-                TimelineDebugLog.log("height mismatch message=\(messageID) formula=\(Int(expectedHeight)) fitting=\(Int(roundedHeight)) state=\(bodyStateDescription(for: messageID))")
-            }
-        }
-
-        private func bodyStateDescription(for messageID: Int64) -> String {
-            switch bodyStates[messageID] ?? .notRequested {
-            case .notRequested:
-                return "notRequested"
-            case .loading:
-                return "loading"
-            case .failed:
-                return "failed"
-            case .loaded(let body):
-                if body.html != nil || messagesByID[messageID]?.html != nil {
-                    return "loadedHTML(\(Int(measuredHTMLHeightsByMessageID[messageID] ?? 320)))"
-                }
-                return "loadedText"
-            }
-        }
-
-        private func applyMeasuredRowHeightUpdates() {
-            isApplyingMeasuredRowHeights = false
-            let pendingHeights = pendingMeasuredRowHeightsByMessageID
-            pendingMeasuredRowHeightsByMessageID = [:]
-            guard !pendingHeights.isEmpty else { return }
-
-            var changedHeights = false
-            for (messageID, height) in pendingHeights {
-                if let currentHeight = measuredRowHeightsByMessageID[messageID],
-                   abs(currentHeight - height) <= 2 {
-                    continue
-                }
-                measuredRowHeightsByMessageID[messageID] = height
-                changedHeights = true
-            }
-            guard changedHeights else { return }
-            guard let scrollView = observedScrollView,
-                  let collectionView else { return }
-
-            heightUpdateCount += 1
-            let summary = pendingHeights
-                .sorted { $0.key < $1.key }
-                .prefix(8)
-                .map { "\($0.key):\(Int($0.value))" }
-                .joined(separator: ",")
-            TimelineDebugLog.log("height update #\(heightUpdateCount) count=\(pendingHeights.count) sample=[\(summary)] visible=\(describeVisible(in: scrollView))")
-
-            let anchor = captureVisibleAnchor(in: scrollView)
-            let wasAtBottom = metrics(in: scrollView).wasAtBottom
-            collectionView.collectionViewLayout?.invalidateLayout()
-            collectionView.layoutSubtreeIfNeeded()
-            if wasAtBottom {
-                scrollToBottom(in: scrollView)
-            } else if let anchor {
-                restore(anchor, in: scrollView)
-            }
-        }
-
-        private func requestPagesIfNeeded(in scrollView: NSScrollView) {
-            let metrics = metrics(in: scrollView)
-            if canRequestTop,
-               metrics.distanceFromTop <= edgeThreshold,
-               let topTriggerID = firstMessageID,
-               topTriggerID != lastRequestedTopTriggerID {
-                lastRequestedTopTriggerID = topTriggerID
-                TimelineDebugLog.log("request older trigger id=\(topTriggerID) metrics=\(describe(metrics))")
-                onRequestTop?()
-            }
-
-            if canRequestBottom,
-               metrics.distanceFromBottom <= edgeThreshold,
-               let bottomTriggerID = lastMessageID,
-               bottomTriggerID != lastRequestedBottomTriggerID {
-                lastRequestedBottomTriggerID = bottomTriggerID
-                TimelineDebugLog.log("request newer trigger id=\(bottomTriggerID) metrics=\(describe(metrics))")
-                onRequestBottom?()
-            }
-        }
-
-        private func metrics(in scrollView: NSScrollView) -> ScrollMetrics {
-            guard let documentView = scrollView.documentView else {
-                return ScrollMetrics(distanceFromTop: 0, distanceFromBottom: 0, wasAtBottom: true)
-            }
-            let visibleBounds = scrollView.contentView.bounds
-            let maximumY = max(documentView.bounds.height - visibleBounds.height, 0)
-            let originY = min(max(visibleBounds.origin.y, 0), maximumY)
-            let distanceFromBottom = max(maximumY - originY, 0)
-            return ScrollMetrics(
-                distanceFromTop: originY,
-                distanceFromBottom: distanceFromBottom,
-                wasAtBottom: distanceFromBottom <= edgeThreshold
-            )
-        }
-
-        private func scrollToBottom(in scrollView: NSScrollView) {
-            guard let documentView = scrollView.documentView else { return }
-            let maximumY = max(documentView.bounds.height - scrollView.contentView.bounds.height, 0)
-            TimelineDebugLog.log("scrollToBottom targetY=\(Int(maximumY)) docH=\(Int(documentView.bounds.height)) viewH=\(Int(scrollView.contentView.bounds.height))")
-            scroll(to: NSPoint(x: 0, y: maximumY), in: scrollView)
-        }
-
-        private func captureRestoreAnchor(
-            for scrollAnchor: MailiaTimelineScrollAnchor?,
-            anchorChanged: Bool,
-            entityChanged: Bool,
-            in scrollView: NSScrollView
-        ) -> TimelineRestoreAnchor? {
-            if anchorChanged,
-               let scrollAnchor,
-               scrollAnchor.edge == .top,
-               let anchor = captureAnchor(for: scrollAnchor.id, in: scrollView) {
-                return anchor
-            }
-            guard !entityChanged else { return nil }
-            return captureVisibleAnchor(in: scrollView)
-        }
-
-        private func captureVisibleAnchor(in scrollView: NSScrollView) -> TimelineRestoreAnchor? {
-            guard let collectionView else { return nil }
-            let visibleBounds = scrollView.contentView.bounds
-            let visibleIndexPaths = collectionView.indexPathsForVisibleItems().sorted { lhs, rhs in
-                lhs.item < rhs.item
-            }
-            for indexPath in visibleIndexPaths {
-                guard entries.indices.contains(indexPath.item),
-                      case .message(let message) = entries[indexPath.item].kind,
-                      let attributes = collectionView.layoutAttributesForItem(at: indexPath),
-                      attributes.frame.maxY >= visibleBounds.minY + 1
-                else {
-                    continue
-                }
-                return TimelineRestoreAnchor(
-                    messageID: message.id,
-                    offsetFromVisibleTop: attributes.frame.minY - visibleBounds.minY
-                )
-            }
-            return nil
-        }
-
-        private func captureAnchor(for messageID: Int64, in scrollView: NSScrollView) -> TimelineRestoreAnchor? {
-            guard let collectionView,
-                  let index = entries.firstIndex(where: { $0.messageID == messageID }),
-                  let attributes = collectionView.layoutAttributesForItem(at: IndexPath(item: index, section: 0))
-            else {
-                return nil
-            }
-            return TimelineRestoreAnchor(
-                messageID: messageID,
-                offsetFromVisibleTop: attributes.frame.minY - scrollView.contentView.bounds.minY
-            )
-        }
-
-        private func restore(_ anchor: TimelineRestoreAnchor, in scrollView: NSScrollView) {
-            guard let collectionView,
-                  let index = entries.firstIndex(where: { $0.messageID == anchor.messageID }),
-                  let attributes = collectionView.layoutAttributesForItem(at: IndexPath(item: index, section: 0))
-            else {
-                return
-            }
-            let maximumY = max((scrollView.documentView?.bounds.height ?? 0) - scrollView.contentView.bounds.height, 0)
-            let targetY = min(max(attributes.frame.minY - anchor.offsetFromVisibleTop, 0), maximumY)
-            TimelineDebugLog.log("restore message=\(anchor.messageID) targetY=\(Int(targetY)) maxY=\(Int(maximumY)) frameY=\(Int(attributes.frame.minY))")
-            scroll(to: NSPoint(x: 0, y: targetY), in: scrollView)
-        }
-
-        private func scroll(to point: NSPoint, in scrollView: NSScrollView) {
-            isAdjustingScroll = true
-            scrollView.contentView.scroll(to: point)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-            isAdjustingScroll = false
-        }
-
-        private var firstMessageID: Int64? {
-            entries.compactMap(\.messageID).first
-        }
-
-        private var lastMessageID: Int64? {
-            entries.compactMap(\.messageID).last
-        }
-
-        private static func makeEntries(
-            items: [MailiaTimelineItem],
-            isLoadingTimeline: Bool,
-            isLoadingOlderTimeline: Bool,
-            isLoadingNewerTimeline: Bool,
-            hasOlderTimeline: Bool,
-            hasNewerTimeline: Bool
-        ) -> [TimelineCollectionEntry] {
-            var entries: [TimelineCollectionEntry] = []
-            if isLoadingTimeline {
-                entries.append(TimelineCollectionEntry(id: "loading", kind: .marker(isLoading: true)))
-            }
-            if hasOlderTimeline || isLoadingOlderTimeline {
-                entries.append(TimelineCollectionEntry(id: "older", kind: .marker(isLoading: isLoadingOlderTimeline)))
-            }
-            entries.append(contentsOf: items.map { item in
-                TimelineCollectionEntry(id: "message-\(item.id)", kind: .message(item))
-            })
-            if hasNewerTimeline || isLoadingNewerTimeline {
-                entries.append(TimelineCollectionEntry(id: "newer", kind: .marker(isLoading: isLoadingNewerTimeline)))
-            }
-            return entries
-        }
-
-        private static func entrySignature(
-            entries: [TimelineCollectionEntry],
-            bodyStates: [Int64: MailiaTimelineBodyState],
-            attachmentDownloadStates: [Int64: MailiaAttachmentDownloadState],
-            measuredHTMLHeightsByMessageID: [Int64: CGFloat]
-        ) -> String {
-            entries.map { entry in
-                switch entry.kind {
-                case .marker(let isLoading):
-                    return "\(entry.id):marker:\(isLoading)"
-                case .message(let message):
-                    let body = bodyStateSignature(bodyStates[message.id] ?? .notRequested)
-                    let attachment = attachmentStateSignature(attachmentDownloadStates[message.id] ?? .idle)
-                    let htmlHeight = Int(measuredHTMLHeightsByMessageID[message.id] ?? 0)
-                    return "\(message.id):\(body):\(attachment):\(htmlHeight):\(message.isFlagged):\(message.hasAttachments)"
-                }
-            }.joined(separator: "|")
-        }
-
-        private static func bodyStateSignature(_ state: MailiaTimelineBodyState) -> String {
-            switch state {
-            case .notRequested:
-                return "notRequested"
-            case .loading:
-                return "loading"
-            case .loaded(let body):
-                return "loaded:\(body.html?.count ?? 0):\(body.text?.count ?? 0)"
-            case .failed(let message):
-                return "failed:\(message)"
-            }
-        }
-
-        private static func attachmentStateSignature(_ state: MailiaAttachmentDownloadState) -> String {
-            switch state {
-            case .idle:
-                return "idle"
-            case .downloading:
-                return "downloading"
-            case .downloaded(let result):
-                return "downloaded:\(result.fileNames.count)"
-            case .failed(let message):
-                return "failed:\(message)"
-            }
-        }
-
-        private func describeVisible(in scrollView: NSScrollView) -> String {
-            let bounds = scrollView.contentView.bounds
-            let documentHeight = scrollView.documentView?.bounds.height ?? 0
-            return "y=\(Int(bounds.origin.y)) h=\(Int(bounds.height)) docH=\(Int(documentHeight))"
-        }
-
-        private func describe(_ metrics: ScrollMetrics) -> String {
-            "top=\(Int(metrics.distanceFromTop)) bottom=\(Int(metrics.distanceFromBottom)) atBottom=\(metrics.wasAtBottom)"
-        }
-
-        private static func describe(_ anchor: MailiaTimelineScrollAnchor?) -> String {
-            guard let anchor else { return "nil" }
-            return "\(anchor.edge) id=\(anchor.id) gen=\(anchor.generation)"
-        }
-    }
-
-    fileprivate struct ScrollMetrics {
-        let distanceFromTop: CGFloat
-        let distanceFromBottom: CGFloat
-        let wasAtBottom: Bool
-    }
-
-    private struct TimelineRestoreAnchor {
-        let messageID: Int64
-        let offsetFromVisibleTop: CGFloat
-    }
-}
-
-private enum TimelineDebugLog {
-    static func log(_ message: @autoclosure () -> String) {
-        NSLog("[MailiaTimeline] \(message())")
-    }
-}
-
-private struct TimelineCollectionEntry {
-    enum Kind {
-        case marker(isLoading: Bool)
-        case message(MailiaTimelineItem)
-    }
-
-    let id: String
-    let kind: Kind
-
-    var messageID: Int64? {
-        if case .message(let message) = kind {
-            return message.id
-        }
-        return nil
-    }
-}
-
-private final class TimelineMarkerCollectionItem: NSCollectionViewItem {
-    static let identifier = NSUserInterfaceItemIdentifier("TimelineMarkerCollectionItem")
-    private var hostingView: NSHostingView<AnyView>?
-
-    override func loadView() {
-        view = NSView()
-        view.wantsLayer = true
-    }
-
-    func configure(isLoading: Bool) {
-        let rootView = AnyView(TimelinePageMarker(isLoading: isLoading))
-        if let hostingView {
-            hostingView.rootView = rootView
-        } else {
-            let hostingView = NSHostingView(rootView: rootView)
-            hostingView.autoresizingMask = [.width, .height]
-            view.addSubview(hostingView)
-            self.hostingView = hostingView
-        }
-        hostingView?.frame = view.bounds
-    }
-
-    override func viewDidLayout() {
-        super.viewDidLayout()
-        hostingView?.frame = view.bounds
-    }
-}
-
-private final class TimelineMessageCollectionItem: NSCollectionViewItem {
-    static let identifier = NSUserInterfaceItemIdentifier("TimelineMessageCollectionItem")
-    private var hostingView: NSHostingView<AnyView>?
-    private var messageID: Int64?
-    private var hostedMessageID: Int64?
-    private var onMeasuredHeight: ((Int64, CGFloat) -> Void)?
-    private var lastOverflowLogHeight: CGFloat = 0
-
-    override func loadView() {
-        view = TimelineMessageCellView()
-    }
-
-    func configure(
-        messageID: Int64,
-        row: TimelineMessageRow,
-        onMeasuredHeight: @escaping (Int64, CGFloat) -> Void
-    ) {
-        self.messageID = messageID
-        self.onMeasuredHeight = onMeasuredHeight
-        let rootView = AnyView(row.id(messageID).fixedSize(horizontal: false, vertical: true))
-        if let hostingView, hostedMessageID == messageID {
-            hostingView.rootView = rootView
-        } else {
-            hostingView?.removeFromSuperview()
-            let hostingView = NSHostingView(rootView: rootView)
-            hostingView.autoresizingMask = [.width]
-            view.addSubview(hostingView)
-            self.hostingView = hostingView
-            hostedMessageID = messageID
-            lastOverflowLogHeight = 0
-        }
-        layoutHostingView()
-    }
-
-    override func viewDidLayout() {
-        super.viewDidLayout()
-        layoutHostingView()
-    }
-
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        messageID = nil
-        hostedMessageID = nil
-        onMeasuredHeight = nil
-        hostingView?.removeFromSuperview()
-        hostingView = nil
-        lastOverflowLogHeight = 0
-    }
-
-    func remeasure() {
-        layoutHostingView()
-    }
-
-    private func layoutHostingView() {
-        guard let hostingView else { return }
-        let width = max(view.bounds.width, 1)
-        hostingView.frame = NSRect(x: 0, y: 0, width: width, height: view.bounds.height)
-        let measuredHeight = max(ceil(hostingView.fittingSize.height), 1)
-        guard let messageID else { return }
-        let allocatedHeight = view.bounds.height
-        if measuredHeight > allocatedHeight + 4,
-           abs(measuredHeight - lastOverflowLogHeight) > 4 {
-            lastOverflowLogHeight = measuredHeight
-            TimelineDebugLog.log("cell overflow message=\(messageID) measured=\(Int(measuredHeight)) allocated=\(Int(allocatedHeight))")
-        }
-        onMeasuredHeight?(messageID, measuredHeight)
-    }
-}
-
-private final class TimelineMessageCellView: NSView {
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.masksToBounds = true
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    override var isFlipped: Bool {
-        true
     }
 }
 
@@ -2898,38 +2223,12 @@ private struct EntityContextMenu: View {
             Divider()
         }
 
-        if workspace == .junk {
-            Button {
-                onAction(.moveToInbox, entity)
+        ForEach(EntityActionPolicy.visibleActions(for: workspace.coreWorkspace), id: \.self) { action in
+            Button(role: action.buttonRole) {
+                onAction(action, entity)
             } label: {
-                Label("Inbox", systemImage: "tray.and.arrow.down")
+                Label(action.label, systemImage: action.systemImage)
             }
-        } else {
-            Button {
-                onAction(.moveToJunk, entity)
-            } label: {
-                Label("Junk", systemImage: "nosign")
-            }
-        }
-
-        if workspace == .flagged {
-            Button {
-                onAction(.removeFlag, entity)
-            } label: {
-                Label("Unflag", systemImage: "flag.slash")
-            }
-        } else {
-            Button {
-                onAction(.flagImportant, entity)
-            } label: {
-                Label("Flag", systemImage: "flag")
-            }
-        }
-
-        Button(role: .destructive) {
-            onAction(.moveToTrash, entity)
-        } label: {
-            Label("Trash", systemImage: "trash")
         }
     }
 }
@@ -2949,1069 +2248,106 @@ private func normalizedEmailAddress(_ emailAddress: String?) -> String? {
     return value.isEmpty ? nil : value
 }
 
-private struct TimelineMessageRow: View {
-    let item: MailiaTimelineItem
-    let bodyState: MailiaTimelineBodyState
-    let attachmentDownloadState: MailiaAttachmentDownloadState
-    let maxHTMLHeight: CGFloat
-    let canRequestBody: Bool
-    let renderHTMLImmediately: Bool
-    let cachedHTMLHeight: CGFloat?
-    let onRequestBody: (MailiaTimelineItem) -> Void
-    let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
-    let onDownloadAttachments: (MailiaTimelineItem) -> Void
-    let onHTMLRendered: (Int64, CGFloat) -> Void
-    @State private var renderHTML: Bool
-    @State private var isRenderingHTML = false
-    @State private var measuredHTMLHeight: CGFloat
-    @State private var bodyRequestTask: Task<Void, Never>?
-    @State private var renderHTMLTask: Task<Void, Never>?
-
-    init(
-        item: MailiaTimelineItem,
-        bodyState: MailiaTimelineBodyState,
-        attachmentDownloadState: MailiaAttachmentDownloadState,
-        maxHTMLHeight: CGFloat,
-        canRequestBody: Bool,
-        renderHTMLImmediately: Bool,
-        cachedHTMLHeight: CGFloat?,
-        onRequestBody: @escaping (MailiaTimelineItem) -> Void,
-        onSetMessageFlag: @escaping (MailiaTimelineItem, Bool) -> Void,
-        onDownloadAttachments: @escaping (MailiaTimelineItem) -> Void,
-        onHTMLRendered: @escaping (Int64, CGFloat) -> Void
-    ) {
-        self.item = item
-        self.bodyState = bodyState
-        self.attachmentDownloadState = attachmentDownloadState
-        self.maxHTMLHeight = maxHTMLHeight
-        self.canRequestBody = canRequestBody
-        self.renderHTMLImmediately = renderHTMLImmediately
-        self.cachedHTMLHeight = cachedHTMLHeight
-        self.onRequestBody = onRequestBody
-        self.onSetMessageFlag = onSetMessageFlag
-        self.onDownloadAttachments = onDownloadAttachments
-        self.onHTMLRendered = onHTMLRendered
-        _renderHTML = State(initialValue: renderHTMLImmediately)
-        _measuredHTMLHeight = State(initialValue: cachedHTMLHeight ?? 320)
-    }
-
-    private var isOutgoing: Bool {
-        item.direction == .outgoing
-    }
-
-    private var htmlHeight: CGFloat {
-        min(max(measuredHTMLHeight, 1), maxHTMLHeight)
-    }
-
-    var body: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            if isOutgoing {
-                Spacer(minLength: 56)
-            }
-
-            VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    AccountBadgeLabel(emoji: item.accountEmoji, accountKey: item.accountLabel)
-                    if !item.folderLabel.isEmpty {
-                        BadgeLabel(text: item.folderLabel)
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(item.subject)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(2)
-
-                    bodyContent
-
-                    if item.hasAttachments {
-                        AttachmentDownloadRow(state: attachmentDownloadState) {
-                            onDownloadAttachments(item)
-                        }
-                    }
-
-                    HStack(alignment: .lastTextBaseline, spacing: 8) {
-                        Spacer(minLength: 8)
-
-                        if let date = item.date {
-                            RelativeTimeText(date: date)
-                        }
-                    }
-                }
-                .padding(12)
-                .frame(maxWidth: 640, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(isOutgoing ? Color.accentColor.opacity(0.16) : Color(nsColor: .controlBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(isOutgoing ? Color.accentColor.opacity(0.24) : Color.secondary.opacity(0.16), lineWidth: 1)
-                )
-            }
-
-            if !isOutgoing {
-                Spacer(minLength: 56)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: isOutgoing ? .trailing : .leading)
-        .onAppear {
-            requestBodyIfAllowed()
-        }
-        .onChange(of: item.id) {
-            measuredHTMLHeight = cachedHTMLHeight ?? 320
-            renderHTML = renderHTMLImmediately
-            cancelDeferredWork()
-        }
-        .onChange(of: renderHTMLImmediately) {
-            if renderHTMLImmediately {
-                measuredHTMLHeight = cachedHTMLHeight ?? measuredHTMLHeight
-                renderHTML = true
-            }
-        }
-        .onChange(of: canRequestBody) {
-            requestBodyIfAllowed()
-        }
-        .onDisappear {
-            cancelDeferredWork()
-        }
-        .contextMenu {
-            if item.isFlagged {
-                Button {
-                    onSetMessageFlag(item, false)
-                } label: {
-                    Label("Unflag", systemImage: "flag.slash")
-                }
-            } else {
-                Button {
-                    onSetMessageFlag(item, true)
-                } label: {
-                    Label("Flag", systemImage: "flag")
-                }
-            }
-        }
-    }
-
-    private func requestBodyIfAllowed() {
-        guard canRequestBody else { return }
-        bodyRequestTask?.cancel()
-        bodyRequestTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled else { return }
-            onRequestBody(item)
-        }
-    }
-
-    private func cancelDeferredWork() {
-        bodyRequestTask?.cancel()
-        bodyRequestTask = nil
-        renderHTMLTask?.cancel()
-        renderHTMLTask = nil
-    }
-
-    @ViewBuilder
-    private var bodyContent: some View {
-        switch bodyState {
-        case .notRequested:
-            placeholderBody
-        case .loading:
-            loadingBody
-        case .loaded(let body):
-            if let html = body.html ?? item.html {
-                htmlBody(html)
-            } else if let text = body.text {
-                Text(text)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text(item.preview)
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        case .failed:
-            VStack(alignment: .leading, spacing: 6) {
-                Text(item.preview)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Label("Body unavailable", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var placeholderBody: some View {
-        Text(item.preview)
-            .font(.body)
-            .foregroundStyle(.primary)
-            .lineLimit(6)
-            .fixedSize(horizontal: false, vertical: true)
-            .redacted(reason: .placeholder)
-    }
-
-    private var loadingBody: some View {
-        ZStack(alignment: .topLeading) {
-            placeholderBody
-            ProgressView()
-                .controlSize(.small)
-                .padding(.top, 2)
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: min(320, maxHTMLHeight), alignment: .topLeading)
-    }
-
-    private func htmlBody(_ html: String) -> some View {
-        ZStack(alignment: .topTrailing) {
-            if renderHTML {
-                MailHTMLView(
-                    cacheID: item.id,
-                    html: html,
-                    maximumExpandedHeight: maxHTMLHeight,
-                    isFlagged: item.isFlagged,
-                    onLoadingChange: { isLoading in
-                        if isRenderingHTML != isLoading {
-                            isRenderingHTML = isLoading
-                        }
-                    },
-                    onContentHeightChange: { height in
-                        let clampedHeight = min(max(height, 1), maxHTMLHeight)
-                        if abs(measuredHTMLHeight - clampedHeight) > 2 {
-                            measuredHTMLHeight = clampedHeight
-                        }
-                        onHTMLRendered(item.id, clampedHeight)
-                    },
-                    onSetMessageFlag: { isFlagged in
-                        onSetMessageFlag(item, isFlagged)
-                    }
-                )
-                .frame(maxWidth: .infinity)
-                .frame(height: htmlHeight)
-            } else {
-                placeholderBody
-            }
-
-            if isRenderingHTML {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(8)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .onAppear {
-            if renderHTMLImmediately {
-                renderHTML = true
-                return
-            }
-            renderHTMLTask?.cancel()
-            renderHTMLTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(120))
-                guard !Task.isCancelled else { return }
-                renderHTML = true
-            }
-        }
-        .onDisappear {
-            renderHTMLTask?.cancel()
-            renderHTMLTask = nil
-            isRenderingHTML = false
-        }
-    }
-}
-
-private struct AttachmentDownloadRow: View {
-    let state: MailiaAttachmentDownloadState
-    let onDownload: () -> Void
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "paperclip")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 14)
-                .padding(.top, 2)
-
-            content
-            .layoutPriority(1)
-
-            Spacer(minLength: 8)
-
-            Button {
-                onDownload()
-            } label: {
-                buttonLabel
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-            .disabled(isButtonDisabled)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.72))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .stroke(Color.secondary.opacity(0.14), lineWidth: 1)
-        )
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        switch state {
-        case .idle:
-            Text("Attachment files")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-        case .downloading:
-            Text("Attachment files")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-        case .downloaded(let result):
-            VStack(alignment: .leading, spacing: 2) {
-                if result.fileNames.isEmpty {
-                    Text("Files saved")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                } else {
-                    ForEach(Array(result.fileNames.prefix(4)), id: \.self) { fileName in
-                        Text(fileName)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    if result.fileNames.count > 4 {
-                        Text("+\(result.fileNames.count - 4) more")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                Text(result.directoryPath)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-        case .failed(let message):
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Attachment files")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Text(message)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var buttonLabel: some View {
-        switch state {
-        case .idle, .failed:
-            Label("Download", systemImage: "arrow.down.circle")
-                .labelStyle(.titleAndIcon)
-        case .downloading:
-            HStack(spacing: 5) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Downloading...")
-            }
-        case .downloaded:
-            Label("Downloaded", systemImage: "checkmark.circle")
-                .labelStyle(.titleAndIcon)
-        }
-    }
-
-    private var isButtonDisabled: Bool {
-        switch state {
-        case .downloading, .downloaded:
-            true
-        case .idle, .failed:
-            false
-        }
-    }
-}
-
-private struct MailHTMLView: NSViewRepresentable {
-    let cacheID: Int64
-    let html: String
-    let maximumExpandedHeight: CGFloat
-    let isFlagged: Bool
-    let onLoadingChange: (Bool) -> Void
-    let onContentHeightChange: (CGFloat) -> Void
-    let onSetMessageFlag: (Bool) -> Void
-    @AppStorage(MailiaPreferenceKeys.loadRemoteContent)
-    private var loadRemoteContent = false
-
-    init(
-        cacheID: Int64,
-        html: String,
-        maximumExpandedHeight: CGFloat,
-        isFlagged: Bool,
-        onLoadingChange: @escaping (Bool) -> Void = { _ in },
-        onContentHeightChange: @escaping (CGFloat) -> Void = { _ in },
-        onSetMessageFlag: @escaping (Bool) -> Void = { _ in }
-    ) {
-        self.cacheID = cacheID
-        self.html = html
-        self.maximumExpandedHeight = maximumExpandedHeight
-        self.isFlagged = isFlagged
-        self.onLoadingChange = onLoadingChange
-        self.onContentHeightChange = onContentHeightChange
-        self.onSetMessageFlag = onSetMessageFlag
-    }
-
-    func makeNSView(context: Context) -> MailHTMLContainerView {
-        MailHTMLContainerViewPool.shared.view(for: cacheID)
-    }
-
-    func updateNSView(_ containerView: MailHTMLContainerView, context: Context) {
-        containerView.onLoadingChange = onLoadingChange
-        containerView.onContentHeightChange = onContentHeightChange
-        containerView.maximumExpandedHeight = maximumExpandedHeight
-        containerView.contextMenu = makeMessageMenu()
-        containerView.loadHTML(wrappedHTML)
-    }
-
-    static func dismantleNSView(_ nsView: MailHTMLContainerView, coordinator: ()) {
-        nsView.onLoadingChange = nil
-        nsView.onContentHeightChange = nil
-        nsView.maximumExpandedHeight = .greatestFiniteMagnitude
-        nsView.contextMenu = nil
-    }
-
-    private func makeMessageMenu() -> NSMenu {
-        let menu = NSMenu()
-        if isFlagged {
-            let handler = MessageMenuActionHandler(action: {
-                onSetMessageFlag(false)
-            })
-            let item = NSMenuItem(title: "Unflag", action: #selector(MessageMenuActionHandler.removeFlag), keyEquivalent: "")
-            item.target = handler
-            item.representedObject = handler
-            menu.addItem(item)
-        } else {
-            let handler = MessageMenuActionHandler(action: {
-                onSetMessageFlag(true)
-            })
-            let item = NSMenuItem(title: "Flag", action: #selector(MessageMenuActionHandler.addFlag), keyEquivalent: "")
-            item.target = handler
-            item.representedObject = handler
-            menu.addItem(item)
-        }
-        return menu
-    }
-
-    private var wrappedHTML: String {
-        """
-        <!doctype html>
-        <html>
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-          <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src \(imageSourcePolicy); style-src 'unsafe-inline';">
-          <style>
-            * { box-sizing: border-box; }
-            html, body { width: 100%; min-width: 0; margin: 0; padding: 0; background: transparent; color: -apple-system-label; font: -apple-system-body; overflow-x: hidden; overflow-y: hidden; overflow-wrap: anywhere; -webkit-text-size-adjust: 100%; -webkit-user-select: text; user-select: text; cursor: text; }
-            body { width: 100%; max-width: none; }
-            #mailia-html-root { display: block; width: 100%; min-width: 0; margin: 0; padding: 0; }
-            img, svg, canvas { max-width: 100% !important; height: auto; }
-            .mailia-remote-image-placeholder { align-items: center !important; justify-content: center !important; overflow: hidden !important; max-width: 100% !important; border: 0 !important; border-radius: 0 !important; background: #f2f2f2 !important; color: inherit !important; font: 12px/1.2 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif !important; text-align: center !important; white-space: nowrap !important; text-decoration: none !important; outline: 0 !important; }
-            a { color: -apple-system-link; }
-            table { max-width: 100% !important; width: auto !important; table-layout: auto; }
-            pre, code { white-space: pre-wrap; overflow-wrap: anywhere; }
-          </style>
-        </head>
-        <body><main id="mailia-html-root">\(displayHTML)</main></body>
-        </html>
-        """
-    }
-
-    private var displayHTML: String {
-        guard !loadRemoteContent else {
-            return html
-        }
-
-        return (try? HTMLSanitizer().blockRemoteImages(in: html).content) ?? html
-    }
-
-    private var imageSourcePolicy: String {
-        loadRemoteContent ? "data: cid: http: https:" : "data: cid:"
-    }
-}
-
-@MainActor
-private final class MailHTMLContainerViewPool {
-    static let shared = MailHTMLContainerViewPool()
-
-    private var views: [Int64: MailHTMLContainerView] = [:]
-    private var accessOrder: [Int64] = []
-    private let maxViewCount = 48
-
-    func view(for cacheID: Int64) -> MailHTMLContainerView {
-        if let cached = views[cacheID] {
-            cached.removeFromSuperview()
-            remember(cacheID)
-            return cached
-        }
-
-        let view = MailHTMLContainerView()
-        views[cacheID] = view
-        remember(cacheID)
-        trimIfNeeded()
-        return view
-    }
-
-    private func remember(_ cacheID: Int64) {
-        accessOrder.removeAll { $0 == cacheID }
-        accessOrder.append(cacheID)
-    }
-
-    private func trimIfNeeded() {
-        while views.count > maxViewCount {
-            var removedView = false
-
-            for (index, cacheID) in accessOrder.enumerated() {
-                guard let view = views[cacheID] else {
-                    accessOrder.remove(at: index)
-                    removedView = true
-                    break
-                }
-
-                guard view.superview == nil else { continue }
-
-                accessOrder.remove(at: index)
-                views.removeValue(forKey: cacheID)?.cleanup()
-                removedView = true
-                break
-            }
-
-            guard removedView else { return }
-        }
-    }
-}
-
-private final class MailHTMLContainerView: NSView, WKNavigationDelegate, WKUIDelegate {
-    private let webView: MailHTMLWebView
-    private var currentHTML = ""
-    private var pendingFitWorkItem: DispatchWorkItem?
-    private var lastMeasuredWidth: CGFloat = 0
-    private var lastContentWidth: CGFloat = 0
-    private var lastContentHeight: CGFloat = 0
-    private var lastPageZoom: CGFloat = 1
-    private var isLoading = false
-    var maximumExpandedHeight: CGFloat = .greatestFiniteMagnitude {
-        didSet {
-            if abs(maximumExpandedHeight - oldValue) > 1 {
-                publishDisplayHeightForCurrentContent()
-                updateScrollersForCurrentBounds()
-            }
-        }
-    }
-    var onLoadingChange: ((Bool) -> Void)?
-    var onContentHeightChange: ((CGFloat) -> Void)?
-    var contextMenu: NSMenu? {
-        didSet {
-            webView.contextMenuProvider = { [weak self] in
-                self?.makeContextMenu()
-            }
-        }
-    }
-
-    override var mouseDownCanMoveWindow: Bool {
-        false
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
-    }
-
-    override init(frame frameRect: NSRect) {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
-
-        self.webView = MailHTMLWebView(frame: .zero, configuration: configuration)
-        super.init(frame: frameRect)
-
-        wantsLayer = true
-        layer?.masksToBounds = true
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.setValue(false, forKey: "drawsBackground")
-        webView.allowsMagnification = false
-        webView.wantsLayer = true
-        webView.layer?.masksToBounds = true
-
-        addSubview(webView)
-        setScrollers(horizontal: false, vertical: false)
-    }
-
-    deinit {
-        MainActor.assumeIsolated {
-            cleanup()
-        }
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    override func layout() {
-        super.layout()
-        let previousSize = webView.frame.size
-        webView.frame = bounds
-        if abs(previousSize.width - bounds.width) > 1 {
-            scheduleFit(force: true)
-        } else if abs(previousSize.height - bounds.height) > 1 {
-            scheduleFit(force: true)
-        }
-    }
-
-    func loadHTML(_ html: String) {
-        guard html != currentHTML else { return }
-
-        currentHTML = html
-        lastMeasuredWidth = 0
-        lastContentWidth = 0
-        lastContentHeight = 0
-        lastPageZoom = 1
-        webView.pageZoom = 1
-        setScrollers(horizontal: false, vertical: false)
-        setLoading(true)
-        webView.loadHTMLString(html, baseURL: nil)
-    }
-
-    func refreshLayoutForCurrentBounds() {
-        if lastContentHeight > 0 {
-            publishDisplayHeightForCurrentContent()
-            updateScrollersForCurrentBounds()
-        }
-        scheduleFit(force: true)
-    }
-
-    func cleanup() {
-        pendingFitWorkItem?.cancel()
-        pendingFitWorkItem = nil
-        webView.stopLoading()
-        webView.navigationDelegate = nil
-        webView.uiDelegate = nil
-        onLoadingChange = nil
-        onContentHeightChange = nil
-        contextMenu = nil
-        webView.contextMenuProvider = nil
-        currentHTML = ""
-        isLoading = false
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        setLoading(false)
-        scheduleFit(force: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.scheduleFit(force: true)
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        setLoading(false)
-    }
-
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        setLoading(false)
-    }
-
-    @MainActor
-    func webView(
-        _ webView: WKWebView,
-        decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
-    ) {
-        guard navigationAction.navigationType == .linkActivated,
-              let url = navigationAction.request.url else {
-            decisionHandler(.allow)
-            return
-        }
-
-        if ["http", "https"].contains(url.scheme?.lowercased()) {
-            NSWorkspace.shared.open(url)
-        }
-        decisionHandler(.cancel)
-    }
-
-    private func scheduleFit(force: Bool = false, delay: TimeInterval = 0.05) {
-        let measuredWidth = bounds.width
-        guard measuredWidth > 1, !currentHTML.isEmpty else { return }
-        if !force, abs(lastMeasuredWidth - measuredWidth) <= 1, lastContentHeight > 0 {
-            updateScrollersForCurrentBounds()
-            return
-        }
-
-        pendingFitWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.measureContentForVisibleBounds()
-        }
-        pendingFitWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-    }
-
-    private func measureContentForVisibleBounds() {
-        guard bounds.width > 1, bounds.height > 1, !currentHTML.isEmpty else { return }
-
-        let script = """
-        (() => {
-          const root = document.getElementById('mailia-html-root') || document.body;
-          if (!root) return { width: 1, height: 1 };
-          const elements = [root, ...Array.from(root.querySelectorAll('*'))];
-          let width = 0;
-          let top = Number.POSITIVE_INFINITY;
-          let bottom = 0;
-          const rootRect = root.getBoundingClientRect();
-          for (const element of elements) {
-            const style = window.getComputedStyle(element);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-            const rect = element.getBoundingClientRect();
-            if (rect.width <= 0 || rect.height <= 0) continue;
-            width = Math.max(width, rect.right - rootRect.left);
-            top = Math.min(top, rect.top);
-            bottom = Math.max(bottom, rect.bottom);
-          }
-          if (!Number.isFinite(top)) top = rootRect.top;
-          const height = Math.max(
-            bottom - top,
-            root.scrollHeight,
-            root.offsetHeight,
-            rootRect.height,
-            1
-          );
-          width = Math.max(
-            width,
-            root.scrollWidth,
-            root.offsetWidth,
-            1
-          );
-          return { width, height };
-        })();
-        """
-
-        webView.evaluateJavaScript(script) { [weak self] result, _ in
-            guard let self,
-                  let dimensions = result as? [String: Any],
-                  let contentWidth = Self.cgFloatValue(dimensions["width"]),
-                  let contentHeight = Self.cgFloatValue(dimensions["height"]),
-                  contentWidth > 1,
-                  contentHeight > 1
-            else {
-                return
-            }
-
-            let availableWidth = max(self.bounds.width - 2, 1)
-            let zoom = self.fitZoom(contentWidth: contentWidth, availableWidth: availableWidth)
-            let renderedWidth = ceil(contentWidth * zoom)
-            let renderedHeight = ceil(contentHeight * zoom)
-
-            if abs(self.lastPageZoom - zoom) > 0.01 {
-                self.lastPageZoom = zoom
-                self.webView.pageZoom = zoom
-            }
-
-            self.lastMeasuredWidth = self.bounds.width
-            self.lastContentWidth = renderedWidth
-            self.lastContentHeight = renderedHeight
-            self.publishDisplayHeightForCurrentContent()
-            self.updateScrollersForCurrentBounds(availableWidth: availableWidth)
-        }
-    }
-
-    private func publishDisplayHeightForCurrentContent() {
-        guard lastContentHeight > 0 else { return }
-        onContentHeightChange?(lastContentHeight)
-    }
-
-    private func updateScrollersForCurrentBounds(availableWidth: CGFloat? = nil) {
-        guard lastContentWidth > 0, lastContentHeight > 0 else { return }
-        let width = availableWidth ?? max(bounds.width - 2, 1)
-        let needsVerticalScroller = lastContentHeight > maximumExpandedHeight + 1
-        setScrollers(
-            horizontal: lastContentWidth > width + 1,
-            vertical: needsVerticalScroller
-        )
-    }
-
-    private func fitZoom(contentWidth: CGFloat, availableWidth: CGFloat) -> CGFloat {
-        guard contentWidth > availableWidth + 1 else { return 1 }
-        return min(1, availableWidth / contentWidth)
-    }
-
-    private func setScrollers(horizontal: Bool, vertical: Bool) {
-        webView.allowsHorizontalWheelScrolling = horizontal
-        webView.allowsVerticalWheelScrolling = vertical
-        setDOMVerticalScrollingEnabled(vertical)
-
-        guard let scrollView = firstScrollView(in: webView) else { return }
-        scrollView.drawsBackground = false
-        scrollView.autohidesScrollers = true
-        scrollView.hasHorizontalScroller = horizontal
-        scrollView.hasVerticalScroller = vertical
-        scrollView.horizontalScrollElasticity = .none
-        scrollView.verticalScrollElasticity = .none
-        scrollView.scrollerStyle = .overlay
-    }
-
-    private func setDOMVerticalScrollingEnabled(_ isEnabled: Bool) {
-        guard !currentHTML.isEmpty else { return }
-        let overflow = isEnabled ? "auto" : "hidden"
-        let resetScroll = isEnabled ? "" : "scroller.scrollTop = 0;"
-        let script = """
-        (() => {
-          const scroller = document.scrollingElement || document.documentElement || document.body;
-          if (!scroller) return;
-          document.documentElement.style.overflowY = '\(overflow)';
-          document.documentElement.style.height = 'auto';
-          if (document.body) document.body.style.overflowY = '\(overflow)';
-          if (document.body) document.body.style.height = 'auto';
-          \(resetScroll)
-        })();
-        """
-        webView.evaluateJavaScript(script)
-    }
-
-    private func makeContextMenu() -> NSMenu {
-        let menu = NSMenu()
-        let copyItem = NSMenuItem(title: "Copy", action: #selector(MailHTMLWebView.copy(_:)), keyEquivalent: "")
-        copyItem.target = webView
-        menu.addItem(copyItem)
-
-        if let contextMenu, !contextMenu.items.isEmpty {
-            menu.addItem(.separator())
-            for item in contextMenu.items {
-                if let copy = item.copy() as? NSMenuItem {
-                    menu.addItem(copy)
-                }
-            }
-        }
-
-        return menu
-    }
-
-    private func firstScrollView(in view: NSView) -> NSScrollView? {
-        if let scrollView = view as? NSScrollView {
-            return scrollView
-        }
-        for subview in view.subviews {
-            if let scrollView = firstScrollView(in: subview) {
-                return scrollView
-            }
-        }
-        return nil
-    }
-
-    private func setLoading(_ loading: Bool) {
-        guard isLoading != loading else { return }
-        isLoading = loading
-        onLoadingChange?(loading)
-    }
-
-    private static func cgFloatValue(_ value: Any?) -> CGFloat? {
-        if let number = value as? NSNumber {
-            return CGFloat(truncating: number)
-        }
-        if let double = value as? Double {
-            return CGFloat(double)
-        }
-        return nil
-    }
-
-}
-
-private final class MailHTMLWebView: WKWebView {
-    var allowsHorizontalWheelScrolling = false
-    var allowsVerticalWheelScrolling = false
-    var contextMenuProvider: (() -> NSMenu?)?
-
-    override var mouseDownCanMoveWindow: Bool {
-        false
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
-    }
-
-    override func menu(for event: NSEvent) -> NSMenu? {
-        contextMenuProvider?()
-    }
-
-    override func rightMouseDown(with event: NSEvent) {
-        guard let menu = contextMenuProvider?() else { return }
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if event.modifierFlags.contains(.control), let menu = contextMenuProvider?() {
-            NSMenu.popUpContextMenu(menu, with: event, for: self)
-            return
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
-           event.charactersIgnoringModifiers?.lowercased() == "c" {
-            copySelectedTextToPasteboard()
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-
-    @objc func copy(_ sender: Any?) {
-        copySelectedTextToPasteboard()
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        let isMostlyVertical = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
-        let hasScrollDelta = !event.scrollingDeltaY.isZero || !event.scrollingDeltaX.isZero
-        let canHandleEvent = isMostlyVertical
-            ? allowsVerticalWheelScrolling
-            : allowsHorizontalWheelScrolling
-        guard hasScrollDelta, canHandleEvent else {
-            nextResponder?.scrollWheel(with: event)
-            return
-        }
-
-        if isMostlyVertical,
-           let scrollView = firstScrollView(in: self),
-           !canScroll(scrollView, withVerticalDelta: event.scrollingDeltaY) {
-            nextResponder?.scrollWheel(with: event)
-            return
-        }
-
-        super.scrollWheel(with: event)
-    }
-
-    private func copySelectedTextToPasteboard() {
-        let script = """
-        (() => {
-          const selection = window.getSelection();
-          return selection ? selection.toString() : "";
-        })();
-        """
-
-        evaluateJavaScript(script) { result, _ in
-            guard let selectedText = result as? String,
-                  !selectedText.isEmpty else {
-                return
-            }
-
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(selectedText, forType: .string)
-        }
-    }
-
-    private func canScroll(_ scrollView: NSScrollView, withVerticalDelta deltaY: CGFloat) -> Bool {
-        guard abs(deltaY) > 0.1 else { return false }
-        let visibleBounds = scrollView.contentView.bounds
-        let maximumY = max((scrollView.documentView?.bounds.height ?? 0) - visibleBounds.height, 0)
-        if maximumY <= 1 {
-            return false
-        }
-        let originY = min(max(visibleBounds.origin.y, 0), maximumY)
-        if deltaY > 0 {
-            return originY > 1
-        }
-        return originY < maximumY - 1
-    }
-
-    private func firstScrollView(in view: NSView) -> NSScrollView? {
-        if let scrollView = view as? NSScrollView {
-            return scrollView
-        }
-        for subview in view.subviews {
-            if let scrollView = firstScrollView(in: subview) {
-                return scrollView
-            }
-        }
-        return nil
-    }
-}
-
-private final class MessageMenuActionHandler: NSObject {
-    private let action: () -> Void
-
-    init(action: @escaping () -> Void) {
-        self.action = action
-    }
-
-    @objc func addFlag() {
-        action()
-    }
-
-    @objc func removeFlag() {
-        action()
-    }
-}
-
-private struct BadgeLabel: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .fill(Color.secondary.opacity(0.11))
-            )
-    }
-}
-
-private struct AccountBadgeLabel: View {
-    let emoji: String?
-    let accountKey: String
-
-    var body: some View {
-        if let emoji = MailiaSendAccount.normalizedEmoji(emoji) {
-            BadgeLabel(text: emoji)
-                .help(accountKey)
-        } else {
-            BadgeLabel(text: accountKey)
-        }
-    }
-}
-
 private struct SettingsView: View {
     @ObservedObject var viewModel: AppViewModel
-    @AppStorage(MailiaPreferenceKeys.timelineBodyDisplayMode)
-    private var bodyDisplayMode = TimelineBodyDisplayMode.html.rawValue
-    @AppStorage(MailiaPreferenceKeys.loadRemoteContent)
-    private var loadRemoteContent = false
-    @AppStorage(MailiaPreferenceKeys.showTimelineAvatars)
-    private var showTimelineAvatars = true
-    @State private var appearanceDraft: AppearanceSettingsDraft
+    @TimelineDisplayOptionsStorage
+    private var displayOptions
+    @AppStorage(MailiaPreferenceKeys.autoSyncEnabled)
+    private var autoSyncEnabled = true
+    @AppStorage(MailiaPreferenceKeys.autoSyncIntervalMinutes)
+    private var autoSyncIntervalMinutes = 10
+    @AppStorage(MailiaPreferenceKeys.downloadsDirectoryPath)
+    private var downloadsDirectoryPath = ""
+    @State private var appearanceDraft: TimelineDisplayOptions
+    @State private var syncDraft: SyncSettingsDraft
+    @State private var downloadsDraft: DownloadsSettingsDraft
     @State private var accountDrafts: [String: AccountSettingsDraft] = [:]
 
     init(viewModel: AppViewModel) {
         self.viewModel = viewModel
-        _appearanceDraft = State(initialValue: AppearanceSettingsDraft.saved())
+        _appearanceDraft = State(initialValue: TimelineDisplayOptions.saved())
+        _syncDraft = State(initialValue: SyncSettingsDraft.saved())
+        _downloadsDraft = State(initialValue: DownloadsSettingsDraft.saved())
     }
 
     var body: some View {
         ZStack(alignment: .bottom) {
             Form {
+                Section("Sync") {
+                    LabeledContent("Status") {
+                        Text(viewModel.refreshStatus)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let activity = viewModel.refreshActivity {
+                        if let fraction = activity.fraction {
+                            ProgressView(value: fraction)
+                                .help(activity.detail ?? activity.title)
+                        } else {
+                            ProgressView()
+                                .help(activity.detail ?? activity.title)
+                        }
+                    }
+
+                    Picker("Sync mode", selection: Binding(
+                        get: { syncDraft.autoSyncEnabled ? SettingsSyncMode.automatic : .manual },
+                        set: { mode in syncDraft.autoSyncEnabled = mode == .automatic }
+                    )) {
+                        ForEach(SettingsSyncMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Picker("Automatic interval", selection: $syncDraft.intervalMinutes) {
+                        ForEach(SyncSettingsDraft.allowedIntervals, id: \.self) { minutes in
+                            Text(SyncSettingsDraft.intervalLabel(minutes)).tag(minutes)
+                        }
+                    }
+                    .disabled(!syncDraft.autoSyncEnabled)
+
+                    HStack {
+                        Spacer()
+
+                        Button("Sync Now") {
+                            Task { await viewModel.refresh() }
+                        }
+                        .disabled(viewModel.isRefreshing)
+
+                        Button("Sync All History Once") {
+                            Task { await viewModel.refreshFullHistory() }
+                        }
+                        .disabled(viewModel.isRefreshing)
+                    }
+                }
+
+                Section("Downloads") {
+                    LabeledContent("Attachment location") {
+                        HStack {
+                            Text(downloadsDraft.effectivePath)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundStyle(.secondary)
+                            Button("Choose...") {
+                                chooseDownloadsDirectory()
+                            }
+                            Button("Use Downloads") {
+                                downloadsDraft.path = ""
+                            }
+                        }
+                    }
+                }
+
+                Section("Cache Management") {
+                    CacheSettingsTable(
+                        summaries: viewModel.cacheSummaries,
+                        status: viewModel.cacheOperationStatus,
+                        onClear: { kind in
+                            viewModel.clearCache(kind)
+                        }
+                    )
+                }
+
                 Section("Accounts") {
                     if viewModel.sendAccounts.isEmpty {
                         ContentUnavailableView {
@@ -4061,15 +2397,13 @@ private struct SettingsView: View {
                     }
                     .pickerStyle(.segmented)
 
-                    Toggle("Show avatars in timeline", isOn: $appearanceDraft.showTimelineAvatars)
-                }
+                    Toggle("Show sender avatars", isOn: $appearanceDraft.showTimelineAvatars)
 
-                Section("Privacy") {
-                    Toggle("Load remote content", isOn: $appearanceDraft.loadRemoteContent)
-                }
+                    Toggle("Show my account avatars", isOn: $appearanceDraft.showOwnTimelineAvatars)
 
-                Section("Diagnostics") {
-                    LabeledContent("Core version", value: MailiaCore.version)
+                    Toggle("Hide quoted reply history", isOn: $appearanceDraft.hideQuotedReplyText)
+
+                    Toggle("Hide reply subjects", isOn: $appearanceDraft.hideReplySubjects)
                 }
             }
             .formStyle(.grouped)
@@ -4083,9 +2417,12 @@ private struct SettingsView: View {
         .frame(width: 700, height: 560)
         .background(MailiaSettingsChrome.backgroundColor)
         .task {
+            syncSettingsDraft()
             syncAppearanceDraft()
+            syncDownloadsDraft()
             syncAccountDrafts(with: viewModel.sendAccounts)
             await viewModel.refreshConfiguredAccounts()
+            await viewModel.refreshCacheSummaries()
         }
         .onChange(of: viewModel.sendAccounts) { _, accounts in
             syncDrafts(with: accounts)
@@ -4111,16 +2448,31 @@ private struct SettingsView: View {
         .background(MailiaSettingsChrome.backgroundColor)
     }
 
-    private var savedAppearanceDraft: AppearanceSettingsDraft {
-        AppearanceSettingsDraft(
-            bodyDisplayMode: bodyDisplayMode,
-            loadRemoteContent: loadRemoteContent,
-            showTimelineAvatars: showTimelineAvatars
+    private var savedAppearanceDraft: TimelineDisplayOptions {
+        displayOptions
+    }
+
+    private var savedSyncDraft: SyncSettingsDraft {
+        SyncSettingsDraft(
+            autoSyncEnabled: autoSyncEnabled,
+            intervalMinutes: autoSyncIntervalMinutes
         )
     }
 
+    private var savedDownloadsDraft: DownloadsSettingsDraft {
+        DownloadsSettingsDraft(path: downloadsDirectoryPath)
+    }
+
     private var hasUnsavedSettingsChanges: Bool {
-        hasUnsavedAppearanceChanges || hasUnsavedAccountChanges
+        hasUnsavedSyncChanges || hasUnsavedDownloadsChanges || hasUnsavedAppearanceChanges || hasUnsavedAccountChanges
+    }
+
+    private var hasUnsavedSyncChanges: Bool {
+        syncDraft != savedSyncDraft
+    }
+
+    private var hasUnsavedDownloadsChanges: Bool {
+        downloadsDraft != savedDownloadsDraft
     }
 
     private var hasUnsavedAppearanceChanges: Bool {
@@ -4160,21 +2512,40 @@ private struct SettingsView: View {
         appearanceDraft = savedAppearanceDraft
     }
 
+    private func syncSettingsDraft() {
+        syncDraft = savedSyncDraft
+    }
+
+    private func syncDownloadsDraft() {
+        downloadsDraft = savedDownloadsDraft
+    }
+
     private func resetSettingsDrafts() {
+        syncSettingsDraft()
         syncAppearanceDraft()
+        syncDownloadsDraft()
         syncAccountDrafts(with: viewModel.sendAccounts)
     }
 
     private func saveSettingsDrafts() {
         guard hasUnsavedSettingsChanges else { return }
+        saveSyncDraft()
         saveAppearanceDraft()
+        saveDownloadsDraft()
         saveAccountDrafts()
     }
 
+    private func saveSyncDraft() {
+        autoSyncEnabled = syncDraft.autoSyncEnabled
+        autoSyncIntervalMinutes = syncDraft.normalizedIntervalMinutes
+    }
+
     private func saveAppearanceDraft() {
-        bodyDisplayMode = appearanceDraft.bodyDisplayMode
-        loadRemoteContent = appearanceDraft.loadRemoteContent
-        showTimelineAvatars = appearanceDraft.showTimelineAvatars
+        displayOptions = appearanceDraft
+    }
+
+    private func saveDownloadsDraft() {
+        downloadsDirectoryPath = downloadsDraft.normalizedPath
     }
 
     private func saveAccountDrafts() {
@@ -4219,6 +2590,17 @@ private struct SettingsView: View {
             draft.isDefault = account.id == accountID
             accountDrafts[account.id] = draft
         }
+    }
+
+    private func chooseDownloadsDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = URL(fileURLWithPath: downloadsDraft.effectivePath, isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        downloadsDraft.path = url.path
     }
 }
 
@@ -4291,31 +2673,175 @@ private struct AccountSettingsRow: View {
 
 }
 
-private struct AppearanceSettingsDraft: Equatable {
-    var bodyDisplayMode: String
-    var loadRemoteContent: Bool
-    var showTimelineAvatars: Bool
+private enum SettingsSyncMode: String, CaseIterable, Identifiable {
+    case manual
+    case automatic
 
-    init(
-        bodyDisplayMode: String = TimelineBodyDisplayMode.html.rawValue,
-        loadRemoteContent: Bool = false,
-        showTimelineAvatars: Bool = true
-    ) {
-        self.bodyDisplayMode = bodyDisplayMode
-        self.loadRemoteContent = loadRemoteContent
-        self.showTimelineAvatars = showTimelineAvatars
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .manual:
+            "Manual"
+        case .automatic:
+            "Automatic"
+        }
+    }
+}
+
+private struct SyncSettingsDraft: Equatable {
+    static let allowedIntervals = [5, 10, 15, 30, 60]
+
+    var autoSyncEnabled: Bool
+    var intervalMinutes: Int
+
+    var normalizedIntervalMinutes: Int {
+        Self.allowedIntervals.contains(intervalMinutes) ? intervalMinutes : 10
     }
 
-    static func saved(defaults: UserDefaults = .standard) -> AppearanceSettingsDraft {
+    static func saved(defaults: UserDefaults = .standard) -> SyncSettingsDraft {
+        let autoSyncEnabled = defaults.object(forKey: MailiaPreferenceKeys.autoSyncEnabled) as? Bool ?? true
+        let intervalMinutes = defaults.object(forKey: MailiaPreferenceKeys.autoSyncIntervalMinutes) as? Int ?? 10
+        return SyncSettingsDraft(
+            autoSyncEnabled: autoSyncEnabled,
+            intervalMinutes: Self.allowedIntervals.contains(intervalMinutes) ? intervalMinutes : 10
+        )
+    }
+
+    static func intervalLabel(_ minutes: Int) -> String {
+        minutes == 60 ? "1 hour" : "\(minutes) minutes"
+    }
+}
+
+private struct DownloadsSettingsDraft: Equatable {
+    var path: String
+
+    var normalizedPath: String {
+        path.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var effectivePath: String {
+        normalizedPath.nilIfBlank ?? Self.defaultDownloadsPath()
+    }
+
+    static func saved(defaults: UserDefaults = .standard) -> DownloadsSettingsDraft {
+        DownloadsSettingsDraft(
+            path: defaults.string(forKey: MailiaPreferenceKeys.downloadsDirectoryPath) ?? ""
+        )
+    }
+
+    private static func defaultDownloadsPath(fileManager: FileManager = .default) -> String {
+        (try? fileManager.url(
+            for: .downloadsDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).path) ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Downloads").path
+    }
+}
+
+private struct CacheSettingsTable: View {
+    let summaries: [MailiaCacheSummary]
+    let status: String?
+    let onClear: (MailiaCacheKind) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Text("Cache")
+                    .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                Text("Items")
+                    .frame(width: 70, alignment: .trailing)
+                Text("Size")
+                    .frame(width: 90, alignment: .trailing)
+                Text("Folder")
+                    .frame(width: 54, alignment: .center)
+                Text("")
+                    .frame(width: 70)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+
+            ForEach(MailiaCacheKind.allCases) { kind in
+                let summary = summaries.first { $0.kind == kind }
+                HStack(spacing: 12) {
+                    Text(kind.displayName)
+                        .font(.body.weight(.semibold))
+                        .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+
+                    Text(summary.map { "\($0.itemCount)" } ?? "-")
+                        .monospacedDigit()
+                        .frame(width: 70, alignment: .trailing)
+
+                    Text(summary.map { Self.formattedBytes($0.byteSize) } ?? "-")
+                        .monospacedDigit()
+                        .frame(width: 90, alignment: .trailing)
+
+                    Button {
+                        Self.openFolder(for: kind)
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(width: 54, alignment: .center)
+                    .help("Open \(kind.displayName) folder")
+                    .disabled(Self.folderURL(for: kind) == nil)
+
+                    Button("Clear") {
+                        onClear(kind)
+                    }
+                    .frame(width: 70, alignment: .trailing)
+                    .disabled((summary?.itemCount ?? 0) == 0)
+                }
+            }
+
+            if let status {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private static func formattedBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private static func folderURL(for kind: MailiaCacheKind) -> URL? {
+        switch kind {
+        case .avatars:
+            EntityBrandAvatarResolver.defaultDiskCacheDirectory()
+        case .messageBodies:
+            try? MailiaEnvironment.live().applicationSupportDirectory
+        }
+    }
+
+    private static func openFolder(for kind: MailiaCacheKind) {
+        guard let folderURL = folderURL(for: kind) else { return }
+        try? FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(folderURL)
+    }
+}
+
+private extension TimelineDisplayOptions {
+    static func saved(defaults: UserDefaults = .standard) -> TimelineDisplayOptions {
         let bodyDisplayMode = defaults.string(
             forKey: MailiaPreferenceKeys.timelineBodyDisplayMode
         ) ?? TimelineBodyDisplayMode.html.rawValue
         let loadRemoteContent = defaults.object(forKey: MailiaPreferenceKeys.loadRemoteContent) as? Bool ?? false
         let showTimelineAvatars = defaults.object(forKey: MailiaPreferenceKeys.showTimelineAvatars) as? Bool ?? true
-        return AppearanceSettingsDraft(
+        let showOwnTimelineAvatars = defaults.object(
+            forKey: MailiaPreferenceKeys.showOwnTimelineAvatars
+        ) as? Bool ?? showTimelineAvatars
+        let hideQuotedReplyText = defaults.object(forKey: MailiaPreferenceKeys.hideQuotedReplyText) as? Bool ?? false
+        let hideReplySubjects = defaults.object(forKey: MailiaPreferenceKeys.hideReplySubjects) as? Bool ?? false
+        return TimelineDisplayOptions(
             bodyDisplayMode: bodyDisplayMode,
             loadRemoteContent: loadRemoteContent,
-            showTimelineAvatars: showTimelineAvatars
+            showTimelineAvatars: showTimelineAvatars,
+            showOwnTimelineAvatars: showOwnTimelineAvatars,
+            hideQuotedReplyText: hideQuotedReplyText,
+            hideReplySubjects: hideReplySubjects
         )
     }
 }
@@ -4459,5 +2985,12 @@ private extension EntityKind {
         case .unknown:
             "Unknown"
         }
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let value = trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 }

@@ -30,12 +30,12 @@ export function DevHarness({ bridge, state }: DevHarnessProps) {
       <label>
         Entity
         <select
-          value={state.selectedEntityID ?? ""}
+          value={state.entity?.id ?? ""}
           onChange={(event) =>
-            bridge.send({ type: "selectEntity", entityID: event.currentTarget.value })
+            bridge.send({ type: "selectEntity", entityID: Number(event.currentTarget.value) })
           }
         >
-          {state.entities.map((entity) => (
+          {bridge.getEntities().map((entity) => (
             <option key={entity.id} value={entity.id}>
               {entity.name}
             </option>
@@ -45,7 +45,7 @@ export function DevHarness({ bridge, state }: DevHarnessProps) {
 
       <div className="dev-harness__meta">
         <span>{bridge.mode}</span>
-        <span>{state.messages.length} messages</span>
+        <span>{state.items.length} messages</span>
       </div>
     </section>
   );

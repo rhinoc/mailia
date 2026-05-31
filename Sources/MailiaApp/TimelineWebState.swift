@@ -1,6 +1,68 @@
 import Foundation
 import AppKit
 
+private enum TimelineWebTaggedStateCodingKey: String, CodingKey {
+    case status
+    case body
+    case result
+    case message
+}
+
+private enum TimelineWebTaggedStateCoding {
+    typealias DecodingContainer = KeyedDecodingContainer<TimelineWebTaggedStateCodingKey>
+    typealias EncodingContainer = KeyedEncodingContainer<TimelineWebTaggedStateCodingKey>
+
+    static func decodeStatus<Status: Decodable>(
+        _ statusType: Status.Type,
+        from decoder: Decoder
+    ) throws -> (status: Status, container: DecodingContainer) {
+        let container = try decoder.container(keyedBy: TimelineWebTaggedStateCodingKey.self)
+        return (try container.decode(statusType, forKey: .status), container)
+    }
+
+    static func encodeStatus<Status: Encodable>(
+        _ status: Status,
+        to encoder: Encoder
+    ) throws -> EncodingContainer {
+        var container = encoder.container(keyedBy: TimelineWebTaggedStateCodingKey.self)
+        try container.encode(status, forKey: .status)
+        return container
+    }
+}
+
+struct TimelineDisplayOptions: Codable, Equatable, Sendable {
+    var bodyDisplayMode: String
+    var loadRemoteContent: Bool
+    var showTimelineAvatars: Bool
+    var showOwnTimelineAvatars: Bool
+    var hideQuotedReplyText: Bool
+    var hideReplySubjects: Bool
+
+    init(
+        bodyDisplayMode: String = "html",
+        loadRemoteContent: Bool = false,
+        showTimelineAvatars: Bool = true,
+        showOwnTimelineAvatars: Bool = true,
+        hideQuotedReplyText: Bool = false,
+        hideReplySubjects: Bool = false
+    ) {
+        self.bodyDisplayMode = bodyDisplayMode
+        self.loadRemoteContent = loadRemoteContent
+        self.showTimelineAvatars = showTimelineAvatars
+        self.showOwnTimelineAvatars = showOwnTimelineAvatars
+        self.hideQuotedReplyText = hideQuotedReplyText
+        self.hideReplySubjects = hideReplySubjects
+    }
+}
+
+struct TimelineWindowState: Codable, Equatable, Sendable {
+    var bottomOverlayHeight: CGFloat
+
+    init(bottomOverlayHeight: CGFloat = 0) {
+        self.bottomOverlayHeight = bottomOverlayHeight
+    }
+}
+
 struct TimelineWebState: Codable, Equatable, Sendable {
     var entity: Entity?
     var items: [Item]
@@ -15,9 +77,8 @@ struct TimelineWebState: Codable, Equatable, Sendable {
     var sendAccounts: [SendAccount]
     var selectedSendAccountKey: String?
     var scrollAnchor: ScrollAnchor?
-    var bodyDisplayMode: String
-    var loadRemoteContent: Bool
-    var showTimelineAvatars: Bool
+    var displayOptions: TimelineDisplayOptions
+    var windowState: TimelineWindowState
 
     init(
         entity: Entity?,
@@ -33,9 +94,8 @@ struct TimelineWebState: Codable, Equatable, Sendable {
         sendAccounts: [SendAccount] = [],
         selectedSendAccountKey: String? = nil,
         scrollAnchor: ScrollAnchor? = nil,
-        bodyDisplayMode: String = "html",
-        loadRemoteContent: Bool = false,
-        showTimelineAvatars: Bool = true
+        displayOptions: TimelineDisplayOptions = TimelineDisplayOptions(),
+        windowState: TimelineWindowState = TimelineWindowState()
     ) {
         self.entity = entity
         self.items = items
@@ -50,9 +110,8 @@ struct TimelineWebState: Codable, Equatable, Sendable {
         self.sendAccounts = sendAccounts
         self.selectedSendAccountKey = selectedSendAccountKey
         self.scrollAnchor = scrollAnchor
-        self.bodyDisplayMode = bodyDisplayMode
-        self.loadRemoteContent = loadRemoteContent
-        self.showTimelineAvatars = showTimelineAvatars
+        self.displayOptions = displayOptions
+        self.windowState = windowState
     }
 }
 
@@ -65,6 +124,7 @@ extension TimelineWebState {
         var kind: String
         var unreadCount: Int
         var latestSubject: String
+        var latestBodyPreview: String?
         var latestDate: Date?
         var accountLabel: String
         var workspace: String
@@ -80,6 +140,8 @@ extension TimelineWebState {
         var html: String?
         var date: Date?
         var accountLabel: String
+        var accountEmoji: String?
+        var accountAvatarImageDataURL: String?
         var folderLabel: String
         var envelopeID: String
         var isFlagged: Bool
@@ -102,12 +164,6 @@ extension TimelineWebState {
         case loaded(Body)
         case failed(String)
 
-        private enum CodingKeys: String, CodingKey {
-            case status
-            case body
-            case message
-        }
-
         private enum Status: String, Codable {
             case notRequested
             case loading
@@ -116,32 +172,30 @@ extension TimelineWebState {
         }
 
         init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            let status = try container.decode(Status.self, forKey: .status)
-            switch status {
+            let decoded = try TimelineWebTaggedStateCoding.decodeStatus(Status.self, from: decoder)
+            switch decoded.status {
             case .notRequested:
                 self = .notRequested
             case .loading:
                 self = .loading
             case .loaded:
-                self = .loaded(try container.decode(Body.self, forKey: .body))
+                self = .loaded(try decoded.container.decode(Body.self, forKey: .body))
             case .failed:
-                self = .failed(try container.decode(String.self, forKey: .message))
+                self = .failed(try decoded.container.decode(String.self, forKey: .message))
             }
         }
 
         func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
             switch self {
             case .notRequested:
-                try container.encode(Status.notRequested, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.notRequested, to: encoder)
             case .loading:
-                try container.encode(Status.loading, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.loading, to: encoder)
             case .loaded(let body):
-                try container.encode(Status.loaded, forKey: .status)
+                var container = try TimelineWebTaggedStateCoding.encodeStatus(Status.loaded, to: encoder)
                 try container.encode(body, forKey: .body)
             case .failed(let message):
-                try container.encode(Status.failed, forKey: .status)
+                var container = try TimelineWebTaggedStateCoding.encodeStatus(Status.failed, to: encoder)
                 try container.encode(message, forKey: .message)
             }
         }
@@ -158,12 +212,6 @@ extension TimelineWebState {
         case downloaded(AttachmentDownloadResult)
         case failed(String)
 
-        private enum CodingKeys: String, CodingKey {
-            case status
-            case result
-            case message
-        }
-
         private enum Status: String, Codable {
             case idle
             case downloading
@@ -172,32 +220,30 @@ extension TimelineWebState {
         }
 
         init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            let status = try container.decode(Status.self, forKey: .status)
-            switch status {
+            let decoded = try TimelineWebTaggedStateCoding.decodeStatus(Status.self, from: decoder)
+            switch decoded.status {
             case .idle:
                 self = .idle
             case .downloading:
                 self = .downloading
             case .downloaded:
-                self = .downloaded(try container.decode(AttachmentDownloadResult.self, forKey: .result))
+                self = .downloaded(try decoded.container.decode(AttachmentDownloadResult.self, forKey: .result))
             case .failed:
-                self = .failed(try container.decode(String.self, forKey: .message))
+                self = .failed(try decoded.container.decode(String.self, forKey: .message))
             }
         }
 
         func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
             switch self {
             case .idle:
-                try container.encode(Status.idle, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.idle, to: encoder)
             case .downloading:
-                try container.encode(Status.downloading, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.downloading, to: encoder)
             case .downloaded(let result):
-                try container.encode(Status.downloaded, forKey: .status)
+                var container = try TimelineWebTaggedStateCoding.encodeStatus(Status.downloaded, to: encoder)
                 try container.encode(result, forKey: .result)
             case .failed(let message):
-                try container.encode(Status.failed, forKey: .status)
+                var container = try TimelineWebTaggedStateCoding.encodeStatus(Status.failed, to: encoder)
                 try container.encode(message, forKey: .message)
             }
         }
@@ -214,11 +260,6 @@ extension TimelineWebState {
         case sent
         case failed(String)
 
-        private enum CodingKeys: String, CodingKey {
-            case status
-            case message
-        }
-
         private enum Status: String, Codable {
             case idle
             case sending
@@ -227,9 +268,8 @@ extension TimelineWebState {
         }
 
         init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            let status = try container.decode(Status.self, forKey: .status)
-            switch status {
+            let decoded = try TimelineWebTaggedStateCoding.decodeStatus(Status.self, from: decoder)
+            switch decoded.status {
             case .idle:
                 self = .idle
             case .sending:
@@ -237,21 +277,20 @@ extension TimelineWebState {
             case .sent:
                 self = .sent
             case .failed:
-                self = .failed(try container.decode(String.self, forKey: .message))
+                self = .failed(try decoded.container.decode(String.self, forKey: .message))
             }
         }
 
         func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
             switch self {
             case .idle:
-                try container.encode(Status.idle, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.idle, to: encoder)
             case .sending:
-                try container.encode(Status.sending, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.sending, to: encoder)
             case .sent:
-                try container.encode(Status.sent, forKey: .status)
+                _ = try TimelineWebTaggedStateCoding.encodeStatus(Status.sent, to: encoder)
             case .failed(let message):
-                try container.encode(Status.failed, forKey: .status)
+                var container = try TimelineWebTaggedStateCoding.encodeStatus(Status.failed, to: encoder)
                 try container.encode(message, forKey: .message)
             }
         }
@@ -284,9 +323,8 @@ extension TimelineWebState {
         sendAccounts: [MailiaSendAccount] = [],
         selectedSendAccountKey: String? = nil,
         scrollAnchor: MailiaTimelineScrollAnchor?,
-        bodyDisplayMode: String = "html",
-        loadRemoteContent: Bool = false,
-        showTimelineAvatars: Bool = true
+        displayOptions: TimelineDisplayOptions = TimelineDisplayOptions(),
+        windowState: TimelineWindowState = TimelineWindowState()
     ) {
         self.init(
             entity: entity.map(Entity.init),
@@ -306,9 +344,8 @@ extension TimelineWebState {
             sendAccounts: sendAccounts.map(SendAccount.init),
             selectedSendAccountKey: selectedSendAccountKey,
             scrollAnchor: scrollAnchor.map(ScrollAnchor.init),
-            bodyDisplayMode: bodyDisplayMode,
-            loadRemoteContent: loadRemoteContent,
-            showTimelineAvatars: showTimelineAvatars
+            displayOptions: displayOptions,
+            windowState: windowState
         )
     }
 }
@@ -335,6 +372,7 @@ extension TimelineWebState.Entity {
             kind: entity.kind.rawValue,
             unreadCount: entity.unreadCount,
             latestSubject: entity.latestSubject,
+            latestBodyPreview: entity.latestBodyPreview,
             latestDate: entity.latestDate,
             accountLabel: entity.accountLabel,
             workspace: entity.workspace.rawValue,
@@ -357,6 +395,8 @@ extension TimelineWebState.Item {
             html: item.html,
             date: item.date,
             accountLabel: item.accountLabel,
+            accountEmoji: item.accountEmoji,
+            accountAvatarImageDataURL: item.accountAvatarImageDataURL,
             folderLabel: item.folderLabel,
             envelopeID: item.envelopeID,
             isFlagged: item.isFlagged,
@@ -602,6 +642,7 @@ enum EntityAvatarRenderer {
         let hue = CGFloat(Double(hash % 360) / 360.0)
         return NSColor(calibratedHue: hue, saturation: 0.58, brightness: 0.74, alpha: 1)
     }
+
 }
 
 private extension Character {
@@ -625,7 +666,6 @@ private extension Character {
 enum TimelineWebEvent: Equatable, Sendable {
     case ready
     case requestOlder
-    case requestNewer
     case requestBody(messageID: Int64, priority: Int?)
     case sendReply(messageID: Int64, body: String, replyAll: Bool, accountKey: String?)
     case selectSendAccount(accountKey: String)
@@ -649,8 +689,6 @@ extension TimelineWebEvent {
             self = .ready
         case "requestOlder":
             self = .requestOlder
-        case "requestNewer":
-            self = .requestNewer
         case "requestBody":
             let payload = try envelope.payloadObject(as: MessagePayload.self)
             self = .requestBody(messageID: payload.messageID, priority: payload.bodyPriority)

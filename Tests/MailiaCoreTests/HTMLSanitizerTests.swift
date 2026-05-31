@@ -11,10 +11,11 @@ func sanitizerRemovesScriptElements() throws {
 }
 
 @Test
-func sanitizerRemovesEventHandlerAttributes() throws {
+func sanitizerRemovesInteractiveElementsAndEventHandlerAttributes() throws {
     let result = try HTMLSanitizer().sanitize("<button onclick=\"alert('x')\">Open</button>")
 
-    #expect(result.content.contains("<button>Open</button>"))
+    #expect(result.content.contains("Open"))
+    #expect(!result.content.localizedCaseInsensitiveContains("<button"))
     #expect(!result.content.localizedCaseInsensitiveContains("onclick"))
 }
 
@@ -25,6 +26,24 @@ func sanitizerRemovesJavaScriptHref() throws {
     #expect(result.content.contains("<a>Open</a>"))
     #expect(!result.content.localizedCaseInsensitiveContains("javascript:"))
     #expect(!result.content.localizedCaseInsensitiveContains("href="))
+}
+
+@Test
+func sanitizerKeepsAllowedLinkURLs() throws {
+    let result = try HTMLSanitizer().sanitize("""
+    <a href="mailto:support@example.com">Mail</a>
+    <a href="#details">Jump</a>
+    <a href="/settings">Settings</a>
+    <a href="docs/setup.html">Docs</a>
+    <a href="//example.com/protocol-relative">Blocked</a>
+    """)
+
+    #expect(result.content.contains("href=\"mailto:support@example.com\""))
+    #expect(result.content.contains("href=\"#details\""))
+    #expect(result.content.contains("href=\"/settings\""))
+    #expect(result.content.contains("href=\"docs/setup.html\""))
+    #expect(result.content.contains(">Blocked</a>"))
+    #expect(!result.content.contains("href=\"//example.com/protocol-relative\""))
 }
 
 @Test
@@ -71,6 +90,19 @@ func sanitizerRemovesUnsafeImageURLs() throws {
     #expect(!result.content.localizedCaseInsensitiveContains("javascript:"))
     #expect(!result.content.localizedCaseInsensitiveContains("src="))
     #expect(!result.content.localizedCaseInsensitiveContains("srcset="))
+}
+
+@Test
+func sanitizerFiltersUnsafeStyleDeclarations() throws {
+    let result = try HTMLSanitizer().sanitize("""
+    <p style="color: red; position: absolute; background-image: url(javascript:alert(1)); width: expression(alert(1));">Hello</p>
+    """)
+
+    #expect(result.content.contains("color:red"))
+    #expect(!result.content.localizedCaseInsensitiveContains("position"))
+    #expect(!result.content.localizedCaseInsensitiveContains("background-image"))
+    #expect(!result.content.localizedCaseInsensitiveContains("expression"))
+    #expect(!result.content.localizedCaseInsensitiveContains("javascript"))
 }
 
 @Test
@@ -133,4 +165,19 @@ func textNormalizerKeepsInlinePartLikeText() {
     let result = MessageTextNormalizer().normalize(text)
 
     #expect(result == text)
+}
+
+@Test
+func textNormalizerRemovesTrailingQuotedReplyText() {
+    let text = """
+    I will handle this today.
+
+    On May 30, Alice wrote:
+    > Can you look at this?
+    > Thanks.
+    """
+
+    let result = MessageTextNormalizer().removingTrailingQuotedReplyText(text)
+
+    #expect(result == "I will handle this today.")
 }

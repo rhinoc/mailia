@@ -1,17 +1,49 @@
-import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
+import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import TurndownService from "turndown";
-import { debugLog, debugLogEnabled } from "../debugLog";
 import type { BodyDisplayMode } from "../types";
 
 const REMOTE_IMAGE_PLACEHOLDER =
   "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+const REMOTE_IMAGE_PLACEHOLDER_CLASS = "mailia-remote-image-placeholder";
+const LEGACY_REMOTE_IMAGE_PLACEHOLDER_CLASS = "mail-body__blocked-image";
+const BLOCKED_REMOTE_IMAGE_LABEL = "Remote image blocked";
 const turndown = new TurndownService({
   headingStyle: "atx",
   bulletListMarker: "-",
   codeBlockStyle: "fenced"
 });
+const HTML_SANITIZER_CONFIG: DOMPurifyConfig = {
+  USE_PROFILES: { html: true },
+  FORBID_TAGS: [
+    "audio",
+    "base",
+    "button",
+    "embed",
+    "form",
+    "iframe",
+    "input",
+    "link",
+    "meta",
+    "object",
+    "option",
+    "picture",
+    "script",
+    "select",
+    "source",
+    "style",
+    "textarea",
+    "track",
+    "video"
+  ],
+  FORBID_ATTR: ["srcdoc"],
+  ALLOW_UNKNOWN_PROTOCOLS: false,
+  SANITIZE_DOM: true,
+  SANITIZE_NAMED_PROPS: true,
+  RETURN_TRUSTED_TYPE: false
+};
 
 turndown.addRule("blockedRemoteImage", {
   filter(node) {
@@ -22,8 +54,8 @@ turndown.addRule("blockedRemoteImage", {
     return (
       classList !== null &&
       (
-        classList.contains("mail-body__blocked-image") ||
-        classList.contains("mailia-remote-image-placeholder")
+        classList.contains(REMOTE_IMAGE_PLACEHOLDER_CLASS) ||
+        classList.contains(LEGACY_REMOTE_IMAGE_PLACEHOLDER_CLASS)
       )
     );
   },
@@ -95,14 +127,14 @@ function markdownComponents(loadRemoteContent: boolean): Components {
     },
     img({ node: _node, src, alt, ...props }) {
       if (!loadRemoteContent && src === REMOTE_IMAGE_PLACEHOLDER) {
-        return <span className="mail-markdown__blocked-image" aria-label="Remote image blocked" />;
+        return <span className="mail-markdown__blocked-image" aria-label={BLOCKED_REMOTE_IMAGE_LABEL} />;
       }
 
       if (loadRemoteContent || !isRemoteURL(src)) {
         return <img className="mail-markdown__image" src={src} alt={alt ?? ""} {...props} />;
       }
 
-      return <span className="mail-markdown__blocked-image" aria-label="Remote image blocked" />;
+      return <span className="mail-markdown__blocked-image" aria-label={BLOCKED_REMOTE_IMAGE_LABEL} />;
     },
     hr({ node: _node, ...props }) {
       return <hr className="mail-markdown__rule" {...props} />;
@@ -111,66 +143,57 @@ function markdownComponents(loadRemoteContent: boolean): Components {
 }
 
 interface MessageBodyProps {
-  debugID: string | number;
   html?: string | null;
   text?: string | null;
   mode: BodyDisplayMode;
   loadRemoteContent: boolean;
+  hideQuotedReplyText: boolean;
   onMeasuredHeight?(height: number): void;
 }
 
 export function MessageBody({
-  debugID,
   html,
   text,
   mode,
   loadRemoteContent,
+  hideQuotedReplyText,
   onMeasuredHeight
 }: MessageBodyProps) {
   const markdownFrameRef = useRef<HTMLDivElement>(null);
+  const displayText = useMemo(() => {
+    if (!text) return "";
+    return hideQuotedReplyText ? stripTrailingQuotedReplyText(text) : text;
+  }, [hideQuotedReplyText, text]);
+
   const normalizedHTML = useMemo(() => {
     if (html) return html;
     if (!text) return "<p>No body content is available for this message.</p>";
+    if (!displayText.trim()) return "";
 
-    return `<pre>${escapeHTML(text)}</pre>`;
-  }, [html, text]);
+    return `<pre>${escapeHTML(displayText)}</pre>`;
+  }, [displayText, html, text]);
+
+  const sanitizedHTML = useMemo(
+    () => sanitizeEmailHTML(normalizedHTML, hideQuotedReplyText),
+    [hideQuotedReplyText, normalizedHTML]
+  );
 
   const displayHTML = useMemo(() => {
-    if (loadRemoteContent) return normalizedHTML;
-    return blockRemoteImages(normalizedHTML);
-  }, [loadRemoteContent, normalizedHTML]);
+    if (loadRemoteContent) return sanitizedHTML;
+    return blockRemoteImages(sanitizedHTML);
+  }, [loadRemoteContent, sanitizedHTML]);
 
   const markdown = useMemo(() => {
     if (mode !== "markdown") return "";
     if (html) return turndown.turndown(displayHTML).trim();
-    return text?.trim() || "No body content is available for this message.";
-  }, [displayHTML, html, mode, text]);
+    if (text) return displayText.trim();
+    return "No body content is available for this message.";
+  }, [displayHTML, displayText, html, mode, text]);
 
   const markdownRenderers = useMemo(
     () => markdownComponents(loadRemoteContent),
     [loadRemoteContent]
   );
-
-  useEffect(() => {
-    if (!debugLogEnabled) return;
-    if (mode !== "markdown") return;
-    debugLog("render markdown body", {
-      messageID: debugID,
-      markdownLength: markdown.length,
-      htmlLength: html?.length ?? 0,
-      remote: loadRemoteContent
-    });
-  }, [debugID, html, loadRemoteContent, markdown.length, mode]);
-
-  useEffect(() => {
-    if (!debugLogEnabled) return;
-    if (mode === "markdown") return;
-    debugLog("render html body", {
-      messageID: debugID,
-      htmlLength: displayHTML.length,
-      remote: loadRemoteContent
-    });
-  }, [debugID, displayHTML.length, loadRemoteContent, mode]);
 
   if (mode === "markdown") {
     return (
@@ -413,6 +436,187 @@ function classNames(...values: Array<string | undefined>) {
   return values.filter(Boolean).join(" ");
 }
 
+function sanitizeEmailHTML(html: string, hideQuotedReplyText: boolean) {
+  const sanitized = DOMPurify.sanitize(html, HTML_SANITIZER_CONFIG);
+  const template = document.createElement("template");
+  template.innerHTML = sanitized;
+
+  normalizeSanitizedEmailDOM(template.content);
+  if (hideQuotedReplyText) {
+    stripQuotedReplyHTML(template.content);
+  }
+  return template.innerHTML;
+}
+
+function normalizeSanitizedEmailDOM(root: DocumentFragment) {
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    removeUnsafeInlineStyle(element);
+    sanitizeEmailURLAttributes(element);
+  }
+}
+
+function removeUnsafeInlineStyle(element: Element) {
+  const style = element.getAttribute("style");
+  if (!style) return;
+
+  if (!isSafeInlineStyle(style)) {
+    element.removeAttribute("style");
+  }
+}
+
+function isSafeInlineStyle(style: string) {
+  const lowercased = style.toLowerCase();
+  return !(
+    lowercased.includes("url(") ||
+    lowercased.includes("@import") ||
+    lowercased.includes("expression(") ||
+    lowercased.includes("behavior:")
+  );
+}
+
+function sanitizeEmailURLAttributes(element: Element) {
+  if (element.localName === "a") {
+    const href = element.getAttribute("href");
+    if (href && !isAllowedLinkURL(href)) {
+      element.removeAttribute("href");
+    }
+  }
+
+  for (const attribute of ["action", "background", "formaction", "poster"]) {
+    element.removeAttribute(attribute);
+  }
+}
+
+function stripTrailingQuotedReplyText(text: string) {
+  const normalized = text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!isReplyAttributionLine(lines[index])) continue;
+
+    const followingLines = lines.slice(index + 1);
+    const nonBlankFollowingLines = followingLines.filter((line) => line.trim() !== "");
+    if (nonBlankFollowingLines.length === 0) continue;
+    if (!nonBlankFollowingLines.every(isQuotedTextLine)) continue;
+
+    const keptLines = lines.slice(0, index);
+    while (keptLines.length > 0 && keptLines.at(-1)?.trim() === "") {
+      keptLines.pop();
+    }
+    return keptLines.join("\n");
+  }
+
+  return text;
+}
+
+function isReplyAttributionLine(line: string) {
+  return /^On\s+.+\swrote:\s*$/i.test(line.trim());
+}
+
+function isQuotedTextLine(line: string) {
+  return line.trimStart().startsWith(">");
+}
+
+function stripQuotedReplyHTML(root: DocumentFragment) {
+  removeOutlookQuotedReplyHTML(root);
+  removeKnownQuotedReplyContainers(root);
+}
+
+function removeOutlookQuotedReplyHTML(root: DocumentFragment) {
+  for (const header of Array.from(root.querySelectorAll('[id$="divRplyFwdMsg"]'))) {
+    if (!isOutlookReplyHeader(header)) continue;
+
+    removeNodeAndFollowingSiblings(outlookReplyStartNode(header));
+  }
+}
+
+function isOutlookReplyHeader(element: Element) {
+  const text = compactMarkdownText(element.textContent ?? "").toLowerCase();
+  const labels = [
+    "from:",
+    "sent:",
+    "to:",
+    "subject:",
+    "发件人:",
+    "发送时间:",
+    "收件人:",
+    "主题:"
+  ];
+  return labels.filter((label) => text.includes(label.toLowerCase())).length >= 3;
+}
+
+function outlookReplyStartNode(header: Element) {
+  const previous = previousElementSibling(header);
+  if (previous?.localName === "hr") {
+    const beforeRule = previousElementSibling(previous);
+    if (beforeRule && hasIDEnding(beforeRule, "appendonsend")) {
+      return beforeRule;
+    }
+    return previous;
+  }
+
+  const beforeHeader = previousElementSibling(header);
+  if (beforeHeader && hasIDEnding(beforeHeader, "appendonsend")) {
+    return beforeHeader;
+  }
+
+  return header;
+}
+
+function hasIDEnding(element: Element | null | undefined, suffix: string) {
+  return element?.id.toLowerCase().endsWith(suffix.toLowerCase()) === true;
+}
+
+function previousElementSibling(element: Element) {
+  let sibling = element.previousSibling;
+  while (sibling) {
+    if (sibling.nodeType === Node.ELEMENT_NODE) {
+      return sibling as Element;
+    }
+    if ((sibling.textContent ?? "").trim() !== "") {
+      return null;
+    }
+    sibling = sibling.previousSibling;
+  }
+  return null;
+}
+
+function removeNodeAndFollowingSiblings(node: ChildNode) {
+  let current: ChildNode | null = node;
+  while (current) {
+    const next: ChildNode | null = current.nextSibling;
+    current.remove();
+    current = next;
+  }
+}
+
+function removeKnownQuotedReplyContainers(root: DocumentFragment) {
+  const selectors = [
+    ".gmail_quote",
+    ".gmail_extra",
+    "blockquote[type='cite']"
+  ];
+
+  for (const element of Array.from(root.querySelectorAll(selectors.join(",")))) {
+    element.remove();
+  }
+}
+
+function isAllowedLinkURL(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  if (/[\u0000-\u001F\u007F]/.test(trimmed)) return false;
+  if (trimmed.startsWith("#")) return true;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return true;
+
+  const schemeMatch = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(trimmed);
+  if (!schemeMatch) return !trimmed.startsWith("//");
+
+  return ["http:", "https:", "mailto:"].includes(schemeMatch[0].toLowerCase());
+}
+
 function blockRemoteImages(html: string) {
   const template = document.createElement("template");
   template.innerHTML = html;
@@ -450,9 +654,9 @@ function imageOnlyLinkParent(image: HTMLImageElement) {
 
 function remoteImagePlaceholder(image: HTMLImageElement) {
   const placeholder = document.createElement("span");
-  placeholder.className = "mail-body__blocked-image";
+  placeholder.className = REMOTE_IMAGE_PLACEHOLDER_CLASS;
   placeholder.setAttribute("role", "img");
-  placeholder.setAttribute("aria-label", "Remote image blocked");
+  placeholder.setAttribute("aria-label", BLOCKED_REMOTE_IMAGE_LABEL);
   placeholder.textContent = " ";
   placeholder.setAttribute("style", preservedImageBoxStyle(image));
   return placeholder;

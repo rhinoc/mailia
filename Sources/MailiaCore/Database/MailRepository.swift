@@ -129,6 +129,8 @@ public struct MailRepository {
                 let toJSON = try encodeAddresses(envelope.to)
                 let ccJSON = try encodeAddresses(envelope.cc)
                 let fallbackKey = fallbackDedupeKey(for: envelope)
+                let ownEmailAddresses = try ownEmailAddresses(db)
+                let accountEmailAddress = try accountEmailAddress(db, accountKey: envelope.accountKey.trimmed)
                 let messageID = try upsertMessage(
                     db,
                     envelope: envelope,
@@ -144,7 +146,13 @@ public struct MailRepository {
                     folderID: folderID,
                     envelope: envelope
                 )
-                try upsertMessageEntities(db, messageID: messageID, envelope: envelope)
+                try rebuildMessageEntities(
+                    db,
+                    messageID: messageID,
+                    envelope: envelope,
+                    ownEmailAddresses: ownEmailAddresses,
+                    accountEmailAddress: accountEmailAddress
+                )
 
                 messageIDs.append(messageID)
             }
@@ -156,17 +164,13 @@ public struct MailRepository {
         return try databaseQueue.read { db in
             let whereClause: String
             let arguments: StatementArguments
-            switch workspace {
-            case .main:
-                whereClause = "WHERE is_sync_enabled = 1 AND role IN ('normal', 'sent')"
-                arguments = []
-            case .junk:
-                whereClause = "WHERE is_sync_enabled = 1 AND role = ?"
-                arguments = [FolderRole.junk.rawValue]
-            case .flagged:
-                whereClause = "WHERE is_sync_enabled = 1 AND role IN ('normal', 'sent', 'junk')"
-                arguments = []
-            case .none:
+            if let workspace {
+                let roles = WorkspacePolicy.visibleRoles(for: workspace)
+                guard !roles.isEmpty else { return [] }
+                let placeholders = Array(repeating: "?", count: roles.count).joined(separator: ", ")
+                whereClause = "WHERE is_sync_enabled = 1 AND role IN (\(placeholders))"
+                arguments = StatementArguments(roles.map(\.rawValue))
+            } else {
                 whereClause = "WHERE is_sync_enabled = 1"
                 arguments = []
             }
@@ -198,35 +202,45 @@ public struct MailRepository {
         folderID: Int64,
         workspace: Workspace
     ) throws -> Date? {
+        try syncCheckpoint(accountKey: accountKey, folderID: folderID, workspace: workspace)?.lastSuccessfulSyncAt
+    }
+
+    public func lastSuccessfulRefreshFinishedAt() throws -> Date? {
         try databaseQueue.read { db in
-            let folderValue = try String.fetchOne(
+            let value = try String.fetchOne(
                 db,
                 sql: """
-                    SELECT last_successful_sync_at
+                    SELECT MAX(datetime(COALESCE(last_successful_sync_finished_at, last_successful_sync_at)))
                     FROM sync_checkpoints
-                    WHERE account_key = ?
-                      AND folder_id = ?
-                      AND workspace = ?
-                    """,
-                arguments: [accountKey, folderID, workspace.rawValue]
+                    WHERE folder_id IS NULL
+                    """
             )
+            return Self.parseCheckpointDate(value)
+        }
+    }
 
-            if let folderDate = Self.parseCheckpointDate(folderValue) {
-                return folderDate
+    public func syncCheckpoint(
+        accountKey: String,
+        folderID: Int64?,
+        workspace: Workspace
+    ) throws -> SyncCheckpoint? {
+        try databaseQueue.read { db in
+            if let folderID,
+               let checkpoint = try fetchSyncCheckpoint(
+                    db,
+                    accountKey: accountKey,
+                    folderID: folderID,
+                    workspace: workspace
+               ) {
+                return checkpoint
             }
 
-            let accountValue = try String.fetchOne(
+            return try fetchSyncCheckpoint(
                 db,
-                sql: """
-                    SELECT last_successful_sync_at
-                    FROM sync_checkpoints
-                    WHERE account_key = ?
-                      AND folder_id IS NULL
-                      AND workspace = ?
-                    """,
-                arguments: [accountKey, workspace.rawValue]
+                accountKey: accountKey,
+                folderID: nil,
+                workspace: workspace
             )
-            return Self.parseCheckpointDate(accountValue)
         }
     }
 
@@ -234,7 +248,11 @@ public struct MailRepository {
         accountKey: String,
         folderID: Int64,
         workspace: Workspace,
-        at date: Date = Date()
+        at date: Date = Date(),
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        queryStartAt: Date? = nil,
+        oldestSyncedMessageDate: Date? = nil
     ) throws {
         let checkpointValue = Self.formatCheckpointDate(date)
         try databaseQueue.write { db in
@@ -251,7 +269,11 @@ public struct MailRepository {
                 accountKey: accountKey,
                 folderID: folderID,
                 workspace: workspace,
-                checkpointValue: checkpointValue
+                checkpointValue: checkpointValue,
+                startedValue: startedAt.map(Self.formatCheckpointDate),
+                finishedValue: Self.formatCheckpointDate(finishedAt ?? date),
+                queryStartValue: queryStartAt.map(Self.formatCheckpointDate),
+                oldestSyncedMessageValue: oldestSyncedMessageDate.map(Self.formatCheckpointDate)
             )
         }
     }
@@ -259,7 +281,11 @@ public struct MailRepository {
     public func markAccountSyncSucceeded(
         accountKey: String,
         workspace: Workspace,
-        at date: Date = Date()
+        at date: Date = Date(),
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        queryStartAt: Date? = nil,
+        oldestSyncedMessageDate: Date? = nil
     ) throws {
         let checkpointValue = Self.formatCheckpointDate(date)
         try databaseQueue.write { db in
@@ -268,15 +294,21 @@ public struct MailRepository {
                 accountKey: accountKey,
                 folderID: nil,
                 workspace: workspace,
-                checkpointValue: checkpointValue
+                checkpointValue: checkpointValue,
+                startedValue: startedAt.map(Self.formatCheckpointDate),
+                finishedValue: Self.formatCheckpointDate(finishedAt ?? date),
+                queryStartValue: queryStartAt.map(Self.formatCheckpointDate),
+                oldestSyncedMessageValue: oldestSyncedMessageDate.map(Self.formatCheckpointDate)
             )
         }
     }
 
     public func entityList(workspace: Workspace) throws -> [EntityListItem] {
         try databaseQueue.read { db in
-            let roles = workspaceRoles(workspace)
-            let entityFlagPredicate = workspaceEntityFlagPredicate(workspace: workspace)
+            let scope = WorkspaceScopeSQL(workspace: workspace)
+            let messageSortKey = scope.messageSortKey(alias: "m")
+            let newerMessageSortKey = scope.messageSortKey(alias: "newer_m")
+            let latestMessageSortKey = scope.messageSortKey(alias: "latest")
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -292,9 +324,8 @@ public struct MailRepository {
                         JOIN messages m ON m.id = me.message_id
                         JOIN message_locations ml ON ml.message_id = m.id
                         JOIN folders f ON f.id = ml.folder_id
-                        WHERE f.role IN (\(rolePlaceholders(count: roles.count)))
-                          AND ml.missing_since_at IS NULL
-                          \(entityFlagPredicate)
+                        WHERE \(scope.locationVisibilityPredicate(locationAlias: "ml", folderAlias: "f"))
+                          \(scope.entityVisibilityPredicate(entityAlias: "me"))
                     ),
                     latest_messages AS (
                         SELECT wm.entity_id, wm.message_id
@@ -305,8 +336,7 @@ public struct MailRepository {
                             FROM workspace_messages newer_wm
                             JOIN messages newer_m ON newer_m.id = newer_wm.message_id
                             WHERE newer_wm.entity_id = wm.entity_id
-                              AND COALESCE(newer_m.message_date, newer_m.created_at) >
-                                  COALESCE(m.message_date, m.created_at)
+                              AND \(newerMessageSortKey) > \(messageSortKey)
                         )
                     ),
                     primary_senders AS (
@@ -342,7 +372,9 @@ public struct MailRepository {
                         eea.email_addresses,
                         e.kind,
                         latest.subject AS latest_subject,
+                        latest_body.text_fallback AS latest_body_preview,
                         COALESCE(latest.message_date, latest.created_at) AS latest_message_date,
+                        \(latestMessageSortKey) AS latest_sort_key,
                         COUNT(DISTINCT wm.message_id) AS message_count,
                         COUNT(DISTINCT CASE WHEN wm.is_unread = 1 THEN wm.message_id END) AS unread_count,
                         GROUP_CONCAT(DISTINCT latest.account_key) AS account_keys
@@ -350,12 +382,13 @@ public struct MailRepository {
                     JOIN entities e ON e.id = wm.entity_id
                     JOIN latest_messages lm ON lm.entity_id = wm.entity_id
                     JOIN messages latest ON latest.id = lm.message_id
+                    LEFT JOIN message_bodies latest_body ON latest_body.message_id = latest.id
                     LEFT JOIN primary_senders ps ON ps.entity_id = e.id AND ps.rank = 1
                     LEFT JOIN entity_email_addresses eea ON eea.entity_id = e.id
                     GROUP BY e.id
-                    ORDER BY latest_message_date DESC, e.display_name COLLATE NOCASE
+                    ORDER BY latest_sort_key DESC, e.display_name COLLATE NOCASE
                     """,
-                arguments: StatementArguments(roles.map(\.rawValue))
+                arguments: StatementArguments(scope.roleValues)
             )
 
             return rows.map { row in
@@ -365,6 +398,7 @@ public struct MailRepository {
                     primaryEmailAddress: row["primary_email_address"],
                     emailAddresses: splitCommaSeparatedValues(row["email_addresses"]),
                     latestSubject: row["latest_subject"],
+                    latestBodyPreview: row["latest_body_preview"],
                     latestDate: HimalayaDateParser.parse(row["latest_message_date"] as String?),
                     unreadCount: row["unread_count"],
                     accountKeys: splitCommaSeparatedValues(row["account_keys"])
@@ -384,8 +418,8 @@ public struct MailRepository {
         precondition(!(beforeMessageID != nil && afterMessageID != nil), "Use either beforeMessageID or afterMessageID, not both")
 
         return try databaseQueue.read { db in
-            let roles = workspaceRoles(workspace)
-            var arguments = StatementArguments(roles.map(\.rawValue))
+            let scope = WorkspaceScopeSQL(workspace: workspace)
+            var arguments = StatementArguments(scope.roleValues)
             _ = arguments.append(contentsOf: StatementArguments([entityID]))
             _ = arguments.append(contentsOf: StatementArguments([beforeMessageID ?? afterMessageID]))
             _ = arguments.append(contentsOf: StatementArguments([beforeMessageID]))
@@ -393,7 +427,7 @@ public struct MailRepository {
             if let limit {
                 _ = arguments.append(contentsOf: StatementArguments([limit]))
             }
-            _ = arguments.append(contentsOf: StatementArguments(roles.map(\.rawValue)))
+            _ = arguments.append(contentsOf: StatementArguments(scope.roleValues))
             let bodySelect = includeBodies
                 ? """
                         mb.sanitized_html,
@@ -410,31 +444,63 @@ public struct MailRepository {
             let windowOrder = afterMessageID == nil
                 ? "sm.sort_key DESC, sm.id DESC"
                 : "sm.sort_key ASC, sm.id ASC"
+            let messageSortKey = scope.messageSortKey(alias: "m")
+            let bareMessageSortKey = scope.messageSortKey(alias: nil)
 
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                    WITH scoped_messages AS (
-                        SELECT DISTINCT
+                    WITH eligible_locations AS (
+                        SELECT
+                            ml.message_id,
+                            MAX(CASE WHEN f.role = 'sent' THEN 1 ELSE 0 END) AS has_sent_location,
+                            MAX(CASE WHEN f.role = 'normal' THEN 1 ELSE 0 END) AS has_normal_location
+                        FROM message_locations ml
+                        JOIN folders f ON f.id = ml.folder_id
+                        WHERE \(scope.locationVisibilityPredicate(locationAlias: "ml", folderAlias: "f"))
+                        GROUP BY ml.message_id
+                    ),
+                    ranked_message_relations AS (
+                        SELECT
                             m.id,
-                            COALESCE(m.message_date, m.created_at) AS sort_key
+                            me.timeline_direction,
+                            \(messageSortKey) AS sort_key,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY m.id
+                                ORDER BY
+                                    CASE
+                                        WHEN me.timeline_direction = 'outgoing' AND el.has_sent_location = 1 THEN 0
+                                        WHEN me.timeline_direction = 'incoming' AND el.has_normal_location = 1 THEN 0
+                                        ELSE 1
+                                    END,
+                                    CASE me.relation_kind
+                                        WHEN 'from' THEN 0
+                                        WHEN 'to' THEN 1
+                                        WHEN 'cc' THEN 2
+                                        WHEN 'bcc' THEN 3
+                                        ELSE 4
+                                    END,
+                                    me.timeline_direction
+                            ) AS relation_rank
                         FROM messages m
                         JOIN message_entities me ON me.message_id = m.id
-                        JOIN message_locations ml ON ml.message_id = m.id
-                        JOIN folders f ON f.id = ml.folder_id
-                        WHERE f.role IN (\(rolePlaceholders(count: roles.count)))
-                          AND ml.missing_since_at IS NULL
-                          AND me.entity_id = ?
+                        JOIN eligible_locations el ON el.message_id = m.id
+                        WHERE me.entity_id = ?
+                    ),
+                    scoped_messages AS (
+                        SELECT id, timeline_direction, sort_key
+                        FROM ranked_message_relations
+                        WHERE relation_rank = 1
                     ),
                     cursor_message AS (
                         SELECT
                             id,
-                            COALESCE(message_date, created_at) AS sort_key
+                            \(bareMessageSortKey) AS sort_key
                         FROM messages
                         WHERE id = ?
                     ),
                     windowed_messages AS (
-                        SELECT sm.id
+                        SELECT sm.id, sm.timeline_direction
                         FROM scoped_messages sm
                         WHERE (
                             ? IS NULL
@@ -458,27 +524,22 @@ public struct MailRepository {
                     preferred_locations AS (
                         SELECT
                             ml.message_id,
+                            wm.timeline_direction,
                             f.provider_name,
                             ml.himalaya_envelope_id,
                             ml.flags_json,
                             ROW_NUMBER() OVER (
                                 PARTITION BY ml.message_id
-                                ORDER BY
-                                    \(preferredFlagRank(workspace))
-                                    CASE f.role
-                                        WHEN 'sent' THEN 0
-                                        WHEN 'normal' THEN 1
-                                        WHEN 'junk' THEN 2
-                                        ELSE 3
-                                    END,
-                                    ml.is_primary DESC,
-                                    ml.id ASC
+                                ORDER BY \(scope.preferredLocationOrder(
+                                    locationAlias: "ml",
+                                    folderAlias: "f",
+                                    directionExpression: "wm.timeline_direction"
+                                ))
                             ) AS rank
                         FROM message_locations ml
                         JOIN folders f ON f.id = ml.folder_id
                         JOIN windowed_messages wm ON wm.id = ml.message_id
-                        WHERE f.role IN (\(rolePlaceholders(count: roles.count)))
-                          AND ml.missing_since_at IS NULL
+                        WHERE \(scope.locationVisibilityPredicate(locationAlias: "ml", folderAlias: "f"))
                     )
                     SELECT
                         m.id AS message_id,
@@ -492,7 +553,7 @@ public struct MailRepository {
                         m.to_recipients_json,
                         m.cc_recipients_json,
                         m.message_date,
-                        m.direction,
+                        wm.timeline_direction,
                         m.has_attachments,
                         \(bodySelect)
                     FROM windowed_messages wm
@@ -500,7 +561,7 @@ public struct MailRepository {
                     LEFT JOIN preferred_locations pl ON pl.message_id = m.id AND pl.rank = 1
                     LEFT JOIN senders s ON s.id = m.from_sender_id
                     \(bodyJoin)
-                    ORDER BY COALESCE(m.message_date, m.created_at) ASC, m.id ASC
+                    ORDER BY \(messageSortKey) ASC, m.id ASC
                     """,
                 arguments: arguments
             )
@@ -518,7 +579,7 @@ public struct MailRepository {
                     to: try decodeAddresses(row["to_recipients_json"]),
                     cc: try decodeAddresses(row["cc_recipients_json"]),
                     messageDate: row["message_date"],
-                    direction: MessageDirection(rawValue: row["direction"]) ?? .incoming,
+                    direction: MessageDirection(rawValue: row["timeline_direction"]) ?? .incoming,
                     hasAttachments: hasAttachments != 0,
                     sanitizedHTML: row["sanitized_html"],
                     textFallback: row["text_fallback"]
@@ -548,6 +609,34 @@ public struct MailRepository {
         }
     }
 
+    public func messageBodyCacheStats() throws -> CacheStats {
+        try databaseQueue.read { db in
+            let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        COUNT(*) AS item_count,
+                        COALESCE(SUM(
+                            LENGTH(COALESCE(sanitized_html, '')) +
+                            LENGTH(COALESCE(text_fallback, ''))
+                        ), 0) AS byte_size
+                    FROM message_bodies
+                    """
+            )
+
+            return CacheStats(
+                itemCount: row?["item_count"] ?? 0,
+                byteSize: row?["byte_size"] ?? 0
+            )
+        }
+    }
+
+    public func clearMessageBodyCache() throws {
+        try databaseQueue.write { db in
+            try db.execute(sql: "DELETE FROM message_bodies")
+        }
+    }
+
     public func messageLocations(
         entityID: Int64,
         workspace: Workspace,
@@ -555,14 +644,14 @@ public struct MailRepository {
         onlyUnread: Bool = false
     ) throws -> [MessageLocationTarget] {
         try databaseQueue.read { db in
-            let roles = sourceRoles ?? workspaceRoles(workspace)
+            let scope = WorkspaceScopeSQL(workspace: workspace, roleOverride: sourceRoles)
+            let roles = scope.roles
             guard !roles.isEmpty else { return [] }
-            let flagPredicate = workspaceFlagPredicate(alias: "ml", workspace: workspace)
             let unreadPredicate = onlyUnread
                 ? "AND LOWER(COALESCE(ml.flags_json, '')) NOT LIKE '%seen%'"
                 : ""
 
-            var arguments = StatementArguments(roles.map(\.rawValue))
+            var arguments = StatementArguments(scope.roleValues)
             _ = arguments.append(contentsOf: StatementArguments([entityID]))
 
             let rows = try Row.fetchAll(
@@ -577,9 +666,8 @@ public struct MailRepository {
                     FROM message_locations ml
                     JOIN folders f ON f.id = ml.folder_id
                     JOIN message_entities me ON me.message_id = ml.message_id
-                    WHERE f.role IN (\(rolePlaceholders(count: roles.count)))
-                      AND ml.missing_since_at IS NULL
-                      \(flagPredicate)
+                    WHERE \(scope.locationVisibilityPredicate(locationAlias: "ml", folderAlias: "f"))
+                      \(scope.flaggedLocationPredicate(locationAlias: "ml"))
                       \(unreadPredicate)
                       AND me.entity_id = ?
                     ORDER BY ml.account_key, f.provider_name, ml.himalaya_envelope_id
@@ -739,7 +827,11 @@ public struct MailRepository {
         accountKey: String,
         folderID: Int64?,
         workspace: Workspace,
-        checkpointValue: String
+        checkpointValue: String,
+        startedValue: String?,
+        finishedValue: String?,
+        queryStartValue: String?,
+        oldestSyncedMessageValue: String?
     ) throws {
         let existingID: Int64?
         if let folderID {
@@ -773,10 +865,26 @@ public struct MailRepository {
                 sql: """
                     UPDATE sync_checkpoints
                     SET last_successful_sync_at = ?,
+                        last_successful_sync_started_at = ?,
+                        last_successful_sync_finished_at = ?,
+                        last_successful_query_start_at = ?,
+                        oldest_synced_message_date = COALESCE(
+                            MIN(datetime(oldest_synced_message_date), datetime(?)),
+                            oldest_synced_message_date,
+                            ?
+                        ),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                arguments: [checkpointValue, existingID]
+                arguments: [
+                    checkpointValue,
+                    startedValue,
+                    finishedValue,
+                    queryStartValue,
+                    oldestSyncedMessageValue,
+                    oldestSyncedMessageValue,
+                    existingID
+                ]
             )
             return
         }
@@ -784,11 +892,82 @@ public struct MailRepository {
         try db.execute(
             sql: """
                 INSERT INTO sync_checkpoints (
-                    account_key, folder_id, workspace, last_successful_sync_at, updated_at
+                    account_key, folder_id, workspace,
+                    last_successful_sync_at,
+                    last_successful_sync_started_at,
+                    last_successful_sync_finished_at,
+                    last_successful_query_start_at,
+                    oldest_synced_message_date,
+                    updated_at
                 )
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
-            arguments: [accountKey, folderID, workspace.rawValue, checkpointValue]
+            arguments: [
+                accountKey,
+                folderID,
+                workspace.rawValue,
+                checkpointValue,
+                startedValue,
+                finishedValue,
+                queryStartValue,
+                oldestSyncedMessageValue
+            ]
+        )
+    }
+
+    private func fetchSyncCheckpoint(
+        _ db: Database,
+        accountKey: String,
+        folderID: Int64?,
+        workspace: Workspace
+    ) throws -> SyncCheckpoint? {
+        let row: Row?
+        if let folderID {
+            row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT account_key, folder_id, workspace,
+                           last_successful_sync_at,
+                           last_successful_sync_started_at,
+                           last_successful_sync_finished_at,
+                           last_successful_query_start_at,
+                           oldest_synced_message_date
+                    FROM sync_checkpoints
+                    WHERE account_key = ?
+                      AND folder_id = ?
+                      AND workspace = ?
+                    """,
+                arguments: [accountKey, folderID, workspace.rawValue]
+            )
+        } else {
+            row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT account_key, folder_id, workspace,
+                           last_successful_sync_at,
+                           last_successful_sync_started_at,
+                           last_successful_sync_finished_at,
+                           last_successful_query_start_at,
+                           oldest_synced_message_date
+                    FROM sync_checkpoints
+                    WHERE account_key = ?
+                      AND folder_id IS NULL
+                      AND workspace = ?
+                    """,
+                arguments: [accountKey, workspace.rawValue]
+            )
+        }
+
+        guard let row else { return nil }
+        return SyncCheckpoint(
+            accountKey: row["account_key"],
+            folderID: row["folder_id"],
+            workspace: Workspace(rawValue: row["workspace"]) ?? workspace,
+            lastSuccessfulSyncAt: Self.parseCheckpointDate(row["last_successful_sync_at"]),
+            lastSuccessfulSyncStartedAt: Self.parseCheckpointDate(row["last_successful_sync_started_at"]),
+            lastSuccessfulSyncFinishedAt: Self.parseCheckpointDate(row["last_successful_sync_finished_at"]),
+            lastSuccessfulQueryStartAt: Self.parseCheckpointDate(row["last_successful_query_start_at"]),
+            oldestSyncedMessageDate: Self.parseCheckpointDate(row["oldest_synced_message_date"])
         )
     }
 
@@ -859,10 +1038,10 @@ public struct MailRepository {
                 sql: """
                     INSERT INTO messages (
                         account_key, rfc_message_id, fallback_dedupe_key, subject, from_sender_id,
-                        to_recipients_json, cc_recipients_json, message_date, direction,
-                        has_attachments, updated_at
+                        to_recipients_json, cc_recipients_json, message_date, has_attachments,
+                        updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(account_key, rfc_message_id) DO UPDATE SET
                         fallback_dedupe_key = excluded.fallback_dedupe_key,
                         subject = excluded.subject,
@@ -870,7 +1049,6 @@ public struct MailRepository {
                         to_recipients_json = excluded.to_recipients_json,
                         cc_recipients_json = excluded.cc_recipients_json,
                         message_date = excluded.message_date,
-                        direction = excluded.direction,
                         has_attachments = excluded.has_attachments,
                         updated_at = CURRENT_TIMESTAMP
                     """,
@@ -896,17 +1074,16 @@ public struct MailRepository {
             sql: """
                 INSERT INTO messages (
                     account_key, rfc_message_id, fallback_dedupe_key, subject, from_sender_id,
-                    to_recipients_json, cc_recipients_json, message_date, direction,
-                    has_attachments, updated_at
+                    to_recipients_json, cc_recipients_json, message_date, has_attachments,
+                    updated_at
                 )
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(account_key, fallback_dedupe_key) DO UPDATE SET
                     subject = excluded.subject,
                     from_sender_id = excluded.from_sender_id,
                     to_recipients_json = excluded.to_recipients_json,
                     cc_recipients_json = excluded.cc_recipients_json,
                     message_date = excluded.message_date,
-                    direction = excluded.direction,
                     has_attachments = excluded.has_attachments,
                     updated_at = CURRENT_TIMESTAMP
                 """,
@@ -918,7 +1095,6 @@ public struct MailRepository {
                 toJSON,
                 ccJSON,
                 envelope.messageDate?.nilIfBlank,
-                envelope.direction.rawValue,
                 envelope.hasAttachments ? 1 : 0
             ]
         )
@@ -948,7 +1124,6 @@ public struct MailRepository {
             toJSON,
             ccJSON,
             envelope.messageDate?.nilIfBlank,
-            envelope.direction.rawValue,
             envelope.hasAttachments ? 1 : 0
         ]
     }
@@ -983,32 +1158,65 @@ public struct MailRepository {
         )
     }
 
-    private func upsertMessageEntities(
+    private func rebuildMessageEntities(
         _ db: Database,
         messageID: Int64,
-        envelope: EnvelopeMessage
+        envelope: EnvelopeMessage,
+        ownEmailAddresses: Set<String>,
+        accountEmailAddress: String?
     ) throws {
-        switch envelope.direction {
-        case .incoming:
-            guard let from = envelope.from else { return }
-            let senderID = try upsertSender(db, address: from)
-            let entityID = try upsertEntity(db, address: from, senderID: senderID, relationKind: .from)
-            try replaceMessageEntity(
+        try db.execute(
+            sql: "DELETE FROM message_entities WHERE message_id = ?",
+            arguments: [messageID]
+        )
+
+        var participants: [(MailAddress, RelationKind)] = []
+        if let from = envelope.from {
+            participants.append((from, .from))
+        }
+        participants += envelope.to.map { ($0, RelationKind.to) }
+        participants += envelope.cc.map { ($0, RelationKind.cc) }
+
+        let visibleParticipants: [(MailAddress, RelationKind)]
+        let isSelfConversation: Bool
+        if ownEmailAddresses.isEmpty {
+            isSelfConversation = false
+            visibleParticipants = participants.filter { _, relationKind in
+                switch (envelope.direction, relationKind) {
+                case (.incoming, .from), (.outgoing, .to), (.outgoing, .cc), (.outgoing, .bcc):
+                    true
+                case (.incoming, .to), (.incoming, .cc), (.incoming, .bcc), (.outgoing, .from):
+                    false
+                }
+            }
+        } else {
+            let externalParticipants = participants.filter { participant in
+                !ownEmailAddresses.contains(normalizeEmail(participant.0.emailAddress))
+            }
+            isSelfConversation = !participants.isEmpty && externalParticipants.isEmpty
+            if isSelfConversation, let accountEmailAddress {
+                visibleParticipants = participants.filter {
+                    normalizeEmail($0.0.emailAddress) != accountEmailAddress
+                }
+            } else {
+                visibleParticipants = isSelfConversation ? participants : externalParticipants
+            }
+        }
+
+        for (address, relationKind) in visibleParticipants {
+            let senderID = try upsertSender(db, address: address)
+            let entityID = try upsertEntity(db, address: address, senderID: senderID, relationKind: relationKind)
+            try upsertMessageEntity(
                 db,
                 messageID: messageID,
                 entityID: entityID,
-                relationKind: .from
+                relationKind: relationKind,
+                timelineDirection: timelineDirection(
+                    envelopeDirection: envelope.direction,
+                    relationKind: relationKind,
+                    isSelfConversation: isSelfConversation
+                )
             )
-        case .outgoing:
-            try db.execute(
-                sql: "DELETE FROM message_entities WHERE message_id = ? AND relation_kind = ?",
-                arguments: [messageID, RelationKind.to.rawValue]
-            )
-            for recipient in envelope.to {
-                let senderID = try upsertSender(db, address: recipient)
-                let entityID = try upsertEntity(db, address: recipient, senderID: senderID, relationKind: .to)
-                try upsertMessageEntity(db, messageID: messageID, entityID: entityID, relationKind: .to)
-            }
         }
     }
 
@@ -1077,32 +1285,64 @@ public struct MailRepository {
         )
     }
 
-    private func replaceMessageEntity(
-        _ db: Database,
-        messageID: Int64,
-        entityID: Int64,
-        relationKind: RelationKind
-    ) throws {
-        try db.execute(
-            sql: "DELETE FROM message_entities WHERE message_id = ? AND relation_kind = ?",
-            arguments: [messageID, relationKind.rawValue]
-        )
-        try upsertMessageEntity(db, messageID: messageID, entityID: entityID, relationKind: relationKind)
-    }
-
     private func upsertMessageEntity(
         _ db: Database,
         messageID: Int64,
         entityID: Int64,
-        relationKind: RelationKind
+        relationKind: RelationKind,
+        timelineDirection: MessageDirection
     ) throws {
         try db.execute(
             sql: """
-                INSERT OR IGNORE INTO message_entities (message_id, entity_id, relation_kind)
-                VALUES (?, ?, ?)
+                INSERT OR IGNORE INTO message_entities (
+                    message_id, entity_id, relation_kind, timeline_direction
+                )
+                VALUES (?, ?, ?, ?)
                 """,
-            arguments: [messageID, entityID, relationKind.rawValue]
+            arguments: [messageID, entityID, relationKind.rawValue, timelineDirection.rawValue]
         )
+    }
+
+    private func timelineDirection(
+        envelopeDirection: MessageDirection,
+        relationKind: RelationKind,
+        isSelfConversation: Bool
+    ) -> MessageDirection {
+        if isSelfConversation {
+            return envelopeDirection
+        }
+
+        switch relationKind {
+        case .from:
+            return .incoming
+        case .to, .cc, .bcc:
+            return .outgoing
+        }
+    }
+
+    private func ownEmailAddresses(_ db: Database) throws -> Set<String> {
+        let emails = try String.fetchAll(
+            db,
+            sql: """
+                SELECT email_address
+                FROM accounts
+                WHERE email_address IS NOT NULL
+                """
+        )
+        return Set(emails.map(normalizeEmail).filter { !$0.isEmpty })
+    }
+
+    private func accountEmailAddress(_ db: Database, accountKey: String) throws -> String? {
+        let email = try String.fetchOne(
+            db,
+            sql: """
+                SELECT email_address
+                FROM accounts
+                WHERE account_key = ?
+                """,
+            arguments: [accountKey]
+        )
+        return email.map(normalizeEmail)?.nilIfBlank
     }
 
     private func fallbackDedupeKey(for envelope: EnvelopeMessage) -> String {
@@ -1144,51 +1384,6 @@ public struct MailRepository {
         return MailAddress(displayName: displayName?.nilIfBlank, emailAddress: emailAddress)
     }
 
-    private func workspaceRoles(_ workspace: Workspace) -> [FolderRole] {
-        switch workspace {
-        case .main:
-            return [.normal, .sent]
-        case .junk:
-            return [.junk]
-        case .flagged:
-            return [.normal, .sent, .junk]
-        }
-    }
-
-    private func workspaceFlagPredicate(alias: String, workspace: Workspace) -> String {
-        guard workspace == .flagged else { return "" }
-        return "AND LOWER(COALESCE(\(alias).flags_json, '')) LIKE '%flagged%'"
-    }
-
-    private func preferredFlagRank(_ workspace: Workspace) -> String {
-        guard workspace == .flagged else { return "" }
-        return "CASE WHEN LOWER(COALESCE(ml.flags_json, '')) LIKE '%flagged%' THEN 0 ELSE 1 END,"
-    }
-
-    private func workspaceEntityFlagPredicate(workspace: Workspace) -> String {
-        guard workspace == .flagged else { return "" }
-        return """
-        AND EXISTS (
-            SELECT 1
-            FROM message_entities flagged_me
-            JOIN message_locations flagged_ml ON flagged_ml.message_id = flagged_me.message_id
-            JOIN folders flagged_f ON flagged_f.id = flagged_ml.folder_id
-            WHERE flagged_me.entity_id = me.entity_id
-              AND flagged_f.role IN (\(roleLiterals(workspaceRoles(workspace))))
-              AND flagged_ml.missing_since_at IS NULL
-              AND LOWER(COALESCE(flagged_ml.flags_json, '')) LIKE '%flagged%'
-        )
-        """
-    }
-
-    private func roleLiterals(_ roles: [FolderRole]) -> String {
-        roles.map { "'\($0.rawValue)'" }.joined(separator: ", ")
-    }
-
-    private func rolePlaceholders(count: Int) -> String {
-        Array(repeating: "?", count: count).joined(separator: ", ")
-    }
-
     private func splitCommaSeparatedValues(_ value: String?) -> [String] {
         guard let value else { return [] }
         return value.split(separator: ",").map(String.init)
@@ -1220,6 +1415,96 @@ public struct MailRepository {
 }
 
 extension MailRepository: @unchecked Sendable {}
+
+private struct WorkspaceScopeSQL {
+    let workspace: Workspace
+    let roles: [FolderRole]
+
+    init(workspace: Workspace, roleOverride: [FolderRole]? = nil) {
+        self.workspace = workspace
+        self.roles = roleOverride ?? WorkspacePolicy.visibleRoles(for: workspace)
+    }
+
+    var roleValues: [String] {
+        roles.map(\.rawValue)
+    }
+
+    func messageSortKey(alias: String?) -> String {
+        let prefix = alias.map { "\($0)." } ?? ""
+        return "COALESCE(datetime(\(prefix)message_date), datetime(\(prefix)created_at), \(prefix)message_date, \(prefix)created_at)"
+    }
+
+    func locationVisibilityPredicate(locationAlias: String, folderAlias: String) -> String {
+        "\(folderAlias).role IN (\(Self.placeholders(count: roles.count))) AND \(locationAlias).missing_since_at IS NULL"
+    }
+
+    func flaggedLocationPredicate(locationAlias: String) -> String {
+        guard workspace == .flagged else { return "" }
+        return "AND \(flaggedExpression(locationAlias: locationAlias))"
+    }
+
+    func entityVisibilityPredicate(entityAlias: String) -> String {
+        guard workspace == .flagged else { return "" }
+        return """
+        AND EXISTS (
+            SELECT 1
+            FROM message_entities flagged_me
+            JOIN message_locations flagged_ml ON flagged_ml.message_id = flagged_me.message_id
+            JOIN folders flagged_f ON flagged_f.id = flagged_ml.folder_id
+            WHERE flagged_me.entity_id = \(entityAlias).entity_id
+              AND flagged_f.role IN (\(roleLiterals))
+              AND flagged_ml.missing_since_at IS NULL
+              AND \(flaggedExpression(locationAlias: "flagged_ml"))
+        )
+        """
+    }
+
+    func preferredLocationOrder(
+        locationAlias: String,
+        folderAlias: String,
+        directionExpression: String
+    ) -> String {
+        var terms: [String] = []
+        if workspace == .flagged {
+            terms.append("CASE WHEN \(flaggedExpression(locationAlias: locationAlias)) THEN 0 ELSE 1 END")
+        }
+
+        terms.append(
+            """
+            CASE
+                WHEN \(directionExpression) = 'outgoing' AND \(folderAlias).role = 'sent' THEN 0
+                WHEN \(directionExpression) = 'incoming' AND \(folderAlias).role = 'normal' THEN 0
+                ELSE 1
+            END
+            """
+        )
+        terms.append(
+            """
+            CASE \(folderAlias).role
+                WHEN 'sent' THEN 0
+                WHEN 'normal' THEN 1
+                WHEN 'junk' THEN 2
+                ELSE 3
+            END
+            """
+        )
+        terms.append("\(locationAlias).is_primary DESC")
+        terms.append("\(locationAlias).id ASC")
+        return terms.joined(separator: ",\n                                    ")
+    }
+
+    private var roleLiterals: String {
+        roles.map { "'\($0.rawValue)'" }.joined(separator: ", ")
+    }
+
+    private func flaggedExpression(locationAlias: String) -> String {
+        "LOWER(COALESCE(\(locationAlias).flags_json, '')) LIKE '%flagged%'"
+    }
+
+    private static func placeholders(count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ", ")
+    }
+}
 
 private extension String {
     var trimmed: String {

@@ -1,12 +1,3 @@
-export type FolderRole =
-  | "normal"
-  | "sent"
-  | "junk"
-  | "trash"
-  | "drafts"
-  | "outbox"
-  | "unknown";
-
 export type MessageDirection = "incoming" | "outgoing";
 
 export type EntityKind =
@@ -19,74 +10,141 @@ export type EntityKind =
 export type WorkspaceKind = "main" | "junk" | "flagged";
 export type BodyDisplayMode = "html" | "markdown";
 
+export type TimelineBodyState =
+  | { status: "notRequested" }
+  | { status: "loading" }
+  | { status: "loaded"; body: TimelineBody }
+  | { status: "failed"; message: string };
+
 export type AttachmentDownloadState =
   | { status: "idle" }
   | { status: "downloading" }
-  | { status: "downloaded"; result: { directoryPath: string; fileNames: string[] } }
+  | { status: "downloaded"; result: AttachmentDownloadResult }
   | { status: "failed"; message: string };
 
-export interface MailAddress {
-  displayName?: string | null;
-  emailAddress: string;
+export type ReplySendState =
+  | { status: "idle" }
+  | { status: "sending" }
+  | { status: "sent" }
+  | { status: "failed"; message: string };
+
+export interface TimelineState {
+  entity: TimelineEntity | null;
+  items: TimelineItem[];
+  isLoadingTimeline: boolean;
+  isLoadingOlderTimeline: boolean;
+  isLoadingNewerTimeline: boolean;
+  hasOlderTimeline: boolean;
+  hasNewerTimeline: boolean;
+  bodyStates: Record<string, TimelineBodyState>;
+  attachmentDownloadStates: Record<string, AttachmentDownloadState>;
+  replySendState: ReplySendState;
+  sendAccounts: SendAccount[];
+  selectedSendAccountKey?: string | null;
+  scrollAnchor?: TimelineScrollAnchor | null;
+  displayOptions: TimelineDisplayOptions;
+  windowState: TimelineWindowState;
+}
+
+export interface TimelineDisplayOptions {
+  bodyDisplayMode: BodyDisplayMode | string;
+  loadRemoteContent: boolean;
+  showTimelineAvatars: boolean;
+  showOwnTimelineAvatars: boolean;
+  hideQuotedReplyText: boolean;
+  hideReplySubjects: boolean;
+}
+
+export interface TimelineWindowState {
+  bottomOverlayHeight: number;
 }
 
 export interface TimelineEntity {
-  id: string;
-  name: string;
-  kind: EntityKind;
-  primaryAddress?: string | null;
-  emailAddresses?: string[];
-  detail?: string | null;
-  messageCount: number;
+  id: number;
+  displayName: string;
+  primaryEmailAddress?: string | null;
+  emailAddresses: string[];
+  kind: EntityKind | string;
   unreadCount: number;
-  lastMessageAt?: string | null;
-  sourceAccounts: string[];
+  latestSubject: string;
+  latestBodyPreview?: string | null;
+  latestDate?: string | null;
+  accountLabel: string;
+  workspace: WorkspaceKind | string;
   avatarImageDataURL?: string | null;
 }
 
-export interface TimelineMessage {
-  messageID: number | string;
-  accountKey: string;
-  folderName?: string | null;
-  folderRole?: FolderRole | null;
-  himalayaEnvelopeID?: string | null;
-  flags: string[];
-  subject?: string | null;
-  from?: MailAddress | null;
-  to: MailAddress[];
-  cc: MailAddress[];
-  messageDate?: string | null;
-  direction: MessageDirection;
+export interface TimelineItem {
+  id: number;
+  entityID: number;
+  direction: MessageDirection | string;
+  subject: string;
+  preview: string;
+  html?: string | null;
+  date?: string | null;
+  accountLabel: string;
+  accountEmoji?: string | null;
+  accountAvatarImageDataURL?: string | null;
+  folderLabel: string;
+  envelopeID: string;
+  isFlagged: boolean;
+  fromLabel: string;
+  toLabel: string;
   hasAttachments: boolean;
-  bodyStatus?: "notRequested" | "loading" | "loaded" | "failed";
-  sanitizedHTML?: string | null;
-  textFallback?: string | null;
-  avatarSeed?: string | null;
-  avatarName?: string | null;
-  avatarImageDataURL?: string | null;
+}
+
+export interface SendAccount {
+  id: string;
+  label: string;
+  emailAddress?: string | null;
+  isDefault: boolean;
+  emoji?: string | null;
+}
+
+export interface TimelineBody {
+  html?: string | null;
+  text?: string | null;
+}
+
+export interface AttachmentDownloadResult {
+  directoryPath: string;
+  fileNames: string[];
 }
 
 export interface TimelineScrollAnchor {
-  id: TimelineMessage["messageID"];
+  id: number;
   edge: "top" | "bottom";
   generation: number;
 }
 
-export interface TimelineState {
-  workspace: WorkspaceKind;
-  entities: TimelineEntity[];
-  selectedEntityID?: string | null;
-  messages: TimelineMessage[];
-  isLoading: boolean;
-  isLoadingOlderMessages?: boolean;
-  isLoadingNewerMessages?: boolean;
-  error?: string | null;
-  syncStatus?: string | null;
-  hasOlderMessages?: boolean;
-  anchoredToBottom?: boolean;
-  scrollAnchor?: TimelineScrollAnchor | null;
-  bodyDisplayMode: BodyDisplayMode;
-  loadRemoteContent: boolean;
-  showTimelineAvatars: boolean;
-  attachmentDownloadStates?: Record<string, AttachmentDownloadState>;
+export interface TimelineEntityOption {
+  id: number;
+  name: string;
+  kind: EntityKind;
+  primaryAddress?: string | null;
+  detail?: string | null;
+  unreadCount: number;
+  lastMessageAt?: string | null;
+  avatarImageDataURL?: string | null;
+}
+
+export interface TimelineMessageView {
+  messageID: TimelineItem["id"];
+  accountKey: string;
+  folderName?: string | null;
+  himalayaEnvelopeID?: string | null;
+  flags: string[];
+  subject?: string | null;
+  fromLabel?: string | null;
+  toLabel?: string | null;
+  messageDate?: string | null;
+  direction: MessageDirection;
+  hasAttachments: boolean;
+  bodyStatus?: TimelineBodyState["status"];
+  sanitizedHTML?: string | null;
+  textFallback?: string | null;
+  avatarSeed?: string | null;
+  avatarName?: string | null;
+  avatarEmoji?: string | null;
+  avatarImageDataURL?: string | null;
 }

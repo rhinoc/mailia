@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { debugLog, debugLogEnabled } from "../debugLog";
-import type { AttachmentDownloadState, BodyDisplayMode, TimelineMessage } from "../types";
+import type { AttachmentDownloadState, BodyDisplayMode, TimelineMessageView } from "../types";
 import { MessageBody } from "./MessageBody";
 
-const MIN_RESERVED_BODY_HEIGHT = 120;
+type TimelineMessage = TimelineMessageView;
+
+const MIN_PLACEHOLDER_BODY_HEIGHT = 36;
 const MAX_ESTIMATED_BODY_HEIGHT = 420;
 const MAX_CACHED_BODY_HEIGHT = 1400;
 
@@ -13,6 +14,7 @@ interface MessageCardProps {
   cluster: "single" | "start" | "middle" | "end";
   bodyDisplayMode: BodyDisplayMode;
   loadRemoteContent: boolean;
+  hideQuotedReplyText: boolean;
   showAvatar: boolean;
   bodyRequestWakeToken: number;
   bodyRequestPriority: number;
@@ -31,6 +33,7 @@ export function MessageCard({
   cluster,
   bodyDisplayMode,
   loadRemoteContent,
+  hideQuotedReplyText,
   showAvatar,
   bodyRequestWakeToken,
   bodyRequestPriority,
@@ -48,9 +51,10 @@ export function MessageCard({
   const folderName = message.folderName;
   const himalayaEnvelopeID = message.himalayaEnvelopeID;
   const bodyStatus = message.bodyStatus;
-  const estimatedBodyHeight = estimateReservedBodyHeight(message);
+  const hasVisibleSubject = showSubject && Boolean(message.subject?.trim());
+  const estimatedBodyHeight = estimateReservedBodyHeight(message, hasVisibleSubject);
   const [committedBodyHeight, setCommittedBodyHeight] = useState(
-    clampReservedHeight(reservedBodyHeight ?? estimatedBodyHeight)
+    clampPlaceholderHeight(reservedBodyHeight ?? estimatedBodyHeight)
   );
   const [revealedBodyMessageID, setRevealedBodyMessageID] = useState<
     TimelineMessage["messageID"] | null
@@ -58,17 +62,17 @@ export function MessageCard({
   const isBodyRevealed = hasBody && revealedBodyMessageID === messageID;
   const shouldRequestBody = !hasBody && bodyStatus !== "loading";
   const showMessageAvatar =
-    showAvatar && message.direction === "incoming" && (cluster === "single" || cluster === "end");
+    showAvatar && (cluster === "single" || cluster === "end");
 
   useEffect(() => {
-    setCommittedBodyHeight(clampReservedHeight(reservedBodyHeight ?? estimatedBodyHeight));
+    setCommittedBodyHeight(clampPlaceholderHeight(reservedBodyHeight ?? estimatedBodyHeight));
   }, [bodyHeightCacheKey]);
 
   useEffect(() => {
     if (reservedBodyHeight === undefined) return;
     if (shouldDeferBodyRequest()) return;
     setCommittedBodyHeight((current) => {
-      const next = clampReservedHeight(reservedBodyHeight);
+      const next = clampPlaceholderHeight(reservedBodyHeight);
       return Math.abs(current - next) > 2 ? next : current;
     });
   }, [bodyRequestWakeToken, reservedBodyHeight, shouldDeferBodyRequest]);
@@ -95,15 +99,9 @@ export function MessageCard({
     if (!shouldRequestBody) return;
 
     if (shouldDeferBodyRequest()) {
-      if (debugLogEnabled) {
-        debugLog("defer body request", { messageID: message.messageID });
-      }
       return;
     }
 
-    if (debugLogEnabled) {
-      debugLog("request body", { messageID });
-    }
     onRequestBody(message, bodyRequestPriority);
   }, [
     accountKey,
@@ -120,12 +118,13 @@ export function MessageCard({
   ]);
 
   const handleMeasuredBodyHeight = useCallback((height: number) => {
-    const nextHeight = clampReservedHeight(height);
+    const nextHeight = clampMeasuredHeight(height);
     onBodyHeightMeasured(bodyHeightCacheKey, nextHeight);
 
     if (shouldDeferBodyRequest()) return;
     setCommittedBodyHeight((current) => {
-      return Math.abs(current - nextHeight) > 2 ? nextHeight : current;
+      const nextPlaceholderHeight = clampPlaceholderHeight(nextHeight);
+      return Math.abs(current - nextPlaceholderHeight) > 2 ? nextPlaceholderHeight : current;
     });
   }, [bodyHeightCacheKey, onBodyHeightMeasured, shouldDeferBodyRequest]);
 
@@ -140,26 +139,28 @@ export function MessageCard({
           className="message-avatar"
           aria-hidden="true"
         >
-          {showMessageAvatar && message.avatarImageDataURL ? (
+          {showMessageAvatar && message.avatarEmoji ? (
+            <span className="message-avatar__emoji">{message.avatarEmoji}</span>
+          ) : showMessageAvatar && message.avatarImageDataURL ? (
             <img alt="" src={message.avatarImageDataURL} />
           ) : null}
         </div>
       ) : null}
       <div className="message-card">
-        <header className="message-card__header">
-          {showSubject ? (
-            <h2 className="message-card__subject">{message.subject || "(No subject)"}</h2>
-          ) : null}
-          <div className="message-card__meta" aria-label="Message details">
-            <time dateTime={message.messageDate ?? undefined}>
-              {formatDate(message.messageDate)}
-            </time>
-          </div>
-        </header>
+        {hasVisibleSubject ? (
+          <header className="message-card__header">
+            <h2 className="message-card__subject">{message.subject}</h2>
+            <div className="message-card__meta" aria-label="Message details">
+              <time dateTime={message.messageDate ?? undefined}>
+                {formatDate(message.messageDate)}
+              </time>
+            </div>
+          </header>
+        ) : null}
 
         <div
           className="mail-body-reserve"
-          style={{ minHeight: committedBodyHeight }}
+          style={!isBodyRevealed ? { minHeight: committedBodyHeight } : undefined}
         >
           {!isBodyRevealed ? (
             <div className="mail-body-frame mail-body--placeholder">
@@ -167,11 +168,11 @@ export function MessageCard({
             </div>
           ) : (
             <MessageBody
-              debugID={message.messageID}
               html={message.sanitizedHTML}
               text={message.textFallback}
               mode={bodyDisplayMode}
               loadRemoteContent={loadRemoteContent}
+              hideQuotedReplyText={hideQuotedReplyText}
               onMeasuredHeight={handleMeasuredBodyHeight}
             />
           )}
@@ -188,17 +189,16 @@ export function MessageCard({
   );
 }
 
-function estimateReservedBodyHeight(message: TimelineMessage) {
+function estimateReservedBodyHeight(message: TimelineMessage, hasVisibleSubject: boolean) {
   const textLength = message.textFallback?.length
     ?? visibleTextLength(message.sanitizedHTML)
     ?? message.subject?.length
     ?? 0;
-  const lineEstimate = Math.ceil(textLength / 78);
-  const subjectAllowance = message.subject ? 12 : 0;
+  const lineEstimate = Math.max(1, Math.ceil(textLength / 78));
+  const subjectAllowance = hasVisibleSubject ? 30 : 0;
   const attachmentAllowance = message.hasAttachments ? 34 : 0;
-  const directionAllowance = message.direction === "outgoing" ? 18 : 34;
-  return clampReservedHeight(
-    92 + subjectAllowance + attachmentAllowance + directionAllowance + lineEstimate * 18,
+  return clampPlaceholderHeight(
+    18 + subjectAllowance + attachmentAllowance + lineEstimate * 20,
     MAX_ESTIMATED_BODY_HEIGHT
   );
 }
@@ -213,8 +213,12 @@ function visibleTextLength(html?: string | null) {
     .trim().length;
 }
 
-function clampReservedHeight(height: number, maxHeight = MAX_CACHED_BODY_HEIGHT) {
-  return Math.max(MIN_RESERVED_BODY_HEIGHT, Math.min(Math.ceil(height), maxHeight));
+function clampPlaceholderHeight(height: number, maxHeight = MAX_CACHED_BODY_HEIGHT) {
+  return Math.max(MIN_PLACEHOLDER_BODY_HEIGHT, Math.min(Math.ceil(height), maxHeight));
+}
+
+function clampMeasuredHeight(height: number) {
+  return Math.max(1, Math.min(Math.ceil(height), MAX_CACHED_BODY_HEIGHT));
 }
 
 function AttachmentDownloadRow({

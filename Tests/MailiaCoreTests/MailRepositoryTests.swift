@@ -67,6 +67,8 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
         textFallback: "Build passed",
         sanitizerVersion: 1
     )
+    let entitiesWithCachedPreview = try repository.entityList(workspace: .main)
+    #expect(entitiesWithCachedPreview.first?.latestBodyPreview == "Build passed")
 
     messages = try repository.messages(entityID: mainEntity.id, workspace: .main)
     #expect(messages[0].sanitizedHTML == "<p>Build passed</p>")
@@ -77,6 +79,12 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
     let cachedBody = try #require(try repository.messageBody(messageID: messages[0].messageID))
     #expect(cachedBody.sanitizedHTML == "<p>Build passed</p>")
     #expect(cachedBody.textFallback == "Build passed")
+    let bodyCacheStats = try repository.messageBodyCacheStats()
+    #expect(bodyCacheStats.itemCount == 1)
+    #expect(bodyCacheStats.byteSize > 0)
+    try repository.clearMessageBodyCache()
+    #expect(try repository.messageBodyCacheStats().itemCount == 0)
+    #expect(try repository.messageBody(messageID: messages[0].messageID) == nil)
     #expect(try repository.targetFolderName(accountKey: "work", role: .normal) == "INBOX")
     #expect(try repository.targetFolderName(accountKey: "work", role: .junk) == "Spam")
     #expect(try repository.targetFolderName(accountKey: "work", role: .trash) == "Trash")
@@ -164,6 +172,41 @@ func repositoryKeepsStableEntityWhenSenderDisplayNameChanges() throws {
 }
 
 @Test
+func repositoryPersistsExpandedSyncCheckpointMetadata() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    let folder = try #require(try repository.folders(for: .main).first)
+    let startedAt = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
+    let finishedAt = try #require(HimalayaDateParser.parse("2026-05-30T00:00:05Z"))
+    let queryStartAt = try #require(HimalayaDateParser.parse("2026-05-29T00:00:00Z"))
+    let oldest = try #require(HimalayaDateParser.parse("2026-05-01T10:00:00Z"))
+
+    try repository.markFolderSyncSucceeded(
+        accountKey: "work",
+        folderID: folder.id,
+        workspace: .main,
+        at: startedAt,
+        startedAt: startedAt,
+        finishedAt: finishedAt,
+        queryStartAt: queryStartAt,
+        oldestSyncedMessageDate: oldest
+    )
+
+    let checkpoint = try #require(try repository.syncCheckpoint(
+        accountKey: "work",
+        folderID: folder.id,
+        workspace: .main
+    ))
+    #expect(checkpoint.lastSuccessfulSyncAt == startedAt)
+    #expect(checkpoint.lastSuccessfulSyncStartedAt == startedAt)
+    #expect(checkpoint.lastSuccessfulSyncFinishedAt == finishedAt)
+    #expect(checkpoint.lastSuccessfulQueryStartAt == queryStartAt)
+    #expect(checkpoint.oldestSyncedMessageDate == oldest)
+}
+
+@Test
 func repositoryRelatesOutgoingMessagesToRecipients() throws {
     let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
@@ -198,6 +241,234 @@ func repositoryRelatesOutgoingMessagesToRecipients() throws {
     #expect(messages.count == 1)
     #expect(messages[0].direction == .outgoing)
     #expect(messages[0].to.map(\.emailAddress) == ["alice@example.com"])
+}
+
+@Test
+func repositoryOrdersEntityMessagesByParsedDateAcrossTimeZones() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "ryan@example.com")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "Sent", role: .sent)
+    ])
+
+    let ryan = MailAddress(displayName: "Ryan", emailAddress: "ryan@example.com")
+    let alice = MailAddress(displayName: "Alice", emailAddress: "alice@example.com")
+    try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "Sent",
+            himalayaEnvelopeID: "sent-middle",
+            subject: "Middle reply",
+            from: ryan,
+            to: [alice],
+            messageDate: "2026-05-31 08:55+00:00",
+            direction: .outgoing
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "Sent",
+            himalayaEnvelopeID: "sent-latest",
+            subject: "Latest reply",
+            from: ryan,
+            to: [alice],
+            messageDate: "2026-05-31 09:40+00:00",
+            direction: .outgoing
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-earliest",
+            subject: "Original",
+            from: alice,
+            to: [ryan],
+            messageDate: "2026-05-31 16:36+08:00",
+            direction: .incoming
+        )
+    ])
+
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+    #expect(entity.latestSubject == "Latest reply")
+
+    let messages = try repository.messages(entityID: entity.id, workspace: .main)
+    #expect(messages.map(\.subject) == ["Original", "Middle reply", "Latest reply"])
+}
+
+@Test
+func repositoryComputesDirectionPerEntityWhenSelfOwnedAccountsExchangeMail() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "ryan@work.example", displayName: "Ryan Work"),
+        DiscoveredAccount(accountKey: "personal", emailAddress: "ryan@personal.example", displayName: "Ryan Personal")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "Sent", role: .sent),
+        DiscoveredFolder(accountKey: "personal", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "personal", providerName: "Sent", role: .sent)
+    ])
+
+    let workAddress = MailAddress(displayName: "Ryan Work", emailAddress: "ryan@work.example")
+    let personalAddress = MailAddress(displayName: "Ryan Personal", emailAddress: "ryan@personal.example")
+
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "Sent",
+            himalayaEnvelopeID: "work-sent-1",
+            rfcMessageID: "<self-owned-1@example.com>",
+            subject: "Lunch",
+            from: workAddress,
+            to: [personalAddress],
+            messageDate: "2026-05-04T09:00:00Z",
+            direction: .outgoing
+        ),
+        EnvelopeMessage(
+            accountKey: "personal",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "personal-inbox-1",
+            rfcMessageID: "<self-owned-1@example.com>",
+            subject: "Lunch",
+            from: workAddress,
+            to: [personalAddress],
+            messageDate: "2026-05-04T09:00:00Z",
+            direction: .incoming
+        ),
+        EnvelopeMessage(
+            accountKey: "personal",
+            folderName: "Sent",
+            himalayaEnvelopeID: "personal-sent-1",
+            rfcMessageID: "<self-owned-2@example.com>",
+            subject: "Re: Lunch",
+            from: personalAddress,
+            to: [workAddress],
+            messageDate: "2026-05-04T09:05:00Z",
+            direction: .outgoing
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "work-inbox-1",
+            rfcMessageID: "<self-owned-2@example.com>",
+            subject: "Re: Lunch",
+            from: personalAddress,
+            to: [workAddress],
+            messageDate: "2026-05-04T09:05:00Z",
+            direction: .incoming
+        )
+    ])
+
+    #expect(messageIDs[0] != messageIDs[1])
+    #expect(messageIDs[2] != messageIDs[3])
+
+    let entities = try repository.entityList(workspace: .main)
+    let workEntity = try #require(entities.first { $0.primaryEmailAddress == "ryan@work.example" })
+    let personalEntity = try #require(entities.first { $0.primaryEmailAddress == "ryan@personal.example" })
+
+    let workMessages = try repository.messages(entityID: workEntity.id, workspace: .main)
+    #expect(workMessages.map(\.messageID) == [messageIDs[1], messageIDs[2]])
+    #expect(workMessages.map(\.direction) == [.incoming, .outgoing])
+    #expect(workMessages.map(\.folderName) == ["INBOX", "Sent"])
+    #expect(workMessages.map(\.accountKey) == ["personal", "personal"])
+
+    let personalMessages = try repository.messages(entityID: personalEntity.id, workspace: .main)
+    #expect(personalMessages.map(\.messageID) == [messageIDs[0], messageIDs[3]])
+    #expect(personalMessages.map(\.direction) == [.outgoing, .incoming])
+    #expect(personalMessages.map(\.folderName) == ["Sent", "INBOX"])
+    #expect(personalMessages.map(\.accountKey) == ["work", "work"])
+}
+
+@Test
+func repositoryComputesDirectionPerEntityForGmailSentAndAllMailLocations() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "gmail", emailAddress: "ryan@gmail.example", providerHint: "gmail")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "gmail", providerName: "[Gmail]/Sent Mail", role: .sent),
+        DiscoveredFolder(accountKey: "gmail", providerName: "[Gmail]/All Mail", role: .normal)
+    ])
+
+    let sender = MailAddress(displayName: "Ryan", emailAddress: "ryan@gmail.example")
+    let recipient = MailAddress(displayName: "Alice", emailAddress: "alice@example.com")
+
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "gmail",
+            folderName: "[Gmail]/Sent Mail",
+            himalayaEnvelopeID: "sent-1",
+            rfcMessageID: "<gmail-sent-all-mail-1@example.com>",
+            subject: "Gmail duplicate location",
+            from: sender,
+            to: [recipient],
+            messageDate: "2026-05-05T09:00:00Z",
+            direction: .outgoing
+        ),
+        EnvelopeMessage(
+            accountKey: "gmail",
+            folderName: "[Gmail]/All Mail",
+            himalayaEnvelopeID: "all-mail-1",
+            rfcMessageID: "<gmail-sent-all-mail-1@example.com>",
+            subject: "Gmail duplicate location",
+            from: sender,
+            to: [recipient],
+            messageDate: "2026-05-05T09:00:00Z",
+            direction: .incoming
+        )
+    ])
+
+    #expect(messageIDs[0] == messageIDs[1])
+
+    let entities = try repository.entityList(workspace: .main)
+    let recipientEntity = try #require(entities.first { $0.primaryEmailAddress == "alice@example.com" })
+    #expect(!(entities.contains { $0.primaryEmailAddress == "ryan@gmail.example" }))
+
+    let recipientMessages = try repository.messages(entityID: recipientEntity.id, workspace: .main)
+    #expect(recipientMessages.count == 1)
+    #expect(recipientMessages[0].messageID == messageIDs[0])
+    #expect(recipientMessages[0].direction == .outgoing)
+    #expect(recipientMessages[0].folderName == "[Gmail]/Sent Mail")
+}
+
+@Test
+func repositoryReturnsOneTimelineRowWhenSameEntityIsSenderAndRecipient() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "ryan@work.example")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    let alice = MailAddress(displayName: "Alice", emailAddress: "alice@example.com")
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "alice-self-1",
+            rfcMessageID: "<alice-self-1@example.com>",
+            subject: "Note to self",
+            from: alice,
+            to: [alice],
+            messageDate: "2026-05-05T09:00:00Z",
+            direction: .incoming
+        )
+    ])
+
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+    let messages = try repository.messages(entityID: entity.id, workspace: .main, includeBodies: false)
+    #expect(messages.map(\.messageID) == [messageIDs[0]])
+    #expect(messages.map(\.direction) == [.incoming])
 }
 
 @Test
@@ -295,4 +566,118 @@ func accountDefaultPersistsAsStructuredState() throws {
     accounts = try repository.accounts()
     #expect(accounts.first { $0.accountKey == "work" }?.isDefault == false)
     #expect(accounts.first { $0.accountKey == "personal" }?.isDefault == true)
+}
+
+@Test
+func migrationCreatesSyncCheckpointMetadataColumns() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let checkpointColumns = try DatabaseSchemaInspector.columnNames(in: "sync_checkpoints", databaseQueue: databaseQueue)
+
+    #expect(checkpointColumns.isSuperset(of: [
+        "last_successful_sync_at",
+        "last_successful_sync_started_at",
+        "last_successful_sync_finished_at",
+        "last_successful_query_start_at"
+    ]))
+}
+
+@Test
+func repositoryPersistsFolderSyncCheckpointMetadata() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    let folder = try #require(try repository.folders(for: .main).first)
+    let queryStartAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let startedAt = Date(timeIntervalSince1970: 1_800_010_000)
+    let finishedAt = Date(timeIntervalSince1970: 1_800_010_120)
+
+    try repository.markFolderSyncSucceeded(
+        accountKey: "work",
+        folderID: folder.id,
+        workspace: .main,
+        at: finishedAt,
+        startedAt: startedAt,
+        queryStartAt: queryStartAt
+    )
+
+    let checkpoint = try #require(try repository.syncCheckpoint(
+        accountKey: "work",
+        folderID: folder.id,
+        workspace: .main
+    ))
+    #expect(checkpoint.accountKey == "work")
+    #expect(checkpoint.folderID == folder.id)
+    #expect(checkpoint.workspace == .main)
+    #expect(checkpoint.lastSuccessfulSyncAt == finishedAt)
+    #expect(checkpoint.lastSuccessfulSyncStartedAt == startedAt)
+    #expect(checkpoint.lastSuccessfulSyncFinishedAt == finishedAt)
+    #expect(checkpoint.lastSuccessfulQueryStartAt == queryStartAt)
+    #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: folder.id, workspace: .main) == finishedAt)
+}
+
+@Test
+func repositoryKeepsCheckpointCompatibilityForAccountFallbackAndOldMarkAPI() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work")
+    ])
+
+    let finishedAt = Date(timeIntervalSince1970: 1_800_020_000)
+    try repository.markAccountSyncSucceeded(accountKey: "work", workspace: .main, at: finishedAt)
+
+    let checkpoint = try #require(try repository.syncCheckpoint(
+        accountKey: "work",
+        folderID: 42,
+        workspace: .main
+    ))
+    #expect(checkpoint.folderID == nil)
+    #expect(checkpoint.lastSuccessfulSyncAt == finishedAt)
+    #expect(checkpoint.lastSuccessfulSyncFinishedAt == finishedAt)
+    #expect(checkpoint.lastSuccessfulSyncStartedAt == nil)
+    #expect(checkpoint.lastSuccessfulQueryStartAt == nil)
+    #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: 42, workspace: .main) == finishedAt)
+}
+
+@Test
+func repositoryReturnsMostRecentAccountRefreshFinishedAt() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work"),
+        DiscoveredAccount(accountKey: "personal")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    let folder = try #require(try repository.folders(for: .main).first)
+    let olderFinishedAt = Date(timeIntervalSince1970: 1_800_020_000)
+    let newerStartedAt = Date(timeIntervalSince1970: 1_800_030_000)
+    let newerFinishedAt = Date(timeIntervalSince1970: 1_800_030_120)
+    try repository.markAccountSyncSucceeded(accountKey: "work", workspace: .main, at: olderFinishedAt)
+    try repository.markAccountSyncSucceeded(
+        accountKey: "personal",
+        workspace: .junk,
+        at: newerStartedAt,
+        startedAt: newerStartedAt,
+        finishedAt: newerFinishedAt
+    )
+    try repository.markFolderSyncSucceeded(
+        accountKey: "work",
+        folderID: folder.id,
+        workspace: .main,
+        at: newerFinishedAt.addingTimeInterval(60)
+    )
+
+    #expect(try repository.lastSuccessfulRefreshFinishedAt() == newerFinishedAt)
 }

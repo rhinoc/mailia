@@ -1,14 +1,47 @@
-import type { TimelineEntity } from "../types";
+import type { CSSProperties } from "react";
+import type { TimelineEntityOption } from "../types";
+import { PullSpinner } from "./PullSpinner";
+import { useElasticPullAction } from "./useElasticPullAction";
 
 interface EntityListProps {
-  entities: TimelineEntity[];
-  selectedEntityID?: string | null;
-  onSelect(entityID: string): void;
+  entities: TimelineEntityOption[];
+  selectedEntityID?: number | null;
+  isRefreshing?: boolean;
+  onSelect(entityID: number): void;
+  onRefresh(): void;
 }
 
-export function EntityList({ entities, selectedEntityID, onSelect }: EntityListProps) {
+export function EntityList({
+  entities,
+  selectedEntityID,
+  isRefreshing = false,
+  onSelect,
+  onRefresh
+}: EntityListProps) {
+  const pull = useElasticPullAction<HTMLElement>({
+    edge: "top",
+    enabled: true,
+    isLoading: isRefreshing,
+    onTrigger: onRefresh
+  });
+
   return (
-    <aside className="entity-list" aria-label="Entities">
+    <aside className="entity-list" aria-label="Entities" ref={pull.ref}>
+      <div
+        className="elastic-pull elastic-pull--top"
+        aria-hidden="true"
+        data-visible={pull.state.isActive || isRefreshing}
+        data-ready={pull.state.willTrigger}
+        data-refreshing={isRefreshing}
+        style={
+          {
+            "--pull-distance": `${isRefreshing ? 34 : pull.state.distance}px`,
+            "--pull-opacity": pull.state.isActive || isRefreshing ? "1" : "0"
+          } as CSSProperties
+        }
+      >
+        <PullSpinner frame={isRefreshing ? 8 : pull.state.spinnerFrame} isRefreshing={isRefreshing} />
+      </div>
       {entities.map((entity) => {
         const isSelected = entity.id === selectedEntityID;
         const showUnreadDot = entity.unreadCount > 0 && !isSelected;

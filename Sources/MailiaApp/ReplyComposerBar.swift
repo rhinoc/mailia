@@ -11,12 +11,332 @@ private enum ComposerControlMetrics {
     static let singleLineHeight: CGFloat = 20
     static let maxInputHeight: CGFloat = 132
     static let controlSize: CGFloat = 36
+    static let trailingControlWidth: CGFloat = 104
+    static let statusLineHeight: CGFloat = 16
     static let multilineInputCornerRadius: CGFloat = 14
     static let inputHorizontalPadding: CGFloat = 15
     static let inputVerticalPadding: CGFloat = 8
     static let composerHorizontalPadding: CGFloat = 14
     static let composerTopPadding: CGFloat = 20
     static let composerBottomPadding: CGFloat = 20
+}
+
+@MainActor
+private final class ComposerSendStateController<Payload>: ObservableObject {
+    private enum LocalStatus {
+        case idle
+        case sending
+        case sent
+    }
+
+    @Published private(set) var queuedPayload: Payload?
+    @Published private(set) var remainingSeconds: Int
+
+    private let sendDelaySeconds: Int
+    @Published private var localStatus: LocalStatus = .idle
+    private var sendTask: Task<Void, Never>?
+    private var sentResetTask: Task<Void, Never>?
+
+    init(sendDelaySeconds: Int = 5) {
+        self.sendDelaySeconds = sendDelaySeconds
+        self.remainingSeconds = sendDelaySeconds
+    }
+
+    var isQueued: Bool {
+        queuedPayload != nil
+    }
+
+    var isSending: Bool {
+        localStatus == .sending
+    }
+
+    var isShowingSentConfirmation: Bool {
+        localStatus == .sent
+    }
+
+    func queue(
+        _ payload: Payload,
+        send: @escaping @MainActor (Payload) -> Void
+    ) {
+        sentResetTask?.cancel()
+        sendTask?.cancel()
+        queuedPayload = payload
+        remainingSeconds = sendDelaySeconds
+
+        sendTask = Task { @MainActor in
+            for second in stride(from: sendDelaySeconds, through: 1, by: -1) {
+                remainingSeconds = second
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+            }
+            queuedPayload = nil
+            localStatus = .sending
+            send(payload)
+        }
+    }
+
+    func undo() {
+        sendTask?.cancel()
+        sendTask = nil
+        queuedPayload = nil
+        remainingSeconds = sendDelaySeconds
+    }
+
+    func handleSendStateChange(
+        _ state: MailiaReplySendState,
+        onSent: () -> Void
+    ) {
+        switch state {
+        case .sent:
+            onSent()
+            markSent()
+        case .failed:
+            localStatus = .idle
+        case .idle, .sending:
+            break
+        }
+    }
+
+    func clearSentConfirmationIf(hasDraftContent: Bool) {
+        guard localStatus == .sent, hasDraftContent else { return }
+        sentResetTask?.cancel()
+        localStatus = .idle
+    }
+
+    func cancel() {
+        sendTask?.cancel()
+        sentResetTask?.cancel()
+    }
+
+    private func markSent() {
+        localStatus = .sent
+        sentResetTask?.cancel()
+        sentResetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            if Task.isCancelled { return }
+            if localStatus == .sent {
+                localStatus = .idle
+            }
+        }
+    }
+}
+
+private struct SendAccountSelection {
+    let sendAccounts: [MailiaSendAccount]
+    let selectedSendAccountKey: String?
+
+    var selectedAccountID: String {
+        selectedSendAccountKey
+            ?? sendAccounts.first(where: { $0.isDefault })?.id
+            ?? sendAccounts.first?.id
+            ?? ""
+    }
+
+    var selectedAccount: MailiaSendAccount? {
+        sendAccounts.first { $0.id == selectedAccountID }
+    }
+
+    var currentAccountLabel: String {
+        guard let account = selectedAccount else {
+            return "Default"
+        }
+        return Self.accountLabel(account)
+    }
+
+    static func accountLabel(_ account: MailiaSendAccount) -> String {
+        account.emailAddress ?? account.label
+    }
+}
+
+private struct ComposerChrome<Input: View>: View {
+    let statusMessage: String?
+    let sendAccounts: [MailiaSendAccount]
+    let selectedSendAccountKey: String?
+    let isInputDisabled: Bool
+    let isQueued: Bool
+    let remainingSeconds: Int
+    let isSending: Bool
+    let isShowingSentConfirmation: Bool
+    let canSend: Bool
+    let onSend: () -> Void
+    let onUndo: () -> Void
+    let onSelectSendAccount: (String) -> Void
+    @ViewBuilder let input: () -> Input
+
+    var body: some View {
+        VStack(spacing: 6) {
+            statusLine
+            composerRow
+        }
+        .padding(.horizontal, ComposerControlMetrics.composerHorizontalPadding)
+        .padding(.top, ComposerControlMetrics.composerTopPadding)
+        .padding(.bottom, ComposerControlMetrics.composerBottomPadding)
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var statusLine: some View {
+        HStack {
+            Spacer(minLength: 0)
+            if let statusMessage, !isQueued {
+                ComposerStatusText(text: statusMessage, isError: true)
+            }
+        }
+        .frame(height: ComposerControlMetrics.statusLineHeight)
+    }
+
+    @ViewBuilder
+    private var composerRow: some View {
+        let row = HStack(alignment: .center, spacing: 8) {
+            input()
+            if sendAccounts.count > 1 {
+                SendAccountPicker(
+                    sendAccounts: sendAccounts,
+                    selectedSendAccountKey: selectedSendAccountKey,
+                    isDisabled: isInputDisabled,
+                    onSelectSendAccount: onSelectSendAccount
+                )
+            }
+            if isQueued {
+                ComposerUndoButton(
+                    remainingSeconds: remainingSeconds,
+                    onUndo: onUndo
+                )
+            } else {
+                ComposerSendButton(
+                    isSending: isSending,
+                    isShowingSentConfirmation: isShowingSentConfirmation,
+                    canSend: canSend,
+                    onSend: onSend
+                )
+            }
+        }
+
+        GlassEffectContainer(spacing: 8) {
+            row
+        }
+    }
+}
+
+private struct SendAccountPicker: View {
+    let sendAccounts: [MailiaSendAccount]
+    let selectedSendAccountKey: String?
+    let isDisabled: Bool
+    let onSelectSendAccount: (String) -> Void
+
+    private var selection: SendAccountSelection {
+        SendAccountSelection(
+            sendAccounts: sendAccounts,
+            selectedSendAccountKey: selectedSendAccountKey
+        )
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(sendAccounts) { account in
+                Button {
+                    onSelectSendAccount(account.id)
+                } label: {
+                    if account.id == selection.selectedAccountID {
+                        Label(SendAccountSelection.accountLabel(account), systemImage: "checkmark")
+                    } else {
+                        Text(SendAccountSelection.accountLabel(account))
+                    }
+                }
+            }
+        } label: {
+            AccountMenuEmojiLabel(
+                account: selection.selectedAccount,
+                fallbackEmoji: AccountEmojiFallback.emoji(
+                    for: selection.selectedAccountID,
+                    in: sendAccounts
+                )
+            )
+        }
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .frame(width: ComposerControlMetrics.controlSize, height: ComposerControlMetrics.controlSize)
+        .contentShape(Circle())
+        .modifier(GlassChrome(shape: AnyShape(Circle()), tint: nil, interactive: true))
+        .fixedSize()
+        .disabled(isDisabled)
+        .help("Sending account: \(selection.currentAccountLabel)")
+    }
+}
+
+private struct ComposerUndoButton: View {
+    let remainingSeconds: Int
+    let onUndo: () -> Void
+
+    var body: some View {
+        Button(action: onUndo) {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.uturn.backward")
+                Text("Undo \(remainingSeconds)s")
+                    .monospacedDigit()
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+            .frame(
+                width: ComposerControlMetrics.trailingControlWidth,
+                height: ComposerControlMetrics.controlSize
+            )
+            .modifier(GlassChrome(shape: AnyShape(Capsule(style: .continuous)), tint: .red, interactive: true))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ComposerSendButton: View {
+    let isSending: Bool
+    let isShowingSentConfirmation: Bool
+    let canSend: Bool
+    let onSend: () -> Void
+
+    var body: some View {
+        Button(action: onSend) {
+            ZStack {
+                if isSending {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.white)
+                } else if isShowingSentConfirmation {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                } else {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(width: ComposerControlMetrics.controlSize, height: ComposerControlMetrics.controlSize)
+            .contentShape(Circle())
+            .modifier(GlassChrome(
+                shape: AnyShape(Circle()),
+                tint: isShowingSentConfirmation ? .green : .blue,
+                interactive: true
+            ))
+            .opacity(canSend || isSending || isShowingSentConfirmation ? 1 : 0.55)
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSend)
+        .help("Send")
+    }
+}
+
+private struct ComposerStatusText: View {
+    let text: String
+    let isError: Bool
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(isError ? Color(nsColor: .systemRed) : Color.secondary)
+            .lineLimit(1)
+            .multilineTextAlignment(.trailing)
+    }
 }
 
 /// Floating, native reply composer that sits over the bottom of the timeline.
@@ -34,56 +354,54 @@ struct ReplyComposerBar: View {
     let onSelectSendAccount: (String) -> Void
     let onEdited: () -> Void
 
-    private static let sendDelaySeconds = 5
     private static let singleLineHeight = ComposerControlMetrics.singleLineHeight
     private static let maxInputHeight = ComposerControlMetrics.maxInputHeight
-    private static let controlSize = ComposerControlMetrics.controlSize
-    private static let trailingControlWidth: CGFloat = 104
-    private static let statusLineHeight: CGFloat = 16
 
     @State private var draft = ""
     @State private var textHeight: CGFloat = ReplyComposerBar.singleLineHeight
-    @State private var queuedBody: String?
-    @State private var remainingSeconds = ReplyComposerBar.sendDelaySeconds
-    @State private var localStatus: LocalStatus = .idle
-    @State private var sendTask: Task<Void, Never>?
-    @State private var sentResetTask: Task<Void, Never>?
-
-    private enum LocalStatus {
-        case idle
-        case sending
-        case sent
-    }
+    @StateObject private var sendController = ComposerSendStateController<String>()
 
     private var selectedAccountID: String {
-        selectedSendAccountKey
-            ?? sendAccounts.first(where: { $0.isDefault })?.id
-            ?? sendAccounts.first?.id
-            ?? ""
-    }
-
-    private var selectedAccount: MailiaSendAccount? {
-        sendAccounts.first { $0.id == selectedAccountID }
+        SendAccountSelection(
+            sendAccounts: sendAccounts,
+            selectedSendAccountKey: selectedSendAccountKey
+        ).selectedAccountID
     }
 
     private var isSending: Bool {
         if case .sending = sendState { return true }
-        return localStatus == .sending
+        return sendController.isSending
     }
 
     private var hasTarget: Bool { target != nil }
-    private var isInputDisabled: Bool { queuedBody != nil || isSending }
+    private var isInputDisabled: Bool { sendController.isQueued || isSending }
     private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var canSend: Bool { hasTarget && !trimmedDraft.isEmpty && queuedBody == nil && !isSending }
-    var body: some View {
-        VStack(spacing: 6) {
-            statusLine
-            composerRow
+    private var canSend: Bool { hasTarget && !trimmedDraft.isEmpty && !sendController.isQueued && !isSending }
+
+    private var sendFailureMessage: String? {
+        if case .failed(let message) = sendState {
+            return message
         }
-        .padding(.horizontal, ComposerControlMetrics.composerHorizontalPadding)
-        .padding(.top, ComposerControlMetrics.composerTopPadding)
-        .padding(.bottom, ComposerControlMetrics.composerBottomPadding)
-        .frame(maxWidth: .infinity)
+        return nil
+    }
+
+    var body: some View {
+        ComposerChrome(
+            statusMessage: sendFailureMessage,
+            sendAccounts: sendAccounts,
+            selectedSendAccountKey: selectedSendAccountKey,
+            isInputDisabled: isInputDisabled,
+            isQueued: sendController.isQueued,
+            remainingSeconds: sendController.remainingSeconds,
+            isSending: isSending,
+            isShowingSentConfirmation: sendController.isShowingSentConfirmation,
+            canSend: canSend,
+            onSend: queueSend,
+            onUndo: sendController.undo,
+            onSelectSendAccount: onSelectSendAccount
+        ) {
+            inputField
+        }
         .onChange(of: sendState) { _, newValue in
             handleSendStateChange(newValue)
         }
@@ -91,23 +409,7 @@ struct ReplyComposerBar: View {
             clearFailedSendStateAfterEdit()
         }
         .onDisappear {
-            sendTask?.cancel()
-            sentResetTask?.cancel()
-        }
-    }
-
-    @ViewBuilder
-    private var composerRow: some View {
-        let row = HStack(alignment: .center, spacing: 8) {
-            inputField
-            if sendAccounts.count > 1 {
-                accountMenu
-            }
-            trailingControls
-        }
-
-        GlassEffectContainer(spacing: 8) {
-            row
+            sendController.cancel()
         }
     }
 
@@ -122,175 +424,37 @@ struct ReplyComposerBar: View {
         )
     }
 
-    @ViewBuilder
-    private var trailingControls: some View {
-        Group {
-            if queuedBody != nil {
-                undoButton
-            } else {
-                sendButton
-            }
-        }
-    }
-
-    private var undoButton: some View {
-        Button(action: undoSend) {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.uturn.backward")
-                Text("Undo \(remainingSeconds)s")
-                    .monospacedDigit()
-            }
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .frame(width: Self.trailingControlWidth, height: Self.controlSize)
-            .modifier(GlassChrome(shape: AnyShape(Capsule(style: .continuous)), tint: .red, interactive: true))
-        }
-        .buttonStyle(.plain)
-    }
-
-    @ViewBuilder
-    private var statusLine: some View {
-        HStack {
-            Spacer(minLength: 0)
-            if case .failed(let message) = sendState, queuedBody == nil {
-                statusText(message, isError: true)
-            } else if localStatus == .sent {
-                statusText("Sent", isError: false)
-            }
-        }
-        .frame(height: Self.statusLineHeight)
-    }
-
-    private var accountMenu: some View {
-        Menu {
-            ForEach(sendAccounts) { account in
-                Button {
-                    onSelectSendAccount(account.id)
-                } label: {
-                    if account.id == selectedAccountID {
-                        Label(accountLabel(account), systemImage: "checkmark")
-                    } else {
-                        Text(accountLabel(account))
-                    }
-                }
-            }
-        } label: {
-            AccountMenuEmojiLabel(
-                account: selectedAccount,
-                fallbackEmoji: AccountEmojiFallback.emoji(
-                    for: selectedAccountID,
-                    in: sendAccounts
-                )
-            )
-        }
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-        .frame(width: Self.controlSize, height: Self.controlSize)
-        .contentShape(Circle())
-        .modifier(GlassChrome(shape: AnyShape(Circle()), tint: nil, interactive: true))
-        .fixedSize()
-        .disabled(isInputDisabled)
-        .help("Sending account: \(currentAccountLabel)")
-    }
-
-    private var currentAccountLabel: String {
-        guard let account = sendAccounts.first(where: { $0.id == selectedAccountID }) else {
-            return "Default"
-        }
-        return accountLabel(account)
-    }
-
-    private var sendButton: some View {
-        Button(action: queueSend) {
-            ZStack {
-                if isSending {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.white)
-                } else {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(.white)
-                }
-            }
-            .frame(width: Self.controlSize, height: Self.controlSize)
-            .contentShape(Circle())
-            .modifier(GlassChrome(shape: AnyShape(Circle()), tint: .blue, interactive: true))
-            .opacity(canSend || isSending ? 1 : 0.55)
-        }
-        .buttonStyle(.plain)
-        .disabled(!canSend)
-        .help("Send")
-    }
-
-    private func statusText(_ text: String, isError: Bool) -> some View {
-        Text(text)
-            .font(.system(size: 12))
-            .foregroundStyle(isError ? Color(nsColor: .systemRed) : Color.secondary)
-            .lineLimit(1)
-            .multilineTextAlignment(.trailing)
-    }
-
-    private func accountLabel(_ account: MailiaSendAccount) -> String {
-        account.emailAddress ?? account.label
-    }
-
     private func queueSend() {
         guard canSend else { return }
         let body = trimmedDraft
         guard !body.isEmpty else { return }
-        sentResetTask?.cancel()
-        sendTask?.cancel()
-        queuedBody = body
-        remainingSeconds = Self.sendDelaySeconds
         let account = selectedAccountID
 
-        sendTask = Task { @MainActor in
-            for second in stride(from: Self.sendDelaySeconds, through: 1, by: -1) {
-                remainingSeconds = second
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if Task.isCancelled { return }
-            }
-            queuedBody = nil
-            localStatus = .sending
+        sendController.queue(body) { body in
             onSend(body, account.isEmpty ? nil : account)
         }
     }
 
-    private func undoSend() {
-        sendTask?.cancel()
-        sendTask = nil
-        queuedBody = nil
-        remainingSeconds = Self.sendDelaySeconds
-    }
-
     private func handleSendStateChange(_ state: MailiaReplySendState) {
-        switch state {
-        case .sent:
+        sendController.handleSendStateChange(state) {
             draft = ""
             textHeight = Self.singleLineHeight
-            localStatus = .sent
-            sentResetTask?.cancel()
-            sentResetTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_800_000_000)
-                if Task.isCancelled { return }
-                if localStatus == .sent {
-                    localStatus = .idle
-                }
-            }
-        case .failed:
-            localStatus = .idle
-        case .idle, .sending:
-            break
         }
     }
 
     private func clearFailedSendStateAfterEdit() {
+        sendController.clearSentConfirmationIf(hasDraftContent: !trimmedDraft.isEmpty)
         if case .failed = sendState {
             onEdited()
         }
     }
+}
+
+private struct NewMessageComposerPayload {
+    let recipients: [String]
+    let subject: String?
+    let body: String
+    let accountID: String
 }
 
 struct NewMessageComposerView: View {
@@ -302,12 +466,8 @@ struct NewMessageComposerView: View {
     let onSelectSendAccount: (String) -> Void
     let onEdited: () -> Void
 
-    private static let sendDelaySeconds = 5
     private static let singleLineHeight = ComposerControlMetrics.singleLineHeight
     private static let maxBodyHeight = ComposerControlMetrics.maxInputHeight
-    private static let controlSize = ComposerControlMetrics.controlSize
-    private static let trailingControlWidth: CGFloat = 104
-    private static let statusLineHeight: CGFloat = 16
 
     @State private var recipients: [String] = []
     @State private var recipientDraft = ""
@@ -315,36 +475,22 @@ struct NewMessageComposerView: View {
     @State private var bodyText = ""
     @State private var bodyHeight = NewMessageComposerView.singleLineHeight
     @State private var validationMessage: String?
-    @State private var queuedBody: String?
-    @State private var remainingSeconds = NewMessageComposerView.sendDelaySeconds
-    @State private var localStatus: LocalStatus = .idle
+    @StateObject private var sendController = ComposerSendStateController<NewMessageComposerPayload>()
     @State private var highlightedSuggestionID: String?
     @State private var selectedRecipient: String?
-    @State private var sendTask: Task<Void, Never>?
-    @State private var sentResetTask: Task<Void, Never>?
     @State private var isRecipientFieldFocused = false
     @FocusState private var focusedField: NewMessageComposerFocusedField?
 
-    private enum LocalStatus {
-        case idle
-        case sending
-        case sent
-    }
-
     private var selectedAccountID: String {
-        selectedSendAccountKey
-            ?? sendAccounts.first(where: { $0.isDefault })?.id
-            ?? sendAccounts.first?.id
-            ?? ""
-    }
-
-    private var selectedAccount: MailiaSendAccount? {
-        sendAccounts.first { $0.id == selectedAccountID }
+        SendAccountSelection(
+            sendAccounts: sendAccounts,
+            selectedSendAccountKey: selectedSendAccountKey
+        ).selectedAccountID
     }
 
     private var isSending: Bool {
         if case .sending = sendState { return true }
-        return localStatus == .sending
+        return sendController.isSending
     }
 
     private var trimmedBody: String {
@@ -356,7 +502,17 @@ struct NewMessageComposerView: View {
     }
 
     private var canSend: Bool {
-        !trimmedBody.isEmpty && !resolvedRecipients.isEmpty && queuedBody == nil && !isSending
+        !trimmedBody.isEmpty && !resolvedRecipients.isEmpty && !sendController.isQueued && !isSending
+    }
+
+    private var statusMessage: String? {
+        if let validationMessage {
+            return validationMessage
+        }
+        if case .failed(let message) = sendState {
+            return message
+        }
+        return nil
     }
 
     private var filteredSuggestions: [MailiaRecipientSuggestion] {
@@ -398,8 +554,7 @@ struct NewMessageComposerView: View {
             clearErrorsAfterEdit()
         }
         .onDisappear {
-            sendTask?.cancel()
-            sentResetTask?.cancel()
+            sendController.cancel()
         }
     }
 
@@ -537,43 +692,21 @@ struct NewMessageComposerView: View {
     }
 
     private var composerBar: some View {
-        VStack(spacing: 6) {
-            statusLine
-            composerRow
-        }
-        .padding(.horizontal, ComposerControlMetrics.composerHorizontalPadding)
-        .padding(.top, ComposerControlMetrics.composerTopPadding)
-        .padding(.bottom, ComposerControlMetrics.composerBottomPadding)
-        .frame(maxWidth: .infinity)
-    }
-
-    @ViewBuilder
-    private var statusLine: some View {
-        HStack {
-            Spacer(minLength: 0)
-            if let validationMessage, queuedBody == nil {
-                statusText(validationMessage, isError: true)
-            } else if case .failed(let message) = sendState, queuedBody == nil {
-                statusText(message, isError: true)
-            } else if localStatus == .sent {
-                statusText("Sent", isError: false)
-            }
-        }
-        .frame(height: Self.statusLineHeight)
-    }
-
-    @ViewBuilder
-    private var composerRow: some View {
-        let row = HStack(alignment: .center, spacing: 8) {
+        ComposerChrome(
+            statusMessage: statusMessage,
+            sendAccounts: sendAccounts,
+            selectedSendAccountKey: selectedSendAccountKey,
+            isInputDisabled: sendController.isQueued || isSending,
+            isQueued: sendController.isQueued,
+            remainingSeconds: sendController.remainingSeconds,
+            isSending: isSending,
+            isShowingSentConfirmation: sendController.isShowingSentConfirmation,
+            canSend: canSend,
+            onSend: queueSend,
+            onUndo: sendController.undo,
+            onSelectSendAccount: onSelectSendAccount
+        ) {
             bodyInput
-            if sendAccounts.count > 1 {
-                accountMenu
-            }
-            trailingControls
-        }
-
-        GlassEffectContainer(spacing: 8) {
-            row
         }
     }
 
@@ -582,115 +715,14 @@ struct NewMessageComposerView: View {
             text: $bodyText,
             height: $bodyHeight,
             placeholder: "Message...",
-            isEnabled: queuedBody == nil && !isSending,
+            isEnabled: !sendController.isQueued && !isSending,
             maxHeight: Self.maxBodyHeight,
             onSubmit: queueSend
         )
     }
 
-    @ViewBuilder
-    private var trailingControls: some View {
-        Group {
-            if queuedBody != nil {
-                undoButton
-            } else {
-                sendButton
-            }
-        }
-    }
-
-    private var undoButton: some View {
-        Button(action: undoSend) {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.uturn.backward")
-                Text("Undo \(remainingSeconds)s")
-                    .monospacedDigit()
-            }
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .frame(width: Self.trailingControlWidth, height: Self.controlSize)
-            .modifier(GlassChrome(shape: AnyShape(Capsule(style: .continuous)), tint: .red, interactive: true))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var accountMenu: some View {
-        Menu {
-            ForEach(sendAccounts) { account in
-                Button {
-                    onSelectSendAccount(account.id)
-                } label: {
-                    if account.id == selectedAccountID {
-                        Label(accountLabel(account), systemImage: "checkmark")
-                    } else {
-                        Text(accountLabel(account))
-                    }
-                }
-            }
-        } label: {
-            AccountMenuEmojiLabel(
-                account: selectedAccount,
-                fallbackEmoji: AccountEmojiFallback.emoji(
-                    for: selectedAccountID,
-                    in: sendAccounts
-                )
-            )
-        }
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-        .frame(width: Self.controlSize, height: Self.controlSize)
-        .contentShape(Circle())
-        .modifier(GlassChrome(shape: AnyShape(Circle()), tint: nil, interactive: true))
-        .fixedSize()
-        .disabled(queuedBody != nil || isSending)
-        .help("Sending account: \(currentAccountLabel)")
-    }
-
-    private var sendButton: some View {
-        Button(action: queueSend) {
-            ZStack {
-                if isSending {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.white)
-                } else {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(.white)
-                }
-            }
-            .frame(width: Self.controlSize, height: Self.controlSize)
-            .contentShape(Circle())
-            .modifier(GlassChrome(shape: AnyShape(Circle()), tint: .blue, interactive: true))
-            .opacity(canSend || isSending ? 1 : 0.55)
-        }
-        .buttonStyle(.plain)
-        .disabled(!canSend)
-        .help("Send")
-    }
-
-    private var currentAccountLabel: String {
-        guard let account = sendAccounts.first(where: { $0.id == selectedAccountID }) else {
-            return "Default"
-        }
-        return accountLabel(account)
-    }
-
-    private func statusText(_ text: String, isError: Bool) -> some View {
-        Text(text)
-            .font(.system(size: 12))
-            .foregroundStyle(isError ? Color(nsColor: .systemRed) : Color.secondary)
-            .lineLimit(1)
-            .multilineTextAlignment(.trailing)
-    }
-
-    private func accountLabel(_ account: MailiaSendAccount) -> String {
-        account.emailAddress ?? account.label
-    }
-
     private func queueSend() {
-        guard queuedBody == nil, !isSending else { return }
+        guard !sendController.isQueued, !isSending else { return }
         validationMessage = nil
 
         let sendRecipients = resolvedRecipients
@@ -705,63 +737,50 @@ struct NewMessageComposerView: View {
 
         commitRecipientDraft()
 
-        sentResetTask?.cancel()
-        sendTask?.cancel()
-        queuedBody = body
-        remainingSeconds = Self.sendDelaySeconds
         let trimmedSubject = subject.trimmingCharacters(in: .whitespacesAndNewlines)
         let subject = trimmedSubject.isEmpty ? nil : trimmedSubject
         let account = selectedAccountID
+        let payload = NewMessageComposerPayload(
+            recipients: sendRecipients,
+            subject: subject,
+            body: body,
+            accountID: account
+        )
 
-        sendTask = Task { @MainActor in
-            for second in stride(from: Self.sendDelaySeconds, through: 1, by: -1) {
-                remainingSeconds = second
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if Task.isCancelled { return }
-            }
-            queuedBody = nil
-            localStatus = .sending
-            onSend(sendRecipients, subject, body, account.isEmpty ? nil : account)
+        sendController.queue(payload) { payload in
+            onSend(
+                payload.recipients,
+                payload.subject,
+                payload.body,
+                payload.accountID.isEmpty ? nil : payload.accountID
+            )
         }
     }
 
-    private func undoSend() {
-        sendTask?.cancel()
-        sendTask = nil
-        queuedBody = nil
-        remainingSeconds = Self.sendDelaySeconds
-    }
-
     private func handleSendStateChange(_ state: MailiaReplySendState) {
-        switch state {
-        case .sent:
+        sendController.handleSendStateChange(state) {
             recipients = []
             recipientDraft = ""
             subject = ""
             bodyText = ""
             bodyHeight = Self.singleLineHeight
             validationMessage = nil
-            localStatus = .sent
-            sentResetTask?.cancel()
-            sentResetTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_800_000_000)
-                if Task.isCancelled { return }
-                if localStatus == .sent {
-                    localStatus = .idle
-                }
-            }
-        case .failed:
-            localStatus = .idle
-        case .idle, .sending:
-            break
         }
     }
 
     private func clearErrorsAfterEdit() {
+        sendController.clearSentConfirmationIf(hasDraftContent: hasDraftContent)
         validationMessage = nil
         if case .failed = sendState {
             onEdited()
         }
+    }
+
+    private var hasDraftContent: Bool {
+        !recipients.isEmpty
+            || !recipientDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !trimmedBody.isEmpty
     }
 
     private func commitRecipientDraft() {
@@ -1000,19 +1019,17 @@ private struct RecipientDraftTextField: NSViewRepresentable {
         field.delegate = context.coordinator
         field.stringValue = text
         field.placeholderAttributedString = showPlaceholder ? Self.placeholder : nil
-        field.onFocusChange = Self.makeFocusHandler(
-            isFocused: _isFocused,
-            focusedField: focusedField
-        )
+        field.onFocusChange = { [weak coordinator = context.coordinator] focused in
+            coordinator?.syncFocus(focused)
+        }
         return field
     }
 
     func updateNSView(_ field: RecipientNSTextField, context: Context) {
         context.coordinator.parent = self
-        field.onFocusChange = Self.makeFocusHandler(
-            isFocused: _isFocused,
-            focusedField: focusedField
-        )
+        field.onFocusChange = { [weak coordinator = context.coordinator] focused in
+            coordinator?.syncFocus(focused)
+        }
 
         if text.isEmpty {
             if !field.stringValue.isEmpty {
@@ -1033,20 +1050,6 @@ private struct RecipientDraftTextField: NSViewRepresentable {
         }
     }
 
-    private static func makeFocusHandler(
-        isFocused: Binding<Bool>,
-        focusedField: FocusState<NewMessageComposerFocusedField?>.Binding
-    ) -> (Bool) -> Void {
-        { focused in
-            DispatchQueue.main.async {
-                isFocused.wrappedValue = focused
-                if focused {
-                    focusedField.wrappedValue = .recipients
-                }
-            }
-        }
-    }
-
     private static var placeholder: NSAttributedString {
         NSAttributedString(
             string: "name@example.com",
@@ -1057,19 +1060,42 @@ private struct RecipientDraftTextField: NSViewRepresentable {
         )
     }
 
+    @MainActor
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: RecipientDraftTextField
+        private var pendingFocus: Bool?
+        private var isFocusSyncScheduled = false
 
         init(_ parent: RecipientDraftTextField) {
             self.parent = parent
+        }
+
+        func syncFocus(_ focused: Bool) {
+            pendingFocus = focused
+            guard !isFocusSyncScheduled else { return }
+
+            isFocusSyncScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let focused = self.pendingFocus
+                self.pendingFocus = nil
+                self.isFocusSyncScheduled = false
+                guard let focused else { return }
+
+                if self.parent.isFocused != focused {
+                    self.parent.isFocused = focused
+                }
+                if focused, self.parent.focusedField.wrappedValue != .recipients {
+                    self.parent.focusedField.wrappedValue = .recipients
+                }
+            }
         }
 
         func controlTextDidChange(_ obj: Notification) {
             guard let field = obj.object as? NSTextField else { return }
             let newValue = field.stringValue
             parent.text = newValue
-            parent.isFocused = true
-            parent.focusedField.wrappedValue = .recipients
+            syncFocus(true)
             if !newValue.isEmpty {
                 parent.onDraftEdited()
             }
@@ -1079,14 +1105,13 @@ private struct RecipientDraftTextField: NSViewRepresentable {
         }
 
         func controlTextDidBeginEditing(_ obj: Notification) {
-            parent.isFocused = true
-            parent.focusedField.wrappedValue = .recipients
+            syncFocus(true)
         }
 
         func controlTextDidEndEditing(_ obj: Notification) {
             guard let field = obj.object as? NSTextField else { return }
             parent.text = field.stringValue
-            parent.isFocused = false
+            syncFocus(false)
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -1241,20 +1266,35 @@ private struct AccountMenuEmojiLabel: View {
     let fallbackEmoji: String
 
     var body: some View {
-        Text(displayEmoji)
-            .font(.system(size: 17))
-            .foregroundStyle(.primary)
-            .symbolRenderingMode(.multicolor)
-            .frame(width: 36, height: 36)
-            .shadow(color: Color.black.opacity(0.18), radius: 1, x: 0, y: 1)
+        Group {
+            if let emoji = MailiaSendAccount.normalizedEmoji(account?.emoji) {
+                Text(emoji)
+                    .font(.system(size: 17))
+                    .foregroundStyle(.primary)
+                    .symbolRenderingMode(.multicolor)
+            } else if let image = accountAvatarImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFill()
+                    .frame(width: 36, height: 36)
+                    .clipShape(Circle())
+            } else {
+                Text(fallbackEmoji)
+                    .font(.system(size: 17))
+                    .foregroundStyle(.primary)
+                    .symbolRenderingMode(.multicolor)
+            }
+        }
+        .frame(width: 36, height: 36)
+        .shadow(color: Color.black.opacity(0.18), radius: 1, x: 0, y: 1)
     }
 
-    private var displayEmoji: String {
-        if let emoji = MailiaSendAccount.normalizedEmoji(account?.emoji) {
-            return emoji
+    private var accountAvatarImage: NSImage? {
+        guard let dataURL = account?.avatarImageDataURL?.nilIfBlank else {
+            return nil
         }
-
-        return fallbackEmoji
+        return NSImage.mailiaImage(dataURL: dataURL)
     }
 }
 
@@ -1307,56 +1347,6 @@ private struct ComposerBodyInputField: View {
 
     private var isSingleLineInput: Bool {
         !text.contains("\n") && height <= ComposerControlMetrics.singleLineHeight + 2
-    }
-}
-
-enum AccountEmojiFallback {
-    private static let fallbackEmojis = ["📬", "💼", "✉️", "📮", "🧭", "⭐️", "🔖", "🪪"]
-
-    static func emoji(for accountID: String, in accounts: [MailiaSendAccount]) -> String {
-        let assignments = assignments(for: accounts)
-        return assignments[accountID] ?? emoji(seed: accountID)
-    }
-
-    static func emoji(seed: String) -> String {
-        fallbackEmojis[preferredIndex(seed: seed)]
-    }
-
-    private static func assignments(for accounts: [MailiaSendAccount]) -> [String: String] {
-        var usedIndexes = Set<Int>()
-        var assignments: [String: String] = [:]
-
-        for account in accounts {
-            guard MailiaSendAccount.normalizedEmoji(account.emoji) == nil else { continue }
-
-            let seed = account.id.isEmpty ? account.label : account.id
-            let preferred = preferredIndex(seed: seed)
-            let index = availableIndex(preferred: preferred, usedIndexes: usedIndexes)
-            usedIndexes.insert(index)
-            assignments[account.id] = fallbackEmojis[index]
-        }
-
-        return assignments
-    }
-
-    private static func availableIndex(preferred: Int, usedIndexes: Set<Int>) -> Int {
-        guard usedIndexes.count < fallbackEmojis.count else { return preferred }
-
-        for offset in 0..<fallbackEmojis.count {
-            let index = (preferred + offset) % fallbackEmojis.count
-            if !usedIndexes.contains(index) {
-                return index
-            }
-        }
-
-        return preferred
-    }
-
-    private static func preferredIndex(seed: String) -> Int {
-        let hash = seed.unicodeScalars.reduce(UInt64(5381)) { partial, scalar in
-            (partial &* 33) &+ UInt64(scalar.value)
-        }
-        return Int(hash % UInt64(fallbackEmojis.count))
     }
 }
 
@@ -1606,5 +1596,12 @@ private final class SubmittableTextView: NSTextView {
 
     private func resolvedInsertionPointColor(_ color: NSColor) -> NSColor {
         color.usingColorSpace(.deviceRGB) ?? .systemBlue
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let value = trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 }

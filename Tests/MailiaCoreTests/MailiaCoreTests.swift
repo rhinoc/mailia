@@ -52,8 +52,15 @@ func databaseMigrationCreatesKeyColumns() throws {
         "subject",
         "from_sender_id",
         "message_date",
-        "direction",
         "has_attachments"
+    ]))
+
+    let messageEntityColumns = try DatabaseSchemaInspector.columnNames(in: "message_entities", databaseQueue: databaseQueue)
+    #expect(messageEntityColumns.isSuperset(of: [
+        "message_id",
+        "entity_id",
+        "relation_kind",
+        "timeline_direction"
     ]))
 
     let locationColumns = try DatabaseSchemaInspector.columnNames(in: "message_locations", databaseQueue: databaseQueue)
@@ -65,6 +72,15 @@ func databaseMigrationCreatesKeyColumns() throws {
         "flags_json",
         "is_primary"
     ]))
+
+    let checkpointColumns = try DatabaseSchemaInspector.columnNames(in: "sync_checkpoints", databaseQueue: databaseQueue)
+    #expect(checkpointColumns.isSuperset(of: [
+        "last_successful_sync_at",
+        "last_successful_sync_started_at",
+        "last_successful_sync_finished_at",
+        "last_successful_query_start_at",
+        "oldest_synced_message_date"
+    ]))
 }
 
 @Test
@@ -74,4 +90,37 @@ func modelEnumsUsePersistableRawValues() {
     #expect(EntityKind.newsletter.rawValue == "newsletter")
     #expect(RelationKind.from.rawValue == "from")
     #expect(ActionType.moveToInbox.rawValue == "move_to_inbox")
+}
+
+@Test
+func workspacePolicyDefinesVisibleFolderRoles() {
+    #expect(WorkspacePolicy.visibleRoles(for: .main) == [.normal, .sent])
+    #expect(WorkspacePolicy.visibleRoles(for: .junk) == [.junk])
+    #expect(WorkspacePolicy.visibleRoles(for: .flagged) == [.normal, .sent, .junk])
+}
+
+@Test
+func entityActionPolicyDefinesSourceAndTargetRoles() {
+    #expect(EntityActionPolicy.visibleActions(for: .main) == [.moveToJunk, .flagImportant, .moveToTrash])
+    #expect(EntityActionPolicy.visibleActions(for: .junk) == [.moveToInbox, .flagImportant, .moveToTrash])
+    #expect(EntityActionPolicy.visibleActions(for: .flagged) == [.moveToJunk, .removeFlag, .moveToTrash])
+
+    #expect(EntityActionPolicy.hidesEntityInCurrentWorkspace(.moveToJunk, workspace: .main))
+    #expect(EntityActionPolicy.hidesEntityInCurrentWorkspace(.moveToInbox, workspace: .junk))
+    #expect(EntityActionPolicy.hidesEntityInCurrentWorkspace(.moveToTrash, workspace: .flagged))
+    #expect(!EntityActionPolicy.hidesEntityInCurrentWorkspace(.flagImportant, workspace: .main))
+    #expect(EntityActionPolicy.hidesEntityInCurrentWorkspace(.removeFlag, workspace: .flagged))
+    #expect(!EntityActionPolicy.hidesEntityInCurrentWorkspace(.removeFlag, workspace: .main))
+
+    #expect(EntityActionPolicy.sourceRoles(for: .moveToInbox) == [.junk])
+    #expect(EntityActionPolicy.sourceRoles(for: .moveToJunk) == [.normal])
+    #expect(EntityActionPolicy.sourceRoles(for: .moveToTrash) == WorkspacePolicy.visibleRoles(for: .flagged))
+    #expect(EntityActionPolicy.sourceRoles(for: .flagImportant) == WorkspacePolicy.visibleRoles(for: .flagged))
+    #expect(EntityActionPolicy.sourceRoles(for: .removeFlag) == WorkspacePolicy.visibleRoles(for: .flagged))
+
+    #expect(EntityActionPolicy.targetRole(for: .moveToInbox) == .normal)
+    #expect(EntityActionPolicy.targetRole(for: .moveToJunk) == .junk)
+    #expect(EntityActionPolicy.targetRole(for: .moveToTrash) == .trash)
+    #expect(EntityActionPolicy.targetRole(for: .flagImportant) == nil)
+    #expect(EntityActionPolicy.targetRole(for: .removeFlag) == nil)
 }

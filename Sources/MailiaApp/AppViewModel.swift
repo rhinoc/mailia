@@ -1,7 +1,5 @@
 import Foundation
-import GRDB
 import MailiaCore
-import AppKit
 
 enum MailiaWorkspace: String, CaseIterable, Identifiable, Sendable {
     case main = "Main"
@@ -22,70 +20,6 @@ enum MailiaWorkspace: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum MailiaEntityAction: Sendable {
-    case moveToInbox
-    case moveToJunk
-    case moveToTrash
-    case flagImportant
-    case removeFlag
-
-    var statusLabel: String {
-        switch self {
-        case .moveToInbox:
-            "Moving to Inbox..."
-        case .moveToJunk:
-            "Moving to Junk..."
-        case .moveToTrash:
-            "Moving to Trash..."
-        case .flagImportant:
-            "Flagging..."
-        case .removeFlag:
-            "Removing flag..."
-        }
-    }
-
-    func progressStatus(current: Int, total: Int) -> String {
-        switch self {
-        case .moveToInbox:
-            "Moving \(current) of \(total) to Inbox..."
-        case .moveToJunk:
-            "Moving \(current) of \(total) to Junk..."
-        case .moveToTrash:
-            "Moving \(current) of \(total) to Trash..."
-        case .flagImportant:
-            "Flagging \(current) of \(total)..."
-        case .removeFlag:
-            "Removing flag \(current) of \(total)..."
-        }
-    }
-
-    var sourceRoles: [FolderRole] {
-        switch self {
-        case .moveToInbox:
-            [.junk]
-        case .moveToJunk:
-            [.normal]
-        case .moveToTrash:
-            [.normal, .sent, .junk]
-        case .flagImportant, .removeFlag:
-            [.normal, .sent, .junk]
-        }
-    }
-
-    var targetRole: FolderRole? {
-        switch self {
-        case .moveToInbox:
-            .normal
-        case .moveToJunk:
-            .junk
-        case .moveToTrash:
-            .trash
-        case .flagImportant, .removeFlag:
-            nil
-        }
-    }
-}
-
 struct MailiaEntitySummary: Identifiable, Equatable, Sendable {
     let id: Int64
     let displayName: String
@@ -94,7 +28,9 @@ struct MailiaEntitySummary: Identifiable, Equatable, Sendable {
     let kind: EntityKind
     var unreadCount: Int
     let latestSubject: String
+    let latestBodyPreview: String?
     let latestDate: Date?
+    let accountKeys: [String]
     let accountLabel: String
     let workspace: MailiaWorkspace
     var avatarImageDataURL: String?
@@ -110,6 +46,7 @@ struct MailiaTimelineItem: Identifiable, Equatable, Sendable {
     let date: Date?
     let accountLabel: String
     let accountEmoji: String?
+    let accountAvatarImageDataURL: String?
     let folderLabel: String
     let envelopeID: String
     let isFlagged: Bool
@@ -142,6 +79,7 @@ struct MailiaSendAccount: Identifiable, Equatable, Sendable {
     let displayName: String?
     let isDefault: Bool
     let emoji: String?
+    let avatarImageDataURL: String?
 }
 
 struct MailiaAccountSettingsUpdate: Equatable, Sendable {
@@ -164,7 +102,8 @@ extension MailiaSendAccount {
             emailAddress: account.emailAddress?.nilIfBlank,
             displayName: displayName,
             isDefault: account.isDefault,
-            emoji: account.emoji?.nilIfBlank
+            emoji: account.emoji?.nilIfBlank,
+            avatarImageDataURL: nil
         )
     }
 
@@ -265,34 +204,6 @@ private struct PendingAvatarResolutionRequest: Equatable, Sendable {
     var sequence: Int
 }
 
-/// Aggregates per-workspace sync progress (Main + Junk run concurrently) into a single
-/// determinate progress value for the refresh button.
-private actor RefreshProgressAggregator {
-    private var byWorkspace: [Workspace: SyncWorkspaceProgress] = [:]
-
-    func update(_ progress: SyncWorkspaceProgress) -> MailiaRefreshProgress {
-        byWorkspace[progress.workspace] = progress
-
-        let totalFolders = byWorkspace.values.reduce(0) { $0 + $1.totalFolders }
-        let completedFolders = byWorkspace.values.reduce(0) { $0 + $1.completedFolders }
-        let syncedMessages = byWorkspace.values.reduce(0) { $0 + $1.syncedMessages }
-
-        let detail: String
-        if totalFolders > 0 {
-            detail = "\(completedFolders) of \(totalFolders) mailboxes · \(syncedMessages) messages"
-        } else {
-            detail = "\(syncedMessages) messages"
-        }
-
-        return MailiaRefreshProgress(
-            phase: .downloading,
-            title: "Downloading messages",
-            detail: detail,
-            fraction: totalFolders > 0 ? Double(completedFolders) / Double(totalFolders) : nil
-        )
-    }
-}
-
 enum MailiaAttachmentDownloadState: Equatable, Sendable {
     case idle
     case downloading
@@ -311,6 +222,35 @@ struct MailiaSnapshot: Equatable, Sendable {
     let entities: [MailiaEntitySummary]
     let sendAccounts: [MailiaSendAccount]
     let loadedAt: Date
+}
+
+struct MailiaRefreshOptions: Equatable, Sendable {
+    var preferredAccountKeys: [String] = []
+    var fullHistory: Bool = false
+}
+
+enum MailiaCacheKind: String, CaseIterable, Identifiable, Sendable {
+    case avatars
+    case messageBodies
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .avatars:
+            "Avatars"
+        case .messageBodies:
+            "Message bodies"
+        }
+    }
+}
+
+struct MailiaCacheSummary: Identifiable, Equatable, Sendable {
+    let kind: MailiaCacheKind
+    let itemCount: Int
+    let byteSize: Int64
+
+    var id: MailiaCacheKind { kind }
 }
 
 enum MailiaTimelinePageDirection: Hashable, Sendable {
@@ -333,58 +273,6 @@ struct MailiaTimelineScrollAnchor: Equatable, Sendable {
     let id: Int64
     let edge: Edge
     let generation: Int
-}
-
-private struct MailiaTimelineCacheKey: Hashable {
-    let workspace: MailiaWorkspace
-    let entityID: Int64
-}
-
-private struct MailiaTimelineCacheEntry {
-    let items: [MailiaTimelineItem]
-    let hasOlderTimeline: Bool
-    let hasNewerTimeline: Bool
-}
-
-private struct EntityActionPresentation {
-    let hidesEntityInCurrentWorkspace: Bool
-}
-
-@MainActor
-protocol MailiaAppDataProviding {
-    func loadSnapshot(workspace: MailiaWorkspace, searchQuery: String) async throws -> MailiaSnapshot
-    func recipientSuggestions() async throws -> [MailiaRecipientSuggestion]
-    func refresh(
-        workspace: MailiaWorkspace,
-        searchQuery: String,
-        progress: @escaping @MainActor (MailiaRefreshProgress) -> Void
-    ) async throws -> MailiaSnapshot
-    func loadTimelinePage(
-        entityID: Int64,
-        workspace: MailiaWorkspace,
-        direction: MailiaTimelinePageDirection,
-        anchorID: Int64?,
-        limit: Int
-    ) async throws -> MailiaTimelinePage
-    func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody
-    func performEntityAction(
-        _ action: MailiaEntityAction,
-        entityID: Int64,
-        workspace: MailiaWorkspace,
-        progress: @escaping @MainActor (String) -> Void
-    ) async throws
-    func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws
-    func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws
-    func downloadAttachments(for item: MailiaTimelineItem) async throws -> MailiaAttachmentDownloadResult
-    func sendReply(to item: MailiaTimelineItem, body: String, replyAll: Bool, accountKey: String?) async throws
-    func sendNewMessage(
-        to recipients: [String],
-        subject: String?,
-        body: String,
-        accountKey: String?
-    ) async throws
-    func loadSendAccounts() async throws -> [MailiaSendAccount]
-    func updateAccountSettings(_ updates: [MailiaAccountSettingsUpdate]) async throws
 }
 
 @MainActor
@@ -442,59 +330,65 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var sendAccounts: [MailiaSendAccount] = []
     @Published private(set) var selectedSendAccountKey: String?
     @Published private(set) var timelineScrollAnchor: MailiaTimelineScrollAnchor?
+    @Published private(set) var cacheSummaries: [MailiaCacheSummary] = []
+    @Published private(set) var cacheOperationStatus: String?
 
     private let provider: any MailiaAppDataProviding
+    private let startupRefreshStalenessThreshold: TimeInterval
+    private let now: @Sendable () -> Date
     private var requestGeneration = 0
     private var timelineGeneration = 0
-    private var pendingBodyLoads: [Int64: MailiaTimelineItem] = [:]
-    private var pendingBodyLoadOrder: [Int64] = []
-    private var pendingBodyLoadPriorities: [Int64: Int] = [:]
-    private var inFlightBodyLoads: Set<Int64> = []
-    private var inFlightBodyLoadPriorities: [Int64: Int] = [:]
-    private var bodyLoadTokens: [Int64: Int] = [:]
-    private var nextBodyLoadPriority = 0
-    private var nextBodyLoadToken = 0
-    private var bodyAccessOrder: [Int64] = []
-    private var timelinePageCache: [MailiaTimelineCacheKey: MailiaTimelineCacheEntry] = [:]
-    private var timelinePageCacheAccessOrder: [MailiaTimelineCacheKey] = []
-    private var timelineBodyStateCache: [Int64: MailiaTimelineBodyState] = [:]
-    private var timelineBodyStateCacheAccessOrder: [Int64] = []
+    private var timelineWindowStore = TimelineWindowStore()
+    private let bodyLoadQueue: TimelineBodyLoadQueue
     private var avatarResolutionTasks: [Int64: Task<Void, Never>] = [:]
     private var avatarResolutionTaskInfo: [Int64: AvatarResolutionTaskInfo] = [:]
     private var avatarResolutionBatches: [Int: AvatarResolutionProgressBatch] = [:]
     private var pendingAvatarResolutionRequests: [Int64: PendingAvatarResolutionRequest] = [:]
+    private var accountAvatarResolutionTasks: [String: Task<Void, Never>] = [:]
     private var nextAvatarResolutionBatchID = 0
     private var nextAvatarResolutionSequence = 0
     private var avatarCacheHydrationTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
+    private var partialRefreshSnapshotTask: Task<Void, Never>?
+    private var partialRefreshSnapshotNeedsReload = false
+    private var postSendFollowUpRefreshTasks: [UUID: Task<Void, Never>] = [:]
     private var timelineLoadTask: Task<Void, Never>?
     private var timelinePageTasks: [MailiaTimelinePageDirection: Task<Void, Never>] = [:]
-    private var bodyLoadTasks: [Int64: Task<Void, Never>] = [:]
     private var optimisticHiddenEntityIDs: Set<Int64> = []
     private var optimisticReadEntityIDs: Set<Int64> = []
     private var pendingMarkReadTask: Task<Void, Never>?
     private var markReadTasks: [Int64: Task<Void, Never>] = [:]
-    private var scrollAnchorGeneration = 0
-    private let avatarResolver = EntityBrandAvatarResolver()
+    private let avatarResolver: EntityBrandAvatarResolver
     private let timelinePageSize = 80
-    private let maxConcurrentBodyLoads = 3
-    private let maxLoadedBodyStates = 32
-    private let maxCachedTimelinePages = 24
-    private let maxCachedBodyStates = 240
     private let maxConcurrentAvatarResolutions = 4
+    private let partialRefreshSnapshotDelayNanoseconds: UInt64 = 350_000_000
+    private let postSendFollowUpRefreshDelaysNanoseconds: [UInt64]
     private let avatarResolutionTimeoutNanoseconds: UInt64 = 12_000_000_000
 
-    init(provider: any MailiaAppDataProviding = LiveMailiaAppDataProvider()) {
+    init(
+        provider: any MailiaAppDataProviding = LiveMailiaAppDataProvider(),
+        avatarResolver: EntityBrandAvatarResolver = EntityBrandAvatarResolver(),
+        postSendFollowUpRefreshDelaysNanoseconds: [UInt64] = [3_000_000_000, 8_000_000_000],
+        startupRefreshStalenessThreshold: TimeInterval = 600,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
         self.provider = provider
+        self.bodyLoadQueue = TimelineBodyLoadQueue(provider: provider)
+        self.avatarResolver = avatarResolver
+        self.postSendFollowUpRefreshDelaysNanoseconds = postSendFollowUpRefreshDelaysNanoseconds
+        self.startupRefreshStalenessThreshold = startupRefreshStalenessThreshold
+        self.now = now
+        self.bodyLoadQueue.delegate = self
     }
 
     deinit {
         reloadTask?.cancel()
-        timelineLoadTask?.cancel()
-        for task in timelinePageTasks.values {
+        partialRefreshSnapshotTask?.cancel()
+        for task in postSendFollowUpRefreshTasks.values {
             task.cancel()
         }
-        for task in bodyLoadTasks.values {
+        timelineLoadTask?.cancel()
+        for task in timelinePageTasks.values {
             task.cancel()
         }
         pendingMarkReadTask?.cancel()
@@ -504,8 +398,12 @@ final class AppViewModel: ObservableObject {
         for task in avatarResolutionTasks.values {
             task.cancel()
         }
+        for task in accountAvatarResolutionTasks.values {
+            task.cancel()
+        }
         avatarCacheHydrationTask?.cancel()
         avatarResolutionTasks.removeAll()
+        accountAvatarResolutionTasks.removeAll()
         avatarResolutionTaskInfo.removeAll()
         avatarResolutionBatches.removeAll()
         pendingAvatarResolutionRequests.removeAll()
@@ -515,7 +413,12 @@ final class AppViewModel: ObservableObject {
     }
 
     func load() async {
-        await loadSnapshot(statusPrefix: "Loaded", refresh: false)
+        await loadSnapshot(
+            statusPrefix: "Loaded",
+            refresh: false,
+            refreshIfEmpty: true,
+            refreshIfStaleAfter: startupRefreshStalenessThreshold
+        )
     }
 
     func refresh() async {
@@ -523,9 +426,115 @@ final class AppViewModel: ObservableObject {
         await loadSnapshot(statusPrefix: "Refreshed", refresh: true)
     }
 
+    func refreshFullHistory() async {
+        guard !isRefreshing else { return }
+        await loadSnapshot(
+            statusPrefix: "Full history synced",
+            refresh: true,
+            options: MailiaRefreshOptions(fullHistory: true)
+        )
+    }
+
+    func syncEntityHistory(_ entity: MailiaEntitySummary) {
+        guard !isRefreshing else { return }
+        let emailAddresses = Self.emailAddresses(for: entity)
+        guard !emailAddresses.isEmpty else {
+            refreshStatus = "No email address available for \(entity.displayName)"
+            return
+        }
+
+        Task { [weak self] in
+            await self?.syncEntityHistory(
+                entityID: entity.id,
+                displayName: entity.displayName,
+                emailAddresses: emailAddresses,
+                workspace: entity.workspace
+            )
+        }
+    }
+
+    func refreshCacheSummaries() async {
+        do {
+            cacheSummaries = [
+                await avatarResolver.cacheSummary(),
+                try await messageBodyCacheSummary()
+            ]
+            cacheOperationStatus = nil
+        } catch {
+            cacheOperationStatus = "Unable to load cache sizes: \(error.localizedDescription)"
+            NSLog("Unable to load cache summaries: \(error.localizedDescription)")
+        }
+    }
+
+    func clearCache(_ kind: MailiaCacheKind) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                switch kind {
+                case .avatars:
+                    await avatarResolver.clearCache()
+                    clearInMemoryAvatars()
+                case .messageBodies:
+                    try await provider.clearMessageBodyCache()
+                    clearInMemoryBodyCache()
+                }
+                cacheOperationStatus = "\(kind.displayName) cache cleared."
+                await refreshCacheSummaries()
+            } catch {
+                cacheOperationStatus = "Unable to clear \(kind.displayName.lowercased()): \(error.localizedDescription)"
+                NSLog("Unable to clear \(kind.displayName) cache: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func syncEntityHistory(
+        entityID: Int64,
+        displayName: String,
+        emailAddresses: Set<String>,
+        workspace syncWorkspace: MailiaWorkspace
+    ) async {
+        requestGeneration += 1
+        let generation = requestGeneration
+        let searchQuerySnapshot = searchQuery
+        isRefreshing = true
+        refreshStatus = "Syncing \(displayName)..."
+        refreshActivity = MailiaRefreshProgress(
+            phase: .discovering,
+            title: "Syncing conversation",
+            detail: displayName,
+            fraction: nil
+        )
+        defer {
+            if generation == requestGeneration {
+                isRefreshing = false
+                refreshActivity = nil
+            }
+        }
+
+        do {
+            let snapshot = try await provider.syncEntityHistory(
+                emailAddresses: emailAddresses,
+                workspace: syncWorkspace,
+                searchQuery: searchQuerySnapshot
+            ) { [weak self] progress in
+                guard let self, generation == requestGeneration else { return }
+                refreshActivity = progress
+                refreshStatus = progress.detail.map { "\(progress.title) — \($0)" } ?? progress.title
+            }
+            guard generation == requestGeneration else { return }
+            applySnapshot(snapshot, reloadTimelineIfSelectionKept: selectedEntityID == entityID)
+            refreshStatus = "Synced \(displayName) history"
+        } catch is CancellationError {
+            return
+        } catch {
+            guard generation == requestGeneration else { return }
+            refreshStatus = "Unable to sync \(displayName): \(error.localizedDescription)"
+            NSLog("Unable to sync entity history: \(error.localizedDescription)")
+        }
+    }
+
     func performEntityAction(_ action: MailiaEntityAction, entity: MailiaEntitySummary) {
-        let presentation = presentation(for: action, workspace: entity.workspace)
-        if presentation.hidesEntityInCurrentWorkspace {
+        if EntityActionPolicy.hidesEntityInCurrentWorkspace(action, workspace: entity.workspace.coreWorkspace) {
             optimisticallyHideEntity(entity.id)
         } else {
             refreshStatus = action.statusLabel
@@ -645,23 +654,28 @@ final class AppViewModel: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
+            let sendAccountKey = resolvedSendAccountKey(accountKey, fallback: item.accountLabel)
+            let refreshAccountKeys = postSendRefreshAccountKeys(
+                sendAccountKey: sendAccountKey,
+                entityID: item.entityID,
+                recipientValues: [item.fromLabel, item.toLabel]
+            )
             do {
                 try await provider.sendReply(
                     to: item,
                     body: trimmedBody,
                     replyAll: replyAll,
-                    accountKey: accountKey?.nilIfBlank
+                    accountKey: sendAccountKey
                 )
                 replySendState = .sent
-                refreshStatus = "Reply sent"
+                refreshStatus = "Reply sent. Updating conversation..."
                 invalidateTimelineCache(entityID: item.entityID)
 
-                if selectedEntityID == item.entityID {
-                    loadTimelineForSelection()
-                }
-
-                let snapshot = try await provider.loadSnapshot(workspace: workspace, searchQuery: searchQuery)
-                applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+                await refreshAfterSuccessfulSend(
+                    accountKeys: refreshAccountKeys,
+                    reloadEntityID: item.entityID,
+                    finalStatus: "Reply sent"
+                )
             } catch {
                 replySendState = .failed(error.localizedDescription)
                 refreshStatus = "Unable to send reply: \(error.localizedDescription)"
@@ -800,7 +814,7 @@ final class AppViewModel: ObservableObject {
 
     func refreshConfiguredAccounts() async {
         do {
-            sendAccounts = try await provider.loadSendAccounts()
+            applySendAccounts(try await provider.loadSendAccounts())
         } catch {
             NSLog("Unable to load configured accounts: \(error.localizedDescription)")
         }
@@ -816,7 +830,7 @@ final class AppViewModel: ObservableObject {
                     isDefault: true
                 )
             ])
-            sendAccounts = try await provider.loadSendAccounts()
+            applySendAccounts(try await provider.loadSendAccounts())
             selectedSendAccountKey = accountKey
         } catch {
             NSLog("Unable to update default account: \(error.localizedDescription)")
@@ -834,8 +848,7 @@ final class AppViewModel: ObservableObject {
                     isDefault: nil
                 )
             ])
-            sendAccounts = try await provider.loadSendAccounts()
-            applyAccountEmojisToTimeline()
+            applySendAccounts(try await provider.loadSendAccounts())
         } catch {
             NSLog("Unable to update account emoji: \(error.localizedDescription)")
         }
@@ -851,7 +864,7 @@ final class AppViewModel: ObservableObject {
                     isDefault: nil
                 )
             ])
-            sendAccounts = try await provider.loadSendAccounts()
+            applySendAccounts(try await provider.loadSendAccounts())
         } catch {
             NSLog("Unable to update account alias: \(error.localizedDescription)")
         }
@@ -860,8 +873,7 @@ final class AppViewModel: ObservableObject {
     func saveAccountSettings(_ updates: [MailiaAccountSettingsUpdate]) async {
         do {
             try await provider.updateAccountSettings(updates)
-            sendAccounts = try await provider.loadSendAccounts()
-            applyAccountEmojisToTimeline()
+            applySendAccounts(try await provider.loadSendAccounts())
         } catch {
             NSLog("Unable to update account settings: \(error.localizedDescription)")
         }
@@ -882,26 +894,219 @@ final class AppViewModel: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
+            let sendAccountKey = resolvedSendAccountKey(accountKey)
+            let refreshAccountKeys = postSendRefreshAccountKeys(
+                sendAccountKey: sendAccountKey,
+                entityID: nil,
+                recipientValues: cleanedRecipients
+            )
             do {
                 try await provider.sendNewMessage(
                     to: cleanedRecipients,
                     subject: subject?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
                     body: trimmedBody,
-                    accountKey: accountKey?.nilIfBlank ?? selectedSendAccountKey
+                    accountKey: sendAccountKey
                 )
                 replySendState = .sent
-                refreshStatus = "Message sent"
+                refreshStatus = "Message sent. Updating conversation..."
                 hasComposeDraft = false
                 isComposingNewMessage = false
 
-                let snapshot = try await provider.loadSnapshot(workspace: workspace, searchQuery: searchQuery)
-                applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+                await refreshAfterSuccessfulSend(
+                    accountKeys: refreshAccountKeys,
+                    reloadEntityID: nil,
+                    finalStatus: "Message sent"
+                )
             } catch {
                 replySendState = .failed(error.localizedDescription)
                 refreshStatus = "Unable to send message: \(error.localizedDescription)"
                 NSLog("Unable to send message: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func refreshAfterSuccessfulSend(
+        accountKeys: Set<String>,
+        reloadEntityID: Int64?,
+        finalStatus: String
+    ) async {
+        let workspaceSnapshot = workspace
+        let searchQuerySnapshot = searchQuery
+        let wasRefreshing = isRefreshing
+        isRefreshing = true
+        if !wasRefreshing {
+            refreshActivity = MailiaRefreshProgress(
+                phase: .downloading,
+                title: "Updating conversation",
+                detail: nil,
+                fraction: nil
+            )
+        }
+        defer {
+            if !wasRefreshing {
+                isRefreshing = false
+                refreshActivity = nil
+            }
+        }
+
+        do {
+            let snapshot = try await provider.refreshAfterSendingMessage(
+                accountKeys: accountKeys,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+            guard workspace == workspaceSnapshot, searchQuery == searchQuerySnapshot else { return }
+            let shouldReloadTimeline = reloadEntityID == nil || selectedEntityID == reloadEntityID
+            applySnapshot(snapshot, reloadTimelineIfSelectionKept: shouldReloadTimeline)
+            refreshStatus = finalStatus
+            schedulePostSendFollowUpRefresh(
+                accountKeys: accountKeys,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+        } catch {
+            refreshStatus = "\(finalStatus). Unable to update conversation: \(error.localizedDescription)"
+            NSLog("Unable to refresh after sending message: \(error.localizedDescription)")
+            schedulePostSendFollowUpRefresh(
+                accountKeys: accountKeys,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+        }
+    }
+
+    private func schedulePostSendFollowUpRefresh(
+        accountKeys: Set<String>,
+        workspace workspaceSnapshot: MailiaWorkspace,
+        searchQuery searchQuerySnapshot: String
+    ) {
+        let normalizedAccountKeys = Set(
+            accountKeys
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        guard !normalizedAccountKeys.isEmpty,
+              !postSendFollowUpRefreshDelaysNanoseconds.isEmpty
+        else {
+            return
+        }
+
+        let taskID = UUID()
+        let delays = postSendFollowUpRefreshDelaysNanoseconds
+        postSendFollowUpRefreshTasks[taskID] = Task { [weak self] in
+            for delay in delays {
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    break
+                }
+                guard !Task.isCancelled else { break }
+                await self?.runPostSendFollowUpRefresh(
+                    accountKeys: normalizedAccountKeys,
+                    workspace: workspaceSnapshot,
+                    searchQuery: searchQuerySnapshot
+                )
+            }
+
+            await MainActor.run {
+                self?.postSendFollowUpRefreshTasks[taskID] = nil
+            }
+        }
+    }
+
+    private func runPostSendFollowUpRefresh(
+        accountKeys: Set<String>,
+        workspace workspaceSnapshot: MailiaWorkspace,
+        searchQuery searchQuerySnapshot: String
+    ) async {
+        guard workspace == workspaceSnapshot,
+              searchQuery == searchQuerySnapshot
+        else {
+            return
+        }
+
+        do {
+            let snapshot = try await provider.refreshAfterSendingMessage(
+                accountKeys: accountKeys,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+            guard workspace == workspaceSnapshot,
+                  searchQuery == searchQuerySnapshot
+            else {
+                return
+            }
+            applySnapshot(snapshot, reloadTimelineIfSelectionKept: true)
+        } catch {
+            NSLog("Unable to run delayed post-send refresh: \(error.localizedDescription)")
+        }
+    }
+
+    private func postSendRefreshAccountKeys(
+        sendAccountKey: String?,
+        entityID: Int64?,
+        recipientValues: [String]
+    ) -> Set<String> {
+        var accountKeys = Set<String>()
+        if let sendAccountKey = sendAccountKey?.nilIfBlank {
+            accountKeys.insert(sendAccountKey)
+        }
+        if let entityID {
+            accountKeys.formUnion(localAccountKeys(forEntityID: entityID))
+        }
+        accountKeys.formUnion(localAccountKeys(forEmailValues: recipientValues))
+        return accountKeys
+    }
+
+    private func resolvedSendAccountKey(_ requestedAccountKey: String?, fallback: String? = nil) -> String? {
+        requestedAccountKey?.nilIfBlank
+            ?? selectedSendAccountKey?.nilIfBlank
+            ?? sendAccounts.first(where: { $0.isDefault })?.id.nilIfBlank
+            ?? sendAccounts.first?.id.nilIfBlank
+            ?? fallback?.nilIfBlank
+    }
+
+    private func localAccountKeys(forEntityID entityID: Int64) -> Set<String> {
+        guard let entity = entities.first(where: { $0.id == entityID }) else { return [] }
+        return localAccountKeys(forEmailValues: [entity.primaryEmailAddress].compactMap { $0 } + entity.emailAddresses)
+    }
+
+    private static func emailAddresses(for entity: MailiaEntitySummary) -> Set<String> {
+        let values = entity.emailAddresses.isEmpty
+            ? [entity.primaryEmailAddress].compactMap { $0 }
+            : entity.emailAddresses
+        return Set(values.flatMap(normalizedEmailAddresses(in:)))
+    }
+
+    private func localAccountKeys(forEmailValues values: [String]) -> Set<String> {
+        let normalizedEmails = Set(values.flatMap(Self.normalizedEmailAddresses(in:)))
+        guard !normalizedEmails.isEmpty else { return [] }
+
+        return Set(sendAccounts.compactMap { account in
+            guard let emailAddress = account.emailAddress,
+                  let normalizedEmail = Self.normalizedEmailAddresses(in: emailAddress).first,
+                  normalizedEmails.contains(normalizedEmail)
+            else {
+                return nil
+            }
+            return account.id
+        })
+    }
+
+    private static func normalizedEmailAddresses(in value: String) -> [String] {
+        let separators = CharacterSet(charactersIn: ",;")
+        return value
+            .components(separatedBy: separators)
+            .compactMap { component in
+                var candidate = component.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let open = candidate.firstIndex(of: "<"),
+                   let close = candidate[open...].firstIndex(of: ">") {
+                    candidate = String(candidate[candidate.index(after: open)..<close])
+                }
+                candidate = candidate.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'<>")))
+                guard candidate.contains("@") else { return nil }
+                return candidate.lowercased()
+            }
     }
 
     private func reloadForCurrentFilters() {
@@ -915,6 +1120,9 @@ final class AppViewModel: ObservableObject {
         requestGeneration += 1
         timelineGeneration += 1
         reloadTask?.cancel()
+        partialRefreshSnapshotTask?.cancel()
+        partialRefreshSnapshotTask = nil
+        partialRefreshSnapshotNeedsReload = false
         timelineLoadTask?.cancel()
         avatarCacheHydrationTask?.cancel()
         reloadTask = nil
@@ -929,9 +1137,18 @@ final class AppViewModel: ObservableObject {
         resetTimelineWindowState()
     }
 
-    private func loadSnapshot(statusPrefix: String, refresh: Bool) async {
+    private func loadSnapshot(
+        statusPrefix: String,
+        refresh: Bool,
+        refreshIfEmpty: Bool = false,
+        refreshIfStaleAfter: TimeInterval? = nil,
+        options explicitRefreshOptions: MailiaRefreshOptions? = nil
+    ) async {
         requestGeneration += 1
         let generation = requestGeneration
+        let workspaceSnapshot = workspace
+        let searchQuerySnapshot = searchQuery
+        let refreshOptions = refresh ? (explicitRefreshOptions ?? currentRefreshOptions()) : MailiaRefreshOptions()
         isRefreshing = true
         isLoadingEntityList = true
         refreshStatus = refresh ? "Refreshing..." : "Loading..."
@@ -943,6 +1160,9 @@ final class AppViewModel: ObservableObject {
         )
         defer {
             if generation == requestGeneration {
+                partialRefreshSnapshotTask?.cancel()
+                partialRefreshSnapshotTask = nil
+                partialRefreshSnapshotNeedsReload = false
                 isRefreshing = false
                 isLoadingEntityList = false
                 refreshActivity = nil
@@ -950,30 +1170,220 @@ final class AppViewModel: ObservableObject {
         }
 
         do {
-            let snapshot: MailiaSnapshot
-            if refresh {
-                snapshot = try await provider.refresh(workspace: workspace, searchQuery: searchQuery) { [weak self] progress in
-                    guard let self, generation == requestGeneration else { return }
-                    refreshActivity = progress
-                    refreshStatus = progress.detail.map { "\(progress.title) — \($0)" } ?? progress.title
+            let handleRefreshProgress: @MainActor (MailiaRefreshProgress) -> Void = { [weak self] progress in
+                guard let self, generation == requestGeneration else { return }
+                refreshActivity = progress
+                refreshStatus = progress.detail.map { "\(progress.title) — \($0)" } ?? progress.title
+                if progress.phase == .downloading, (progress.fraction ?? 0) > 0 {
+                    schedulePartialRefreshSnapshot(
+                        generation: generation,
+                        workspace: workspaceSnapshot,
+                        searchQuery: searchQuerySnapshot
+                    )
                 }
+            }
+            var snapshot: MailiaSnapshot
+            var finalStatusPrefix = statusPrefix
+            if refresh {
+                snapshot = try await provider.refresh(
+                    workspace: workspaceSnapshot,
+                    searchQuery: searchQuerySnapshot,
+                    options: refreshOptions
+                ) { progress in handleRefreshProgress(progress) }
             } else {
-                snapshot = try await provider.loadSnapshot(workspace: workspace, searchQuery: searchQuery)
+                snapshot = try await provider.loadSnapshot(workspace: workspaceSnapshot, searchQuery: searchQuerySnapshot)
+                let canStartupRefresh = searchQuerySnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let shouldRefreshEmptySnapshot = refreshIfEmpty && snapshot.entities.isEmpty && canStartupRefresh
+                let shouldRefreshStaleSnapshot = try await shouldRefreshStartupSnapshot(
+                    after: refreshIfStaleAfter,
+                    canRefresh: canStartupRefresh,
+                    hasLocalEntities: !snapshot.entities.isEmpty
+                )
+                if shouldRefreshEmptySnapshot || shouldRefreshStaleSnapshot {
+                    refreshStatus = shouldRefreshEmptySnapshot
+                        ? "No local mail. Fetching messages..."
+                        : "Mail is stale. Refreshing..."
+                    snapshot = try await provider.refresh(
+                        workspace: workspaceSnapshot,
+                        searchQuery: searchQuerySnapshot,
+                        options: MailiaRefreshOptions()
+                    ) { progress in handleRefreshProgress(progress) }
+                    finalStatusPrefix = "Refreshed"
+                }
             }
 
             guard generation == requestGeneration else { return }
 
             applySnapshot(snapshot, reloadTimelineIfSelectionKept: refresh)
-            refreshStatus = "\(statusPrefix) \(Self.statusFormatter.string(from: snapshot.loadedAt))"
+            refreshStatus = "\(finalStatusPrefix) \(Self.statusFormatter.string(from: snapshot.loadedAt))"
         } catch is CancellationError {
             return
         } catch {
             guard generation == requestGeneration else { return }
-            entities = []
-            timeline = []
-            timelineBodyStates = [:]
-            refreshStatus = "Unable to load mail: \(error.localizedDescription)"
+            let failureStatus = "\(refresh ? "Unable to refresh mail" : "Unable to load mail"): \(error.localizedDescription)"
+            if refresh || refreshIfEmpty {
+                do {
+                    let snapshot = try await provider.loadSnapshot(
+                        workspace: workspaceSnapshot,
+                        searchQuery: searchQuerySnapshot
+                    )
+                    guard generation == requestGeneration else { return }
+                    applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+                } catch {
+                    if entities.isEmpty {
+                        timeline = []
+                        timelineBodyStates = [:]
+                        resetTimelineWindowState()
+                    }
+                }
+            } else if entities.isEmpty {
+                timeline = []
+                timelineBodyStates = [:]
+                resetTimelineWindowState()
+            }
+            refreshStatus = failureStatus
         }
+    }
+
+    private func shouldRefreshStartupSnapshot(
+        after stalenessThreshold: TimeInterval?,
+        canRefresh: Bool,
+        hasLocalEntities: Bool
+    ) async throws -> Bool {
+        guard let stalenessThreshold, canRefresh, hasLocalEntities else {
+            return false
+        }
+        guard let lastRefreshFinishedAt = try await provider.lastRefreshFinishedAt() else {
+            return false
+        }
+        return now().timeIntervalSince(lastRefreshFinishedAt) > stalenessThreshold
+    }
+
+    private func currentRefreshOptions() -> MailiaRefreshOptions {
+        var preferredAccountKeys: [String] = []
+        var seen = Set<String>()
+
+        func append(_ accountKey: String?) {
+            guard let accountKey = accountKey?.nilIfBlank,
+                  seen.insert(accountKey).inserted
+            else {
+                return
+            }
+            preferredAccountKeys.append(accountKey)
+        }
+
+        if let selectedEntityID,
+           let selectedEntity = entities.first(where: { $0.id == selectedEntityID }) {
+            for accountKey in selectedEntity.accountKeys {
+                append(accountKey)
+            }
+        }
+        for item in timeline.reversed() {
+            append(item.accountLabel)
+        }
+        append(selectedSendAccountKey)
+
+        return MailiaRefreshOptions(preferredAccountKeys: preferredAccountKeys)
+    }
+
+    private func schedulePartialRefreshSnapshot(
+        generation: Int,
+        workspace workspaceSnapshot: MailiaWorkspace,
+        searchQuery searchQuerySnapshot: String
+    ) {
+        partialRefreshSnapshotNeedsReload = true
+        guard partialRefreshSnapshotTask == nil else { return }
+
+        let delay = partialRefreshSnapshotDelayNanoseconds
+        partialRefreshSnapshotTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            await self?.applyPartialRefreshSnapshot(
+                generation: generation,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+        }
+    }
+
+    private func applyPartialRefreshSnapshot(
+        generation: Int,
+        workspace workspaceSnapshot: MailiaWorkspace,
+        searchQuery searchQuerySnapshot: String
+    ) async {
+        guard generation == requestGeneration,
+              isRefreshing,
+              workspace == workspaceSnapshot,
+              searchQuery == searchQuerySnapshot
+        else {
+            partialRefreshSnapshotTask = nil
+            partialRefreshSnapshotNeedsReload = false
+            return
+        }
+
+        partialRefreshSnapshotNeedsReload = false
+        do {
+            let selectedBeforeReload = selectedEntityID
+            let selectedEntityBeforeReload = selectedBeforeReload.flatMap { selectedEntityID in
+                entities.first { $0.id == selectedEntityID }
+            }
+            let snapshot = try await provider.loadSnapshot(workspace: workspaceSnapshot, searchQuery: searchQuerySnapshot)
+            guard generation == requestGeneration,
+                  isRefreshing,
+                  workspace == workspaceSnapshot,
+                  searchQuery == searchQuerySnapshot
+            else {
+                partialRefreshSnapshotTask = nil
+                partialRefreshSnapshotNeedsReload = false
+                return
+            }
+
+            applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+            let selectedEntityAfterReload = selectedBeforeReload.flatMap { selectedEntityID in
+                entities.first { $0.id == selectedEntityID }
+            }
+            if selectedEntityID == selectedBeforeReload,
+               selectedEntityHasTimelineRelevantChanges(
+                   before: selectedEntityBeforeReload,
+                   after: selectedEntityAfterReload
+               ) {
+                refreshSelectedTimelineIncrementally()
+            }
+        } catch is CancellationError {
+            partialRefreshSnapshotTask = nil
+            return
+        } catch {
+            NSLog("Unable to apply partial refresh snapshot: \(error.localizedDescription)")
+        }
+
+        partialRefreshSnapshotTask = nil
+        if partialRefreshSnapshotNeedsReload {
+            schedulePartialRefreshSnapshot(
+                generation: generation,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+        }
+    }
+
+    private func selectedEntityHasTimelineRelevantChanges(
+        before: MailiaEntitySummary?,
+        after: MailiaEntitySummary?
+    ) -> Bool {
+        guard let before, let after else { return before != nil || after != nil }
+        return before.latestDate != after.latestDate
+            || before.latestSubject != after.latestSubject
+            || before.latestBodyPreview != after.latestBodyPreview
+            || before.unreadCount != after.unreadCount
+            || Set(before.accountKeys) != Set(after.accountKeys)
+    }
+
+    private func refreshSelectedTimelineIncrementally() {
+        guard selectedEntityID != nil, !isLoadingTimeline, !isLoadingNewerTimeline else { return }
+        guard let newestID = timeline.last?.id else {
+            loadTimelineForSelection()
+            return
+        }
+        loadTimelinePage(direction: .newer, anchorID: newestID, preserveAnchorID: newestID)
     }
 
     private func performEntityAction(
@@ -1013,16 +1423,15 @@ final class AppViewModel: ObservableObject {
             return
         }
 
-        let cacheKey = MailiaTimelineCacheKey(workspace: workspaceSnapshot, entityID: selectedEntityID)
         resetTimelineWindowState()
-        let hasCachedPage = timelinePageCache[cacheKey] != nil
-        if let cached = timelinePageCache[cacheKey] {
-            rememberTimelinePageCacheAccess(cacheKey)
+        let hasCachedPage = timelineWindowStore.hasCachedPage(workspace: workspaceSnapshot, entityID: selectedEntityID)
+        if let cached = timelineWindowStore.cachedPage(workspace: workspaceSnapshot, entityID: selectedEntityID) {
             timeline = cached.items
+            applyAccountVisualsToTimeline()
             timelineBodyStates = cachedBodyStates(for: cached.items)
             hasOlderTimeline = cached.hasOlderTimeline
             hasNewerTimeline = cached.hasNewerTimeline
-            bodyAccessOrder = cached.items.map(\.id).filter { timelineBodyStates[$0] != nil }
+            timelineWindowStore.primeBodyAccessOrder(items: cached.items, bodyStates: timelineBodyStates)
             if let latestID = cached.items.last?.id {
                 publishTimelineScrollAnchor(id: latestID, edge: .bottom)
             }
@@ -1044,12 +1453,14 @@ final class AppViewModel: ObservableObject {
                 )
                 guard generation == timelineGeneration else { return }
                 cacheTimelinePage(
-                    key: cacheKey,
+                    workspace: workspaceSnapshot,
+                    entityID: selectedEntityID,
                     items: page.items,
                     hasOlderTimeline: page.hasMore,
                     hasNewerTimeline: false
                 )
                 timeline = page.items
+                applyAccountVisualsToTimeline()
                 timelineBodyStates = cachedBodyStates(for: page.items)
                 hasOlderTimeline = page.hasMore
                 hasNewerTimeline = false
@@ -1089,31 +1500,81 @@ final class AppViewModel: ObservableObject {
         loadTimelinePage(direction: .newer, anchorID: newestID, preserveAnchorID: newestID)
     }
 
+    func refreshNewerTimelineForSelection() {
+        guard !isLoadingTimeline, !isLoadingNewerTimeline else { return }
+        if hasNewerTimeline {
+            loadNewerTimelineIfNeeded()
+            return
+        }
+
+        Task { [weak self] in
+            await self?.refreshNewerTimelineForSelection()
+        }
+    }
+
+    private func refreshNewerTimelineForSelection() async {
+        guard !isRefreshing,
+              let selectedEntityID,
+              let entity = entities.first(where: { $0.id == selectedEntityID })
+        else {
+            return
+        }
+
+        let accountKeys = Set(entity.accountKeys)
+        guard !accountKeys.isEmpty else {
+            loadNewerTimelineIfNeeded()
+            return
+        }
+
+        let workspaceSnapshot = workspace
+        let searchQuerySnapshot = searchQuery
+        isRefreshing = true
+        isLoadingNewerTimeline = true
+        refreshActivity = MailiaRefreshProgress(
+            phase: .downloading,
+            title: "Checking for new messages",
+            detail: entity.displayName,
+            fraction: nil
+        )
+        refreshStatus = "Checking for new messages..."
+
+        do {
+            let snapshot = try await provider.refreshNewerTimelineMessages(
+                accountKeys: accountKeys,
+                workspace: workspaceSnapshot,
+                searchQuery: searchQuerySnapshot
+            )
+            guard self.selectedEntityID == selectedEntityID,
+                  workspace == workspaceSnapshot,
+                  searchQuery == searchQuerySnapshot
+            else {
+                isRefreshing = false
+                isLoadingNewerTimeline = false
+                refreshActivity = nil
+                return
+            }
+
+            isRefreshing = false
+            isLoadingNewerTimeline = false
+            refreshActivity = nil
+            applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+            refreshSelectedTimelineIncrementally()
+            refreshStatus = "Checked for new messages"
+        } catch is CancellationError {
+            isRefreshing = false
+            isLoadingNewerTimeline = false
+            refreshActivity = nil
+        } catch {
+            isRefreshing = false
+            isLoadingNewerTimeline = false
+            refreshActivity = nil
+            refreshStatus = "Unable to check new messages: \(error.localizedDescription)"
+            NSLog("Unable to refresh newer timeline messages: \(error.localizedDescription)")
+        }
+    }
+
     func loadBodyIfNeeded(for item: MailiaTimelineItem, priority requestedPriority: Int? = nil) {
-        guard timeline.contains(where: { $0.id == item.id }) else { return }
-        rememberBodyAccess(item.id)
-        if let cachedState = timelineBodyStateCache[item.id] {
-            rememberTimelineBodyStateCacheAccess(item.id)
-            timelineBodyStates[item.id] = cachedState
-            return
-        }
-        switch timelineBodyStates[item.id] ?? .notRequested {
-        case .notRequested:
-            break
-        case .loading:
-            reprioritizeBodyLoadIfNeeded(for: item, requestedPriority: requestedPriority)
-            return
-        case .loaded, .failed:
-            return
-        }
-
-        if pendingBodyLoads[item.id] != nil || inFlightBodyLoads.contains(item.id) {
-            reprioritizeBodyLoadIfNeeded(for: item, requestedPriority: requestedPriority)
-            return
-        }
-
-        enqueueBodyLoad(item, requestedPriority: requestedPriority)
-        startPendingBodyLoads()
+        bodyLoadQueue.loadIfNeeded(for: item, priority: requestedPriority)
     }
 
     private func loadTimelinePage(direction: MailiaTimelinePageDirection, anchorID: Int64, preserveAnchorID: Int64) {
@@ -1160,19 +1621,6 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func presentation(for action: MailiaEntityAction, workspace: MailiaWorkspace) -> EntityActionPresentation {
-        let hidesEntity: Bool
-        switch action {
-        case .moveToInbox, .moveToJunk, .moveToTrash:
-            hidesEntity = true
-        case .flagImportant:
-            hidesEntity = false
-        case .removeFlag:
-            hidesEntity = workspace == .flagged
-        }
-        return EntityActionPresentation(hidesEntityInCurrentWorkspace: hidesEntity)
-    }
-
     private func optimisticallyHideEntity(_ entityID: Int64) {
         optimisticHiddenEntityIDs.insert(entityID)
         invalidateTimelineCache(entityID: entityID)
@@ -1212,17 +1660,45 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
-    private func applyAccountEmojisToTimeline() {
-        let emojiByAccount: [String: String] = Dictionary(
+    private func applyAccountVisualsToTimeline() {
+        let userEmojiByAccount: [String: String] = Dictionary(
             uniqueKeysWithValues: sendAccounts.compactMap { account -> (String, String)? in
-                guard let emoji = account.emoji?.nilIfBlank else { return nil }
+                guard let emoji = MailiaSendAccount.normalizedEmoji(account.emoji) else { return nil }
                 return (account.id, emoji)
             }
         )
-        guard !emojiByAccount.isEmpty || timeline.contains(where: { $0.accountEmoji != nil }) else { return }
+        let avatarByAccount: [String: String] = Dictionary(
+            uniqueKeysWithValues: sendAccounts.compactMap { account -> (String, String)? in
+                guard MailiaSendAccount.normalizedEmoji(account.emoji) == nil,
+                      let avatarImageDataURL = account.avatarImageDataURL?.nilIfBlank
+                else {
+                    return nil
+                }
+                return (account.id, avatarImageDataURL)
+            }
+        )
+        let fallbackEmojiByAccount: [String: String] = Dictionary(
+            uniqueKeysWithValues: sendAccounts.compactMap { account -> (String, String)? in
+                guard userEmojiByAccount[account.id] == nil,
+                      avatarByAccount[account.id] == nil
+                else {
+                    return nil
+                }
+                return (account.id, AccountEmojiFallback.emoji(for: account.id, in: sendAccounts))
+            }
+        )
+        guard !userEmojiByAccount.isEmpty
+            || !avatarByAccount.isEmpty
+            || !fallbackEmojiByAccount.isEmpty
+            || timeline.contains(where: { $0.accountEmoji != nil || $0.accountAvatarImageDataURL != nil })
+        else {
+            return
+        }
 
         timeline = timeline.map { item in
-            MailiaTimelineItem(
+            let emoji = userEmojiByAccount[item.accountLabel] ?? fallbackEmojiByAccount[item.accountLabel]
+            let avatar = userEmojiByAccount[item.accountLabel] == nil ? avatarByAccount[item.accountLabel] : nil
+            return MailiaTimelineItem(
                 id: item.id,
                 entityID: item.entityID,
                 direction: item.direction,
@@ -1231,7 +1707,8 @@ final class AppViewModel: ObservableObject {
                 html: item.html,
                 date: item.date,
                 accountLabel: item.accountLabel,
-                accountEmoji: emojiByAccount[item.accountLabel],
+                accountEmoji: emoji,
+                accountAvatarImageDataURL: avatar,
                 folderLabel: item.folderLabel,
                 envelopeID: item.envelopeID,
                 isFlagged: item.isFlagged,
@@ -1243,7 +1720,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func applySnapshot(_ snapshot: MailiaSnapshot, reloadTimelineIfSelectionKept: Bool) {
-        sendAccounts = snapshot.sendAccounts
+        applySendAccounts(snapshot.sendAccounts)
         if let selectedSendAccountKey,
            !snapshot.sendAccounts.contains(where: { $0.id == selectedSendAccountKey }) {
             self.selectedSendAccountKey = nil
@@ -1274,6 +1751,108 @@ final class AppViewModel: ObservableObject {
             scheduleMarkSelectedEntityReadIfNeeded()
         }
         hydrateCachedAvatarImagesThenResolve()
+    }
+
+    private func applySendAccounts(_ accounts: [MailiaSendAccount]) {
+        sendAccounts = mergeExistingAccountAvatarImages(into: accounts)
+        cancelAccountAvatarTasksNoLongerNeeded()
+        applyAccountVisualsToTimeline()
+        hydrateAccountAvatarImagesIfNeeded()
+    }
+
+    private func mergeExistingAccountAvatarImages(into accounts: [MailiaSendAccount]) -> [MailiaSendAccount] {
+        let existingByID = Dictionary(uniqueKeysWithValues: sendAccounts.map { ($0.id, $0) })
+        return accounts.map { account in
+            guard MailiaSendAccount.normalizedEmoji(account.emoji) == nil,
+                  let existing = existingByID[account.id],
+                  existing.emailAddress == account.emailAddress,
+                  let avatarImageDataURL = existing.avatarImageDataURL?.nilIfBlank
+            else {
+                return accountWithAvatar(account, avatarImageDataURL: nil)
+            }
+
+            return accountWithAvatar(account, avatarImageDataURL: avatarImageDataURL)
+        }
+    }
+
+    private func hydrateAccountAvatarImagesIfNeeded() {
+        for account in sendAccounts {
+            guard MailiaSendAccount.normalizedEmoji(account.emoji) == nil,
+                  account.avatarImageDataURL?.nilIfBlank == nil,
+                  let emailAddress = account.emailAddress?.nilIfBlank,
+                  accountAvatarResolutionTasks[account.id] == nil
+            else {
+                continue
+            }
+
+            accountAvatarResolutionTasks[account.id] = Task { [weak self] in
+                guard let self else { return }
+                let cachedDataURL = await avatarResolver.cachedGravatarDataURL(forEmailAddress: emailAddress)
+                let dataURL: String?
+                if let cachedDataURL {
+                    dataURL = cachedDataURL
+                } else {
+                    dataURL = await avatarResolver.gravatarDataURL(forEmailAddress: emailAddress)
+                }
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    self.accountAvatarResolutionTasks[account.id] = nil
+                    guard let dataURL else { return }
+                    self.applyAccountAvatarDataURL(dataURL, accountID: account.id, emailAddress: emailAddress)
+                    self.applyAccountVisualsToTimeline()
+                }
+            }
+        }
+    }
+
+    private func cancelAccountAvatarTasksNoLongerNeeded() {
+        let accountsByID = Dictionary(uniqueKeysWithValues: sendAccounts.map { ($0.id, $0) })
+        for (accountID, task) in Array(accountAvatarResolutionTasks) {
+            guard let account = accountsByID[accountID],
+                  MailiaSendAccount.normalizedEmoji(account.emoji) == nil,
+                  account.avatarImageDataURL?.nilIfBlank == nil,
+                  account.emailAddress?.nilIfBlank != nil
+            else {
+                task.cancel()
+                accountAvatarResolutionTasks[accountID] = nil
+                continue
+            }
+        }
+    }
+
+    private func applyAccountAvatarDataURL(
+        _ dataURL: String,
+        accountID: String,
+        emailAddress: String
+    ) {
+        guard let index = sendAccounts.firstIndex(where: {
+            $0.id == accountID
+                && MailiaSendAccount.normalizedEmoji($0.emoji) == nil
+                && $0.emailAddress == emailAddress
+                && $0.avatarImageDataURL?.nilIfBlank == nil
+        }) else {
+            return
+        }
+
+        var updatedAccounts = sendAccounts
+        updatedAccounts[index] = accountWithAvatar(updatedAccounts[index], avatarImageDataURL: dataURL)
+        sendAccounts = updatedAccounts
+    }
+
+    private func accountWithAvatar(
+        _ account: MailiaSendAccount,
+        avatarImageDataURL: String?
+    ) -> MailiaSendAccount {
+        MailiaSendAccount(
+            id: account.id,
+            label: account.label,
+            emailAddress: account.emailAddress,
+            displayName: account.displayName,
+            isDefault: account.isDefault,
+            emoji: account.emoji,
+            avatarImageDataURL: avatarImageDataURL?.nilIfBlank
+        )
     }
 
     private func selectFirstEntityIfNeeded() {
@@ -1384,6 +1963,74 @@ final class AppViewModel: ObservableObject {
             }
         }
 
+        let candidates = entities.filter { entity in
+            entity.avatarImageDataURL == nil &&
+                (entity.primaryEmailAddress?.nilIfBlank != nil || !entity.emailAddresses.isEmpty)
+        }
+        guard !candidates.isEmpty else {
+            updateAvatarResolutionActivity()
+            return
+        }
+
+        let generation = requestGeneration
+        let resolver = avatarResolver
+        Task { [weak self] in
+            var cachedAvatars: [Int64: String] = [:]
+            var uncachedEntityIDs: Set<Int64> = []
+
+            for entity in candidates {
+                guard !Task.isCancelled else { return }
+                switch await resolver.cachedAvatarStatus(
+                    primaryEmailAddress: entity.primaryEmailAddress,
+                    emailAddresses: entity.emailAddresses
+                ) {
+                case .dataURL(let dataURL):
+                    cachedAvatars[entity.id] = dataURL
+                case .missing:
+                    continue
+                case nil:
+                    uncachedEntityIDs.insert(entity.id)
+                }
+            }
+
+            await MainActor.run {
+                guard let self,
+                      self.requestGeneration == generation,
+                      !Task.isCancelled
+                else {
+                    return
+                }
+
+                if !cachedAvatars.isEmpty {
+                    self.entities = self.entities.map { entity in
+                        guard entity.avatarImageDataURL == nil,
+                              let dataURL = cachedAvatars[entity.id]
+                        else {
+                            return entity
+                        }
+                        var updated = entity
+                        updated.avatarImageDataURL = dataURL
+                        return updated
+                    }
+                }
+
+                let uncachedEntities = self.entities.filter { entity in
+                    uncachedEntityIDs.contains(entity.id)
+                }
+                self.enqueueAvatarResolutionTasksIfNeeded(
+                    for: uncachedEntities,
+                    source: source,
+                    priority: requestedPriority
+                )
+            }
+        }
+    }
+
+    private func enqueueAvatarResolutionTasksIfNeeded(
+        for entities: [MailiaEntitySummary],
+        source: String? = nil,
+        priority requestedPriority: AvatarResolutionPriority? = nil
+    ) {
         var currentBatchID: Int?
         for entity in entities {
             let isSelectedEntity = entity.id == selectedEntityID
@@ -1392,14 +2039,9 @@ final class AppViewModel: ObservableObject {
 
             if isSelectedEntity, let existingTask = avatarResolutionTasks[entity.id] {
                 let info = avatarResolutionTaskInfo[entity.id]
-                let age = info.map { String(format: "%.2fs", Date().timeIntervalSince($0.startedAt)) } ?? "unknown"
-                logAvatar(
-                    "[MailiaAvatar] entity=\(entity.id) name=\(entity.displayName) selected blocked by existing task source=\(info?.source ?? "unknown") age=\(age) primary=\(info?.primaryEmailAddress ?? "nil") emails=\(info?.emailAddresses ?? [])"
-                )
                 if info?.source != "selected" {
                     existingTask.cancel()
                     finishAvatarResolutionTask(entityID: entity.id, outcome: .canceled)
-                    logAvatar("[MailiaAvatar] entity=\(entity.id) name=\(entity.displayName) cancel existing lower-priority avatar task")
                 }
             }
 
@@ -1407,11 +2049,6 @@ final class AppViewModel: ObservableObject {
                   avatarResolutionTasks[entity.id] == nil,
                   entity.primaryEmailAddress?.nilIfBlank != nil || !entity.emailAddresses.isEmpty
             else {
-                if isSelectedEntity {
-                    logAvatar(
-                        "[MailiaAvatar] entity=\(entity.id) name=\(entity.displayName) skip hasAvatar=\(entity.avatarImageDataURL != nil) inFlight=\(avatarResolutionTasks[entity.id] != nil) primary=\(entity.primaryEmailAddress ?? "nil") emails=\(entity.emailAddresses)"
-                    )
-                }
                 continue
             }
 
@@ -1436,14 +2073,6 @@ final class AppViewModel: ObservableObject {
                 continue
             }
 
-            let debugLabel = isSelectedEntity
-                ? "entity=\(entity.id) name=\(entity.displayName)"
-                : nil
-            if let debugLabel {
-                logAvatar(
-                    "[MailiaAvatar] \(debugLabel) start primary=\(entity.primaryEmailAddress ?? "nil") emails=\(entity.emailAddresses)"
-                )
-            }
             let batchID: Int
             if let currentBatchID {
                 batchID = currentBatchID
@@ -1543,21 +2172,16 @@ final class AppViewModel: ObservableObject {
 
     private func startAvatarResolutionTask(_ request: PendingAvatarResolutionRequest) {
         let entity = request.entity
-        let debugLabel = request.priority == .selected
-            ? "entity=\(entity.id) name=\(entity.displayName)"
-            : nil
-        let forceRefresh = request.priority == .selected
+        let forceRefresh = false
         avatarResolutionTasks[entity.id] = Task { [weak self] in
             guard let self else { return }
             let result = await self.avatarDataURLWithTimeout(
-                entityID: entity.id,
                 primaryEmailAddress: entity.primaryEmailAddress,
                 emailAddresses: entity.emailAddresses,
-                debugLabel: debugLabel,
                 forceRefresh: forceRefresh,
                 lateResult: { [weak self] dataURL in
                     guard let self, let dataURL else { return }
-                    self.applyAvatarDataURL(dataURL, for: entity, debugLabel: debugLabel)
+                    self.applyAvatarDataURL(dataURL, for: entity)
                 }
             )
             guard !Task.isCancelled else { return }
@@ -1582,11 +2206,8 @@ final class AppViewModel: ObservableObject {
                     outcome: outcome
                 )
                 guard let dataURL,
-                      self.applyAvatarDataURL(dataURL, for: entity, debugLabel: debugLabel)
+                      self.applyAvatarDataURL(dataURL, for: entity)
                 else {
-                    if let debugLabel, outcome != .timedOut {
-                        self.logAvatar("[MailiaAvatar] \(debugLabel) finished without UI update dataURL=\(dataURL != nil)")
-                    }
                     self.drainAvatarResolutionQueue()
                     return
                 }
@@ -1599,8 +2220,7 @@ final class AppViewModel: ObservableObject {
     @discardableResult
     private func applyAvatarDataURL(
         _ dataURL: String,
-        for entity: MailiaEntitySummary,
-        debugLabel: String?
+        for entity: MailiaEntitySummary
     ) -> Bool {
         guard let index = entities.firstIndex(where: {
             $0.id == entity.id && $0.avatarImageDataURL == nil
@@ -1611,9 +2231,6 @@ final class AppViewModel: ObservableObject {
         var updatedEntities = entities
         updatedEntities[index].avatarImageDataURL = dataURL
         entities = updatedEntities
-        if let debugLabel {
-            logAvatar("[MailiaAvatar] \(debugLabel) applied length=\(dataURL.count)")
-        }
         if let primaryEmailAddress = entity.primaryEmailAddress {
             applyRecipientSuggestionAvatar(dataURL, forEmail: primaryEmailAddress)
         }
@@ -1641,10 +2258,6 @@ final class AppViewModel: ObservableObject {
             batch.succeeded += 1
         case .failed:
             batch.failed += 1
-            let elapsed = String(format: "%.2fs", Date().timeIntervalSince(info.startedAt))
-            logAvatar(
-                "[MailiaAvatar] failed entity=\(entityID) name=\(info.displayName) source=\(info.source) age=\(elapsed) primary=\(info.primaryEmailAddress ?? "nil") emails=\(info.emailAddresses)"
-            )
         case .canceled:
             batch.canceled += 1
         case .timedOut:
@@ -1675,10 +2288,6 @@ final class AppViewModel: ObservableObject {
         )
     }
 
-    private func logAvatar(_ message: String) {
-        NSLog("%@", message)
-    }
-
     private func resolveSelectedEntityAvatarIfNeeded() {
         guard let selectedEntityID,
               let entity = entities.first(where: { $0.id == selectedEntityID })
@@ -1694,10 +2303,8 @@ final class AppViewModel: ObservableObject {
     }
 
     private func avatarDataURLWithTimeout(
-        entityID: Int64,
         primaryEmailAddress: String?,
         emailAddresses: [String],
-        debugLabel: String?,
         forceRefresh: Bool,
         lateResult: @escaping @MainActor (String?) -> Void
     ) async -> AvatarResolutionFetchResult {
@@ -1705,11 +2312,11 @@ final class AppViewModel: ObservableObject {
         let timeoutNanoseconds = avatarResolutionTimeoutNanoseconds
         return await withCheckedContinuation { continuation in
             var didResume = false
-            let resolverTask = Task {
+            _ = Task {
                 let dataURL = await resolver.avatarDataURL(
                     primaryEmailAddress: primaryEmailAddress,
                     emailAddresses: emailAddresses,
-                    debugLabel: debugLabel,
+                    debugLabel: nil,
                     forceRefresh: forceRefresh
                 )
                 await MainActor.run {
@@ -1731,11 +2338,6 @@ final class AppViewModel: ObservableObject {
                 await MainActor.run {
                     guard !didResume else { return }
                     didResume = true
-                    if let debugLabel {
-                        NSLog("%@", "[MailiaAvatar] \(debugLabel) timeout entity=\(entityID) seconds=12")
-                    } else {
-                        NSLog("%@", "[MailiaAvatar] timeout entity=\(entityID) seconds=12")
-                    }
                     continuation.resume(returning: .timedOut)
                 }
             }
@@ -1782,9 +2384,11 @@ final class AppViewModel: ObservableObject {
                 publishTimelineScrollAnchor(id: preserveAnchorID, edge: .bottom)
             }
         }
+        applyAccountVisualsToTimeline()
         if let selectedEntityID {
             cacheTimelinePage(
-                key: MailiaTimelineCacheKey(workspace: workspace, entityID: selectedEntityID),
+                workspace: workspace,
+                entityID: selectedEntityID,
                 items: timeline,
                 hasOlderTimeline: hasOlderTimeline,
                 hasNewerTimeline: hasNewerTimeline
@@ -1813,18 +2417,12 @@ final class AppViewModel: ObservableObject {
 
     private func resetTimelineWindowState() {
         cancelTimelinePageTasks()
-        cancelBodyLoadTasks()
+        bodyLoadQueue.reset()
         hasOlderTimeline = false
         hasNewerTimeline = false
         isLoadingOlderTimeline = false
         isLoadingNewerTimeline = false
-        pendingBodyLoads = [:]
-        pendingBodyLoadOrder = []
-        pendingBodyLoadPriorities = [:]
-        inFlightBodyLoads = []
-        inFlightBodyLoadPriorities = [:]
-        bodyLoadTokens = [:]
-        bodyAccessOrder = []
+        timelineWindowStore.resetWindowState()
         timelineScrollAnchor = nil
     }
 
@@ -1836,243 +2434,88 @@ final class AppViewModel: ObservableObject {
     }
 
     private func cancelBodyLoadTasks() {
-        for task in bodyLoadTasks.values {
-            task.cancel()
-        }
-        bodyLoadTasks.removeAll()
-        inFlightBodyLoads.removeAll()
-        inFlightBodyLoadPriorities.removeAll()
-        bodyLoadTokens.removeAll()
+        bodyLoadQueue.cancelAll()
     }
 
-    private func publishTimelineScrollAnchor(id: Int64, edge: MailiaTimelineScrollAnchor.Edge) {
-        scrollAnchorGeneration += 1
-        timelineScrollAnchor = MailiaTimelineScrollAnchor(
-            id: id,
-            edge: edge,
-            generation: scrollAnchorGeneration
+    private func clearInMemoryBodyCache() {
+        cancelBodyLoadTasks()
+        timelineBodyStates = timelineWindowStore.clearBodyCache(timeline: timeline)
+    }
+
+    private func clearInMemoryAvatars() {
+        avatarCacheHydrationTask?.cancel()
+        for task in avatarResolutionTasks.values {
+            task.cancel()
+        }
+        for task in accountAvatarResolutionTasks.values {
+            task.cancel()
+        }
+        for task in suggestionAvatarResolutionTasks.values {
+            task.cancel()
+        }
+        avatarResolutionTasks.removeAll()
+        accountAvatarResolutionTasks.removeAll()
+        suggestionAvatarResolutionTasks.removeAll()
+        avatarResolutionTaskInfo.removeAll()
+        avatarResolutionBatches.removeAll()
+        pendingAvatarResolutionRequests.removeAll()
+        entities = entities.map { entity in
+            var updated = entity
+            updated.avatarImageDataURL = nil
+            return updated
+        }
+        sendAccounts = sendAccounts.map { account in
+            accountWithAvatar(account, avatarImageDataURL: nil)
+        }
+        applyAccountVisualsToTimeline()
+    }
+
+    private func messageBodyCacheSummary() async throws -> MailiaCacheSummary {
+        let stats = try await provider.messageBodyCacheStats()
+        return MailiaCacheSummary(
+            kind: .messageBodies,
+            itemCount: stats.itemCount,
+            byteSize: stats.byteSize
         )
     }
 
-    private func startPendingBodyLoads() {
-        while inFlightBodyLoads.count < maxConcurrentBodyLoads {
-            guard let nextID = nextPendingBodyLoadID(),
-                  let item = pendingBodyLoads.removeValue(forKey: nextID) else {
-                pendingBodyLoadOrder.removeAll()
-                return
-            }
-            let priority = pendingBodyLoadPriorities.removeValue(forKey: nextID) ?? 0
-            pendingBodyLoadOrder.removeAll { $0 == nextID }
-            guard timeline.contains(where: { $0.id == item.id }) else {
-                timelineBodyStates[item.id] = nil
-                continue
-            }
-            startBodyLoad(for: item, priority: priority)
-        }
-    }
-
-    private func enqueueBodyLoad(_ item: MailiaTimelineItem, requestedPriority: Int?) {
-        let priority = nextBodyLoadPriorityValue(requestedPriority: requestedPriority)
-        pendingBodyLoads[item.id] = item
-        pendingBodyLoadPriorities[item.id] = priority
-        pendingBodyLoadOrder.removeAll { $0 == item.id }
-        pendingBodyLoadOrder.append(item.id)
-        preemptOlderBodyLoadIfNeeded(forPriority: priority)
-    }
-
-    private func reprioritizePendingBodyLoad(for item: MailiaTimelineItem, requestedPriority: Int?) {
-        let priority = nextBodyLoadPriorityValue(requestedPriority: requestedPriority)
-        pendingBodyLoads[item.id] = item
-        pendingBodyLoadPriorities[item.id] = priority
-        pendingBodyLoadOrder.removeAll { $0 == item.id }
-        pendingBodyLoadOrder.append(item.id)
-        preemptOlderBodyLoadIfNeeded(forPriority: priority)
-    }
-
-    private func reprioritizeBodyLoadIfNeeded(for item: MailiaTimelineItem, requestedPriority: Int?) {
-        if pendingBodyLoads[item.id] != nil {
-            reprioritizePendingBodyLoad(for: item, requestedPriority: requestedPriority)
-            startPendingBodyLoads()
-        }
-    }
-
-    private func nextBodyLoadPriorityValue(requestedPriority: Int?) -> Int {
-        if let requestedPriority {
-            nextBodyLoadPriority = max(nextBodyLoadPriority, requestedPriority)
-            return requestedPriority
-        }
-        nextBodyLoadPriority += 1
-        return nextBodyLoadPriority
-    }
-
-    private func nextPendingBodyLoadID() -> Int64? {
-        pendingBodyLoadOrder
-            .filter { pendingBodyLoads[$0] != nil }
-            .max {
-                (pendingBodyLoadPriorities[$0] ?? 0) < (pendingBodyLoadPriorities[$1] ?? 0)
-            }
-    }
-
-    private func preemptOlderBodyLoadIfNeeded(forPriority priority: Int) {
-        guard inFlightBodyLoads.count >= maxConcurrentBodyLoads,
-              let preemptedID = inFlightBodyLoads.min(by: {
-                  (inFlightBodyLoadPriorities[$0] ?? 0) < (inFlightBodyLoadPriorities[$1] ?? 0)
-              }),
-              (inFlightBodyLoadPriorities[preemptedID] ?? 0) < priority
-        else {
-            return
-        }
-
-        bodyLoadTasks[preemptedID]?.cancel()
-        bodyLoadTasks[preemptedID] = nil
-        inFlightBodyLoads.remove(preemptedID)
-        let preemptedPriority = inFlightBodyLoadPriorities[preemptedID] ?? 0
-        inFlightBodyLoadPriorities[preemptedID] = nil
-        bodyLoadTokens[preemptedID] = nil
-        if let item = timeline.first(where: { $0.id == preemptedID }),
-           pendingBodyLoads[preemptedID] == nil {
-            pendingBodyLoads[preemptedID] = item
-            pendingBodyLoadPriorities[preemptedID] = preemptedPriority
-            pendingBodyLoadOrder.removeAll { $0 == preemptedID }
-            pendingBodyLoadOrder.append(preemptedID)
-        }
-    }
-
-    private func startBodyLoad(for item: MailiaTimelineItem, priority: Int) {
-        let generation = timelineGeneration
-        nextBodyLoadToken += 1
-        let token = nextBodyLoadToken
-        bodyLoadTokens[item.id] = token
-        inFlightBodyLoads.insert(item.id)
-        inFlightBodyLoadPriorities[item.id] = priority
-        timelineBodyStates[item.id] = .loading
-
-        bodyLoadTasks[item.id]?.cancel()
-        bodyLoadTasks[item.id] = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let body = try await provider.loadBody(for: item)
-                if generation == timelineGeneration,
-                   bodyLoadTokens[item.id] == token,
-                   timeline.contains(where: { $0.id == item.id }) {
-                    timelineBodyStateCache[item.id] = .loaded(body)
-                    rememberTimelineBodyStateCacheAccess(item.id)
-                    timelineBodyStates[item.id] = .loaded(body)
-                    rememberBodyAccess(item.id)
-                }
-            } catch is CancellationError {
-                if generation == timelineGeneration,
-                   bodyLoadTokens[item.id] == token {
-                    timelineBodyStates[item.id] = .notRequested
-                }
-            } catch {
-                if generation == timelineGeneration,
-                   bodyLoadTokens[item.id] == token,
-                   timeline.contains(where: { $0.id == item.id }) {
-                    timelineBodyStateCache[item.id] = .failed(error.localizedDescription)
-                    rememberTimelineBodyStateCacheAccess(item.id)
-                    timelineBodyStates[item.id] = .failed(error.localizedDescription)
-                }
-            }
-            if generation == timelineGeneration,
-               bodyLoadTokens[item.id] == token {
-                inFlightBodyLoads.remove(item.id)
-                inFlightBodyLoadPriorities[item.id] = nil
-                bodyLoadTokens[item.id] = nil
-                bodyLoadTasks[item.id] = nil
-                trimBodyStateWindow()
-                startPendingBodyLoads()
-            }
-        }
-    }
-
-    private func rememberBodyAccess(_ id: Int64) {
-        bodyAccessOrder.removeAll { $0 == id }
-        bodyAccessOrder.append(id)
+    private func publishTimelineScrollAnchor(id: Int64, edge: MailiaTimelineScrollAnchor.Edge) {
+        timelineScrollAnchor = timelineWindowStore.publishScrollAnchor(id: id, edge: edge)
     }
 
     private func cachedBodyStates(for items: [MailiaTimelineItem]) -> [Int64: MailiaTimelineBodyState] {
-        var states: [Int64: MailiaTimelineBodyState] = [:]
-        for item in items {
-            if let current = timelineBodyStates[item.id], current != .notRequested {
-                states[item.id] = current
-            } else if let cached = timelineBodyStateCache[item.id] {
-                states[item.id] = cached
-                rememberTimelineBodyStateCacheAccess(item.id)
-            }
-        }
-        return states
+        timelineWindowStore.cachedBodyStates(for: items, currentStates: timelineBodyStates)
     }
 
     private func cacheTimelinePage(
-        key: MailiaTimelineCacheKey,
+        workspace: MailiaWorkspace,
+        entityID: Int64,
         items: [MailiaTimelineItem],
         hasOlderTimeline: Bool,
         hasNewerTimeline: Bool
     ) {
-        timelinePageCache[key] = MailiaTimelineCacheEntry(
+        timelineWindowStore.cachePage(
+            workspace: workspace,
+            entityID: entityID,
             items: items,
             hasOlderTimeline: hasOlderTimeline,
             hasNewerTimeline: hasNewerTimeline
         )
-        rememberTimelinePageCacheAccess(key)
-        while timelinePageCacheAccessOrder.count > maxCachedTimelinePages,
-              let oldestKey = timelinePageCacheAccessOrder.first {
-            timelinePageCache[oldestKey] = nil
-            timelinePageCacheAccessOrder.removeFirst()
-        }
-    }
-
-    private func rememberTimelinePageCacheAccess(_ key: MailiaTimelineCacheKey) {
-        timelinePageCacheAccessOrder.removeAll { $0 == key }
-        timelinePageCacheAccessOrder.append(key)
     }
 
     private func invalidateTimelineCache(entityID: Int64) {
-        for key in timelinePageCache.keys where key.entityID == entityID {
-            timelinePageCache[key] = nil
-        }
-        timelinePageCacheAccessOrder.removeAll { $0.entityID == entityID }
-    }
-
-    private func rememberTimelineBodyStateCacheAccess(_ id: Int64) {
-        timelineBodyStateCacheAccessOrder.removeAll { $0 == id }
-        timelineBodyStateCacheAccessOrder.append(id)
-        while timelineBodyStateCacheAccessOrder.count > maxCachedBodyStates,
-              let oldestID = timelineBodyStateCacheAccessOrder.first {
-            timelineBodyStateCache[oldestID] = nil
-            timelineBodyStateCacheAccessOrder.removeFirst()
-        }
+        timelineWindowStore.invalidateTimelineCache(entityID: entityID)
     }
 
     private func trimBodyStateWindow() {
+        let removedIDs = timelineWindowStore.trimBodyStateWindow(
+            timeline: timeline,
+            bodyStates: &timelineBodyStates
+        )
+        bodyLoadQueue.cancelLoads(ids: removedIDs)
         let visibleIDs = Set(timeline.map(\.id))
-        for id in timelineBodyStates.keys where !visibleIDs.contains(id) {
-            timelineBodyStates[id] = nil
-            pendingBodyLoads[id] = nil
-            pendingBodyLoadPriorities[id] = nil
-            bodyLoadTasks[id]?.cancel()
-            bodyLoadTasks[id] = nil
-            inFlightBodyLoads.remove(id)
-            inFlightBodyLoadPriorities[id] = nil
-            bodyLoadTokens[id] = nil
-        }
-        pendingBodyLoadOrder.removeAll { pendingBodyLoads[$0] == nil }
-        bodyAccessOrder.removeAll { !visibleIDs.contains($0) }
         for id in attachmentDownloadStates.keys where !visibleIDs.contains(id) {
             attachmentDownloadStates[id] = nil
-        }
-
-        var loadedIDs = bodyAccessOrder.filter { id in
-            if case .loaded = timelineBodyStates[id] {
-                return true
-            }
-            return false
-        }
-        while loadedIDs.count > maxLoadedBodyStates, let id = loadedIDs.first {
-            timelineBodyStates[id] = .notRequested
-            bodyAccessOrder.removeAll { $0 == id }
-            loadedIDs.removeFirst()
         }
     }
 
@@ -2084,918 +2527,109 @@ final class AppViewModel: ObservableObject {
     }()
 }
 
-@MainActor
-struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
-    private let databaseQueue: DatabaseQueue
-    private let repository: MailRepository
-    private let syncService: SyncService
-    private let bridge: any HimalayaBridge
-    private let himalayaConfigStore: HimalayaConfigStore
-    private let himalayaCommandLimiter: HimalayaCommandLimiter
-    private let downloadsDirectory: URL
-    private let revealDownloadedFiles: @MainActor ([URL], URL) -> Void
-    private let htmlDisplayNormalizer = HTMLDisplayNormalizer()
-    private let messageTextNormalizer = MessageTextNormalizer()
-
-    init() {
-        do {
-            let environment = try MailiaEnvironment.live()
-            let databaseQueue = try environment.openDatabase()
-            self.init(
-                databaseQueue: databaseQueue,
-                bridge: environment.himalayaBridge,
-                downloadsDirectory: environment.downloadsDirectory
-            )
-        } catch {
-            let databaseQueue = try! DatabaseQueue()
-            try! DatabaseMigratorFactory.makeMigrator().migrate(databaseQueue)
-            self.init(
-                databaseQueue: databaseQueue,
-                bridge: ProcessHimalayaBridge(),
-                downloadsDirectory: Self.defaultDownloadsDirectory()
-            )
-        }
+extension AppViewModel: TimelineBodyLoadQueueDelegate {
+    var currentTimelineGeneration: Int {
+        timelineGeneration
     }
 
-    init(
-        databaseQueue: DatabaseQueue,
-        bridge: any HimalayaBridge,
-        downloadsDirectory: URL,
-        policy: SyncPolicy = SyncPolicy(),
-        himalayaCommandLimiter: HimalayaCommandLimiter? = nil,
-        himalayaConfigStore: HimalayaConfigStore = HimalayaConfigStore(),
-        revealDownloadedFiles: @MainActor @escaping ([URL], URL) -> Void = Self.revealInFinder
-    ) {
-        let commandLimiter = himalayaCommandLimiter
-            ?? HimalayaCommandLimiter(maxConcurrentCommands: policy.maxConcurrentHimalayaProcesses)
-        self.databaseQueue = databaseQueue
-        self.repository = MailRepository(databaseQueue: databaseQueue)
-        self.bridge = bridge
-        self.himalayaConfigStore = himalayaConfigStore
-        self.himalayaCommandLimiter = commandLimiter
-        self.downloadsDirectory = downloadsDirectory
-        self.revealDownloadedFiles = revealDownloadedFiles
-        self.syncService = SyncService(
-            bridge: bridge,
-            databaseQueue: databaseQueue,
-            policy: policy,
-            himalayaCommandLimiter: commandLimiter
-        )
+    func timelineContainsItem(id: Int64) -> Bool {
+        timeline.contains { $0.id == id }
     }
 
-    func loadSnapshot(workspace: MailiaWorkspace, searchQuery: String) async throws -> MailiaSnapshot {
-        let entities = try repository.entityList(workspace: workspace.coreWorkspace)
-        let sendAccounts = try await loadSendAccounts()
-        return MailiaSnapshot(
-            entities: filterAndMap(entities, workspace: workspace, searchQuery: searchQuery),
-            sendAccounts: sendAccounts,
-            loadedAt: Date()
-        )
+    func timelineItem(id: Int64) -> MailiaTimelineItem? {
+        timeline.first { $0.id == id }
     }
 
-    func recipientSuggestions() async throws -> [MailiaRecipientSuggestion] {
-        let limit = 1_000
-        let entities = try repository.entityList(workspace: .main)
-            + repository.entityList(workspace: .junk)
-
-        var seen = Set<String>()
-        var suggestions: [MailiaRecipientSuggestion] = []
-        suggestions.reserveCapacity(min(limit, entities.count))
-
-        for entity in entities {
-            let displayName = entity.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let addresses = ([entity.primaryEmailAddress].compactMap { $0 } + entity.emailAddresses)
-            for address in addresses {
-                let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
-                let normalized = trimmed.lowercased()
-                guard !trimmed.isEmpty,
-                      !Self.isNonReplyableAddress(trimmed),
-                      seen.insert(normalized).inserted
-                else { continue }
-                suggestions.append(
-                    MailiaRecipientSuggestion(
-                        id: normalized,
-                        name: displayName.isEmpty ? trimmed : displayName,
-                        email: trimmed,
-                        entityID: entity.id,
-                        avatarImageDataURL: nil
-                    )
-                )
-                if suggestions.count >= limit { return suggestions }
-            }
-        }
-
-        let sendAccounts = try await loadSendAccounts()
-        for account in sendAccounts {
-            guard suggestions.count < limit,
-                  let email = account.emailAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !email.isEmpty
-            else { continue }
-
-            let normalized = email.lowercased()
-            guard !Self.isNonReplyableAddress(email),
-                  seen.insert(normalized).inserted
-            else { continue }
-
-            let displayName = account.displayName?.nilIfBlank ?? account.label
-            suggestions.append(
-                MailiaRecipientSuggestion(
-                    id: normalized,
-                    name: displayName,
-                    email: email,
-                    entityID: Self.syntheticEntityID(forNormalizedEmail: normalized),
-                    avatarImageDataURL: nil
-                )
-            )
-        }
-
-        return suggestions
+    func bodyState(id: Int64) -> MailiaTimelineBodyState? {
+        timelineBodyStates[id]
     }
 
-    private static func syntheticEntityID(forNormalizedEmail email: String) -> Int64 {
-        Int64(truncatingIfNeeded: email.unicodeScalars.reduce(5381) { partial, scalar in
-            (partial &* 33) &+ Int(scalar.value)
-        })
+    func setBodyState(_ state: MailiaTimelineBodyState?, id: Int64) {
+        timelineBodyStates[id] = state
     }
 
-    /// Heuristically detects machine-only mailboxes (no-reply / notifications / system senders)
-    /// that should never appear as compose suggestions.
-    private static func isNonReplyableAddress(_ address: String) -> Bool {
-        let localPart = address.split(separator: "@").first.map(String.init)?.lowercased()
-            ?? address.lowercased()
-        // Collapse separators so "no-reply", "no_reply", "no.reply" all match "noreply".
-        let collapsed = localPart.filter { $0.isLetter || $0.isNumber }
-        let blockedSubstrings = [
-            "noreply",
-            "donotreply",
-            "notification",
-            "notifications",
-            "mailerdaemon",
-            "postmaster",
-            "automailer",
-            "autoreply"
-        ]
-        return blockedSubstrings.contains { collapsed.contains($0) }
+    func cachedBodyState(id: Int64) -> MailiaTimelineBodyState? {
+        timelineWindowStore.cachedBodyState(for: id)
     }
 
-    private func fetchSendAccounts() async throws -> [MailiaSendAccount] {
-        let existingAccounts = try repository.accounts()
-        do {
-            _ = try await syncService.discoverAccounts(timeout: 15)
-        } catch {
-            guard !existingAccounts.isEmpty else { throw error }
-            NSLog("Unable to refresh configured accounts: \(error.localizedDescription)")
-        }
-        let storedAccounts = try repository.accounts()
-        return storedAccounts.map(MailiaSendAccount.init).sorted { lhs, rhs in
-            if lhs.isDefault != rhs.isDefault {
-                return lhs.isDefault
-            }
-            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
-        }
+    func cacheBodyState(_ state: MailiaTimelineBodyState, id: Int64) {
+        timelineWindowStore.cacheBodyState(state, for: id)
     }
 
-    func loadSendAccounts() async throws -> [MailiaSendAccount] {
-        try await fetchSendAccounts()
+    func rememberBodyAccess(id: Int64) {
+        timelineWindowStore.rememberBodyAccess(id)
     }
 
-    func updateAccountSettings(_ updates: [MailiaAccountSettingsUpdate]) async throws {
-        guard !updates.isEmpty else { return }
-
-        for update in updates {
-            if let displayName = update.displayName {
-                try himalayaConfigStore.setAccountDisplayName(
-                    accountKey: update.accountKey,
-                    displayName: displayName.nilIfBlank
-                )
-            }
-
-            if let emoji = update.emoji {
-                try repository.updateAccountEmoji(
-                    accountKey: update.accountKey,
-                    emoji: MailiaSendAccount.normalizedEmoji(emoji)
-                )
-            }
-        }
-
-        if let defaultAccountKey = updates.first(where: { $0.isDefault == true })?.accountKey {
-            try himalayaConfigStore.setDefaultAccount(accountKey: defaultAccountKey)
-        }
-
-        _ = try await syncService.discoverAccounts(timeout: 15)
-    }
-
-    func refresh(
-        workspace: MailiaWorkspace,
-        searchQuery: String,
-        progress: @escaping @MainActor (MailiaRefreshProgress) -> Void
-    ) async throws -> MailiaSnapshot {
-        progress(MailiaRefreshProgress(
-            phase: .discovering,
-            title: "Discovering mailboxes",
-            detail: nil,
-            fraction: nil
-        ))
-        _ = try await syncService.discoverFoldersForDiscoveredAccounts(timeout: 45)
-
-        let aggregator = RefreshProgressAggregator()
-        let report: @Sendable (SyncWorkspaceProgress) -> Void = { workspaceProgress in
-            Task { @MainActor in
-                progress(await aggregator.update(workspaceProgress))
-            }
-        }
-
-        async let mainSync: Int = syncService.syncWorkspace(.main, timeout: 45, onProgress: report)
-        async let junkSync: Int = syncService.syncWorkspace(.junk, timeout: 45, onProgress: report)
-        _ = try await (mainSync, junkSync)
-
-        progress(MailiaRefreshProgress(
-            phase: .finishing,
-            title: "Updating",
-            detail: nil,
-            fraction: nil
-        ))
-        return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
-    }
-
-    func loadTimelinePage(
-        entityID: Int64,
-        workspace: MailiaWorkspace,
-        direction: MailiaTimelinePageDirection,
-        anchorID: Int64?,
-        limit: Int
-    ) async throws -> MailiaTimelinePage {
-        let fetchLimit = limit + 1
-        let messages = try repository.messages(
-            entityID: entityID,
-            workspace: workspace.coreWorkspace,
-            includeBodies: false,
-            limit: fetchLimit,
-            beforeMessageID: direction == .older ? anchorID : nil,
-            afterMessageID: direction == .newer ? anchorID : nil
-        )
-        let hasMore = messages.count > limit
-        let pageMessages: [TimelineMessage]
-        switch direction {
-        case .latest, .older:
-            pageMessages = hasMore ? Array(messages.suffix(limit)) : messages
-        case .newer:
-            pageMessages = hasMore ? Array(messages.prefix(limit)) : messages
-        }
-        let emojiByAccount: [String: String] = Dictionary(
-            uniqueKeysWithValues: try repository.accounts().compactMap { account -> (String, String)? in
-                guard let emoji = account.emoji?.nilIfBlank else { return nil }
-                return (account.accountKey, emoji)
-            }
-        )
-        let items = pageMessages.map { message in
-            makeTimelineItem(message: message, entityID: entityID, emojiByAccount: emojiByAccount)
-        }
-        return MailiaTimelinePage(items: items, hasMore: hasMore)
-    }
-
-    func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody {
-        if let cached = try repository.messageBody(messageID: item.id),
-           cached.sanitizedHTML?.nilIfBlank != nil || cached.textFallback?.nilIfBlank != nil {
-            return MailiaTimelineBody(
-                html: displayHTML(cached.sanitizedHTML),
-                text: cached.textFallback?.nilIfBlank
-            )
-        }
-
-        guard let folderName = item.folderLabel.nilIfBlank,
-              let envelopeID = item.envelopeID.nilIfBlank else {
-            return MailiaTimelineBody(html: nil, text: nil)
-        }
-
-        let body = try await fetchBody(
-            messageID: item.id,
-            accountKey: item.accountLabel,
-            folderName: folderName,
-            envelopeID: envelopeID
-        )
-        try repository.cacheMessageBody(
-            messageID: item.id,
-            sanitizedHTML: body.sanitizedHTML,
-            textFallback: body.textFallback,
-            sanitizerVersion: 2
-        )
-        return MailiaTimelineBody(
-            html: displayHTML(body.sanitizedHTML),
-            text: body.textFallback?.nilIfBlank
-        )
-    }
-
-    private enum EntityActionOperation: Sendable {
-        case flag(isEnabled: Bool)
-        case move(targetFoldersByAccount: [String: String])
-
-        func command(for location: MessageLocationTarget) -> HimalayaCommand? {
-            switch self {
-            case let .flag(isEnabled):
-                return isEnabled
-                    ? .flagAdd(
-                        id: location.himalayaEnvelopeID,
-                        flag: "flagged",
-                        folder: location.sourceFolderName,
-                        account: location.accountKey
-                    )
-                    : .flagRemove(
-                        id: location.himalayaEnvelopeID,
-                        flag: "flagged",
-                        folder: location.sourceFolderName,
-                        account: location.accountKey
-                    )
-            case let .move(targetFoldersByAccount):
-                guard let targetFolderName = targetFoldersByAccount[location.accountKey],
-                      targetFolderName != location.sourceFolderName
-                else {
-                    return nil
-                }
-                return .messageMove(
-                    id: location.himalayaEnvelopeID,
-                    from: location.sourceFolderName,
-                    to: targetFolderName,
-                    account: location.accountKey
-                )
-            }
-        }
-    }
-
-    private struct EntityActionLocationResult: Sendable {
-        var location: MessageLocationTarget
-        var didRunCommand: Bool
-        var failureDescription: String?
-    }
-
-    func performEntityAction(
-        _ action: MailiaEntityAction,
-        entityID: Int64,
-        workspace: MailiaWorkspace,
-        progress: @escaping @MainActor (String) -> Void
-    ) async throws {
-        progress("Discovering folders...")
-        _ = try await syncService.discoverFoldersForDiscoveredAccounts(timeout: 45)
-        let locations = try repository.messageLocations(
-            entityID: entityID,
-            workspace: workspace.coreWorkspace,
-            sourceRoles: action.sourceRoles
-        )
-        guard !locations.isEmpty else {
-            throw EntityActionError.noMessages
-        }
-
-        switch action {
-        case .flagImportant:
-            try await performBatchEntityAction(
-                action: action,
-                locations: locations,
-                operation: .flag(isEnabled: true),
-                progress: progress
-            )
-            return
-        case .removeFlag:
-            try await performBatchEntityAction(
-                action: action,
-                locations: locations,
-                operation: .flag(isEnabled: false),
-                progress: progress
-            )
-            return
-        case .moveToInbox, .moveToJunk, .moveToTrash:
-            break
-        }
-
-        guard let targetRole = action.targetRole else { return }
-        var targetFoldersByAccount: [String: String] = [:]
-        for accountKey in Set(locations.map(\.accountKey)) {
-            guard let targetFolderName = try repository.targetFolderName(
-                accountKey: accountKey,
-                role: targetRole
-            ) else {
-                throw EntityActionError.missingTargetFolder(accountKey: accountKey, role: targetRole)
-            }
-            targetFoldersByAccount[accountKey] = targetFolderName
-        }
-        try await performBatchEntityAction(
-            action: action,
-            locations: locations,
-            operation: .move(targetFoldersByAccount: targetFoldersByAccount),
-            progress: progress
-        )
-    }
-
-    func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws {
-        let locations = try repository.messageLocations(
-            entityID: entityID,
-            workspace: workspace.coreWorkspace,
-            onlyUnread: true
-        )
-        guard !locations.isEmpty else { return }
-
-        for location in locations {
-            _ = try repository.setMessageLocationFlag(
-                accountKey: location.accountKey,
-                folderName: location.sourceFolderName,
-                himalayaEnvelopeID: location.himalayaEnvelopeID,
-                flag: "seen",
-                isEnabled: true
-            )
-        }
-
-        let bridge = bridge
-        let commandLimiter = himalayaCommandLimiter
-        await withTaskGroup(of: Void.self) { group in
-            for location in locations {
-                group.addTask {
-                    do {
-                        _ = try await commandLimiter.run(
-                            .flagSeen(
-                                id: location.himalayaEnvelopeID,
-                                folder: location.sourceFolderName,
-                                account: location.accountKey
-                            ),
-                            bridge: bridge,
-                            timeout: 30,
-                            priority: .backgroundSync
-                        ).requireSuccess()
-                    } catch {
-                        NSLog("Unable to mark message read remotely: \(Self.errorDescription(error))")
-                    }
-                }
-            }
-        }
-    }
-
-    private func performBatchEntityAction(
-        action: MailiaEntityAction,
-        locations: [MessageLocationTarget],
-        operation: EntityActionOperation,
-        progress: @escaping @MainActor (String) -> Void
-    ) async throws {
-        let runnableLocations = locations.filter { operation.command(for: $0) != nil }
-        guard !runnableLocations.isEmpty else { return }
-
-        let results = await runEntityActionCommands(
-            action: action,
-            locations: runnableLocations,
-            operation: operation,
-            progress: progress
-        )
-        var failures = results.compactMap(\.failureDescription)
-
-        for result in results where result.failureDescription == nil && result.didRunCommand {
-            do {
-                switch operation {
-                case let .flag(isEnabled):
-                    let didUpdate = try repository.setMessageLocationFlag(
-                        accountKey: result.location.accountKey,
-                        folderName: result.location.sourceFolderName,
-                        himalayaEnvelopeID: result.location.himalayaEnvelopeID,
-                        flag: "flagged",
-                        isEnabled: isEnabled
-                    )
-                    if !didUpdate {
-                        failures.append("No matching message location was found for \(result.location.himalayaEnvelopeID).")
-                    }
-                case .move:
-                    try repository.markMessageLocationMissing(
-                        accountKey: result.location.accountKey,
-                        folderName: result.location.sourceFolderName,
-                        himalayaEnvelopeID: result.location.himalayaEnvelopeID
-                    )
-                }
-            } catch {
-                failures.append(Self.errorDescription(error))
-            }
-        }
-
-        if let firstFailure = failures.first {
-            throw EntityActionError.partialFailure(
-                failed: failures.count,
-                total: runnableLocations.count,
-                firstFailure: firstFailure
-            )
-        }
-    }
-
-    private func runEntityActionCommands(
-        action: MailiaEntityAction,
-        locations: [MessageLocationTarget],
-        operation: EntityActionOperation,
-        progress: @escaping @MainActor (String) -> Void
-    ) async -> [EntityActionLocationResult] {
-        let groupedLocations = Dictionary(grouping: locations) { location in
-            "\(location.accountKey)\u{1F}\(location.messageID)"
-        }
-        .values
-        .map { group in
-            group.sorted {
-                if $0.sourceFolderName == $1.sourceFolderName {
-                    $0.himalayaEnvelopeID < $1.himalayaEnvelopeID
-                } else {
-                    $0.sourceFolderName < $1.sourceFolderName
-                }
-            }
-        }
-        let totalCount = locations.count
-        let bridge = bridge
-        let commandLimiter = himalayaCommandLimiter
-
-        progress(action.statusLabel)
-        return await withTaskGroup(of: [EntityActionLocationResult].self) { group in
-            for locationGroup in groupedLocations {
-                group.addTask {
-                    var groupResults: [EntityActionLocationResult] = []
-                    for location in locationGroup {
-                        guard let command = operation.command(for: location) else {
-                            groupResults.append(
-                                EntityActionLocationResult(
-                                    location: location,
-                                    didRunCommand: false,
-                                    failureDescription: nil
-                                )
-                            )
-                            continue
-                        }
-
-                        do {
-                            _ = try await commandLimiter.run(
-                                command,
-                                bridge: bridge,
-                                timeout: 30,
-                                priority: .interactive
-                            ).requireSuccess()
-                            groupResults.append(
-                                EntityActionLocationResult(
-                                    location: location,
-                                    didRunCommand: true,
-                                    failureDescription: nil
-                                )
-                            )
-                        } catch {
-                            groupResults.append(
-                                EntityActionLocationResult(
-                                    location: location,
-                                    didRunCommand: true,
-                                    failureDescription: Self.errorDescription(error)
-                                )
-                            )
-                        }
-                    }
-                    return groupResults
-                }
-            }
-
-            var results: [EntityActionLocationResult] = []
-            for await groupResults in group {
-                results += groupResults
-                progress(action.progressStatus(current: min(results.count, totalCount), total: totalCount))
-            }
-            return results
-        }
-    }
-
-    nonisolated private static func errorDescription(_ error: Error) -> String {
-        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-    }
-
-    func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws {
-        guard let folderName = item.folderLabel.nilIfBlank,
-              let envelopeID = item.envelopeID.nilIfBlank else {
-            throw EntityActionError.noMessages
-        }
-
-        let command: HimalayaCommand = isFlagged
-            ? .flagAdd(id: envelopeID, flag: "flagged", folder: folderName, account: item.accountLabel)
-            : .flagRemove(id: envelopeID, flag: "flagged", folder: folderName, account: item.accountLabel)
-        _ = try await runHimalaya(command, timeout: 30, priority: .interactive).requireSuccess()
-        let didUpdate = try repository.setMessageLocationFlag(
-            accountKey: item.accountLabel,
-            folderName: folderName,
-            himalayaEnvelopeID: envelopeID,
-            flag: "flagged",
-            isEnabled: isFlagged
-        )
-        guard didUpdate else {
-            throw EntityActionError.noMatchingMessageLocation
-        }
-    }
-
-    func downloadAttachments(for item: MailiaTimelineItem) async throws -> MailiaAttachmentDownloadResult {
-        guard item.hasAttachments else {
-            throw EntityActionError.noAttachments
-        }
-        guard let folderName = item.folderLabel.nilIfBlank,
-              let envelopeID = item.envelopeID.nilIfBlank else {
-            throw EntityActionError.noMatchingMessageLocation
-        }
-
-        let existingFiles = downloadedFileNames(in: downloadsDirectory)
-        _ = try await runHimalaya(
-            .attachmentDownload(
-                messageID: envelopeID,
-                folder: folderName,
-                account: item.accountLabel,
-                downloadsDirectory: downloadsDirectory
-            ),
-            timeout: 300,
-            priority: .userDownload
-        ).requireSuccess()
-
-        let currentFiles = downloadedFileNames(in: downloadsDirectory)
-        let newFiles = currentFiles.filter { !existingFiles.contains($0) }
-        let newFileURLs = newFiles.map { downloadsDirectory.appendingPathComponent($0) }
-        revealDownloadedFiles(newFileURLs, downloadsDirectory)
-        return MailiaAttachmentDownloadResult(
-            directoryPath: downloadsDirectory.path,
-            fileNames: newFiles
-        )
-    }
-
-    func sendReply(to item: MailiaTimelineItem, body: String, replyAll: Bool, accountKey: String?) async throws {
-        guard let folderName = item.folderLabel.nilIfBlank,
-              let envelopeID = item.envelopeID.nilIfBlank else {
-            throw EntityActionError.noMatchingMessageLocation
-        }
-        guard let body = body.nilIfBlank else {
-            throw EntityActionError.noMessages
-        }
-
-        let templateResult = try await runHimalaya(
-            .templateReply(
-                id: envelopeID,
-                body: body,
-                folder: folderName,
-                account: item.accountLabel,
-                replyAll: replyAll
-            ),
-            timeout: 60,
-            priority: .interactive
-        ).requireSuccess()
-
-        let template = (try? templateResult.decodeJSON(as: String.self)) ?? templateResult.stdout
-        guard let template = template.nilIfBlank else {
-            throw EntityActionError.noMessages
-        }
-
-        _ = try await runHimalaya(
-            .templateSend(template: template, account: accountKey?.nilIfBlank ?? item.accountLabel),
-            timeout: 120,
-            priority: .interactive
-        ).requireSuccess()
-    }
-
-    func sendNewMessage(
-        to recipients: [String],
-        subject: String?,
-        body: String,
-        accountKey: String?
-    ) async throws {
-        let cleanedRecipients = recipients.compactMap(Self.mailHeaderValue)
-        guard !cleanedRecipients.isEmpty else {
-            throw EntityActionError.noMessages
-        }
-        guard let body = body.nilIfBlank else {
-            throw EntityActionError.noMessages
-        }
-
-        var headers = ["To:\(cleanedRecipients.joined(separator: ", "))"]
-        if let subject = Self.mailHeaderValue(subject) {
-            headers.append("Subject:\(subject)")
-        }
-
-        let templateResult = try await runHimalaya(
-            .templateWrite(body: body, headers: headers, account: accountKey?.nilIfBlank),
-            timeout: 60,
-            priority: .interactive
-        ).requireSuccess()
-
-        let template = (try? templateResult.decodeJSON(as: String.self)) ?? templateResult.stdout
-        guard let template = template.nilIfBlank else {
-            throw EntityActionError.noMessages
-        }
-
-        _ = try await runHimalaya(
-            .templateSend(template: template, account: accountKey?.nilIfBlank),
-            timeout: 120,
-            priority: .interactive
-        ).requireSuccess()
-    }
-
-    private static func mailHeaderValue(_ value: String?) -> String? {
-        value?
-            .replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfBlank
-    }
-
-    private func makeTimelineItem(
-        message: TimelineMessage,
-        entityID: Int64,
-        emojiByAccount: [String: String] = [:]
-    ) -> MailiaTimelineItem {
-        MailiaTimelineItem(
-            id: message.messageID,
-            entityID: entityID,
-            direction: message.direction,
-            subject: message.subject?.nilIfBlank ?? "(No subject)",
-            preview: preview(for: message),
-            html: displayHTML(message.sanitizedHTML),
-            date: HimalayaDateParser.parse(message.messageDate),
-            accountLabel: message.accountKey,
-            accountEmoji: emojiByAccount[message.accountKey],
-            folderLabel: message.folderName ?? "",
-            envelopeID: message.himalayaEnvelopeID ?? "",
-            isFlagged: message.flags.contains { $0.caseInsensitiveCompare("flagged") == .orderedSame },
-            fromLabel: message.from?.displayLabel ?? "",
-            toLabel: message.to.map(\.displayLabel).joined(separator: ", "),
-            hasAttachments: message.hasAttachments
-        )
-    }
-
-    private func fetchBody(messageID: Int64, accountKey: String, folderName: String, envelopeID: String) async throws -> (sanitizedHTML: String?, textFallback: String?) {
-        let exportDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MailiaExport-\(messageID)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
-        defer {
-            try? FileManager.default.removeItem(at: exportDirectory)
-        }
-
-        do {
-            _ = try await runHimalaya(
-                .messageExport(id: envelopeID, folder: folderName, account: accountKey, destination: exportDirectory),
-                timeout: 30,
-                priority: .visibleBody
-            ).requireSuccess()
-
-            let htmlURL = exportDirectory.appendingPathComponent("index.html")
-            let textURL = exportDirectory.appendingPathComponent("plain.txt")
-            let html = try? String(contentsOf: htmlURL, encoding: .utf8)
-            let text = (try? String(contentsOf: textURL, encoding: .utf8))
-                .map(messageTextNormalizer.normalize)
-
-            if let html, let sanitized = try? HTMLSanitizer().sanitize(html) {
-                return (sanitized.content, text?.nilIfBlank)
-            }
-            if let text = text?.nilIfBlank {
-                return (nil, text)
-            }
-        } catch {
-            // Fall through to preview read below.
-        }
-
-        let result = try await runHimalaya(
-            .messageReadPreview(id: envelopeID, folder: folderName, account: accountKey),
-            timeout: 20,
-            priority: .visibleBody
-        ).requireSuccess()
-        return (nil, messageTextNormalizer.normalize(try result.decodeJSON(as: String.self)))
-    }
-
-    private func displayHTML(_ html: String?) -> String? {
-        guard let html = html?.nilIfBlank else {
-            return nil
-        }
-        return htmlDisplayNormalizer.normalize(html).nilIfBlank
-    }
-
-    private func runHimalaya(
-        _ command: HimalayaCommand,
-        timeout: TimeInterval?,
-        priority: HimalayaCommandPriority
-    ) async throws -> HimalayaResult {
-        try await himalayaCommandLimiter.run(
-            command,
-            bridge: bridge,
-            timeout: timeout,
-            priority: priority
-        )
-    }
-
-    private static func defaultDownloadsDirectory(fileManager: FileManager = .default) -> URL {
-        (try? fileManager.url(
-            for: .downloadsDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )) ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
-    }
-
-    private static func revealInFinder(_ fileURLs: [URL], fallbackDirectory: URL) {
-        let existingFileURLs = fileURLs.filter { FileManager.default.fileExists(atPath: $0.path) }
-        if !existingFileURLs.isEmpty {
-            NSWorkspace.shared.activateFileViewerSelecting(existingFileURLs)
-            return
-        }
-
-        if FileManager.default.fileExists(atPath: fallbackDirectory.path) {
-            NSWorkspace.shared.open(fallbackDirectory)
-        } else {
-            NSWorkspace.shared.activateFileViewerSelecting([fallbackDirectory])
-        }
-    }
-
-    private func downloadedFileNames(in directory: URL) -> [String] {
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-        return urls
-            .filter { url in
-                (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-            }
-            .map(\.lastPathComponent)
-            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-    }
-
-    private func filterAndMap(
-        _ entities: [EntityListItem],
-        workspace: MailiaWorkspace,
-        searchQuery: String
-    ) -> [MailiaEntitySummary] {
-        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        return entities
-            .filter { item in
-                query.isEmpty
-                    || item.displayName.localizedCaseInsensitiveContains(query)
-                    || (item.primaryEmailAddress?.localizedCaseInsensitiveContains(query) ?? false)
-                    || item.emailAddresses.joined(separator: " ").localizedCaseInsensitiveContains(query)
-                    || (item.latestSubject?.localizedCaseInsensitiveContains(query) ?? false)
-                    || item.accountKeys.joined(separator: " ").localizedCaseInsensitiveContains(query)
-            }
-            .map { item in
-                MailiaEntitySummary(
-                    id: item.id,
-                    displayName: item.displayName,
-                    primaryEmailAddress: item.primaryEmailAddress?.nilIfBlank,
-                    emailAddresses: item.emailAddresses,
-                    kind: .unknown,
-                    unreadCount: item.unreadCount,
-                    latestSubject: item.latestSubject?.nilIfBlank ?? "(No subject)",
-                    latestDate: item.latestDate,
-                    accountLabel: item.accountKeys.isEmpty ? "" : item.accountKeys.joined(separator: ", "),
-                    workspace: workspace,
-                    avatarImageDataURL: nil
-                )
-            }
-    }
-
-    private func preview(for message: TimelineMessage) -> String {
-        if let text = message.textFallback?.nilIfBlank {
-            return text
-        }
-        if let html = message.sanitizedHTML?.nilIfBlank {
-            return html
-        }
-        let from = message.from?.displayLabel
-        let to = message.to.map(\.displayLabel).joined(separator: ", ")
-        switch message.direction {
-        case .incoming:
-            return from.map { "From \($0)" } ?? "Message body has not been loaded yet."
-        case .outgoing:
-            return to.isEmpty ? "Sent message body has not been loaded yet." : "To \(to)"
-        }
+    func bodyLoadQueueDidUpdateBodyStates() {
+        trimBodyStateWindow()
     }
 }
 
-private enum EntityActionError: LocalizedError {
-    case noMessages
-    case noMatchingMessageLocation
-    case missingTargetFolder(accountKey: String, role: FolderRole)
-    case noAttachments
-    case partialFailure(failed: Int, total: Int, firstFailure: String)
-
-    var errorDescription: String? {
-        switch self {
-        case .noMessages:
-            "No movable messages were found for this entity."
-        case .noMatchingMessageLocation:
-            "No matching message location was found for this message."
-        case let .missingTargetFolder(accountKey, role):
-            "No \(role.rawValue) folder was found for \(accountKey)."
-        case .noAttachments:
-            "This message does not have attachments."
-        case let .partialFailure(failed, total, firstFailure):
-            "\(failed) of \(total) message actions failed. First failure: \(firstFailure)"
+extension MailiaEntitySummary {
+    func sidebarPreview(hideReplySubjects: Bool, hideQuotedReplyText: Bool) -> String {
+        if hideReplySubjects,
+           latestSubject.isReplySubject,
+           let replyPreview = latestBodyPreview?.nilIfBlank {
+            let visiblePreview = hideQuotedReplyText
+                ? MessageTextNormalizer().removingTrailingQuotedReplyText(replyPreview)
+                : replyPreview
+            if let compactPreview = visiblePreview.compactedPreviewText.nilIfBlank {
+                return compactPreview
+            }
         }
-    }
-}
 
-private extension MailAddress {
-    var displayLabel: String {
-        if let displayName = displayName?.nilIfBlank {
-            return "\(displayName) <\(emailAddress)>"
+        if !latestSubject.isEmpty {
+            return latestSubject
         }
-        return emailAddress
+
+        return primaryEmailAddress ?? kind.rawValue
     }
 }
 
 private extension String {
+    var isReplySubject: Bool {
+        let trimmed = drop(while: \.isWhitespace)
+        let prefixes = ["re", "回复", "答复", "回覆"]
+
+        for prefix in prefixes {
+            guard trimmed.count >= prefix.count,
+                  trimmed.prefix(prefix.count).localizedCaseInsensitiveCompare(prefix) == .orderedSame
+            else {
+                continue
+            }
+
+            let remainder = trimmed.dropFirst(prefix.count).drop(while: \.isWhitespace)
+            guard let first = remainder.first else { continue }
+            if first == ":" || first == "：" {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    var compactedPreviewText: String {
+        var result = ""
+        result.reserveCapacity(count)
+        var isCollapsingWhitespace = false
+
+        for character in self {
+            if character.isWhitespace {
+                if !result.isEmpty {
+                    isCollapsingWhitespace = true
+                }
+            } else {
+                if isCollapsingWhitespace {
+                    result.append(" ")
+                    isCollapsingWhitespace = false
+                }
+                result.append(character)
+            }
+        }
+
+        return result
+    }
+
     var nilIfBlank: String? {
         let value = trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value

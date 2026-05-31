@@ -1,45 +1,36 @@
 import { devFixtures } from "../dev/fixtures";
-import { debugLog, debugLogEnabled } from "../debugLog";
 import type {
   TimelineEntity,
-  TimelineMessage,
+  TimelineEntityOption,
+  TimelineItem,
   TimelineState
 } from "../types";
 
+type TimelineEntityID = TimelineEntity["id"];
+type TimelineMessageID = TimelineItem["id"];
+
 export type TimelineInboundEvent =
   | { type: "state"; state: TimelineState }
-  | {
-      type: "messagesChanged";
-      entityID: string;
-      messages: TimelineMessage[];
-      hasOlderMessages?: boolean;
-      anchoredToBottom?: boolean;
-    }
-  | {
-      type: "bodyLoaded";
-      messageID: TimelineMessage["messageID"];
-      sanitizedHTML?: string | null;
-      textFallback?: string | null;
-    }
   | { type: "error"; message: string };
 
 export type TimelineOutboundEvent =
   | { type: "ready" }
-  | { type: "selectEntity"; entityID: string }
+  | { type: "refreshEntities" }
+  | { type: "selectEntity"; entityID: TimelineEntityID }
   | {
       type: "requestOlderMessages";
-      entityID: string;
-      beforeMessageID?: TimelineMessage["messageID"];
+      entityID: TimelineEntityID;
+      beforeMessageID?: TimelineMessageID;
     }
   | {
       type: "requestBody";
-      messageID: TimelineMessage["messageID"];
+      messageID: TimelineMessageID;
       bodyPriority?: number;
       accountKey: string;
       folderName?: string | null;
       himalayaEnvelopeID?: string | null;
     }
-  | { type: "downloadAttachments"; messageID: TimelineMessage["messageID"] }
+  | { type: "downloadAttachments"; messageID: TimelineMessageID }
   | { type: "setScrolledToBottom"; atBottom: boolean };
 
 export interface TimelineBridge {
@@ -57,6 +48,7 @@ export interface DevTimelineBridge extends TimelineBridge {
   mode: "dev";
   getFixtures(): DevFixtureSummary[];
   getFixtureID(): string;
+  getEntities(): TimelineEntityOption[];
   setFixture(fixtureID: string): void;
 }
 
@@ -71,71 +63,12 @@ declare global {
     };
     mailiaTimeline?: {
       receive(event: TimelineInboundEvent): void;
-      receiveState(state: NativeTimelineState): void;
+      receiveState(state: TimelineState): void;
     };
   }
 }
 
 type Listener = (event: TimelineInboundEvent) => void;
-
-interface NativeTimelineState {
-  entity: NativeTimelineEntity | null;
-  items: NativeTimelineItem[];
-  isLoadingTimeline: boolean;
-  isLoadingOlderTimeline: boolean;
-  isLoadingNewerTimeline: boolean;
-  hasOlderTimeline: boolean;
-  hasNewerTimeline: boolean;
-  bodyStates: Record<string, NativeBodyState>;
-  attachmentDownloadStates: Record<string, NativeAttachmentState>;
-  scrollAnchor?: { id: number | string; edge: "top" | "bottom"; generation: number } | null;
-  bodyDisplayMode?: string | null;
-  loadRemoteContent?: boolean | null;
-  showTimelineAvatars?: boolean | null;
-}
-
-interface NativeTimelineEntity {
-  id: number | string;
-  displayName: string;
-  primaryEmailAddress?: string | null;
-  emailAddresses?: string[] | null;
-  kind: string;
-  unreadCount: number;
-  latestSubject: string;
-  latestDate?: string | null;
-  accountLabel: string;
-  workspace: string;
-  avatarImageDataURL?: string | null;
-}
-
-interface NativeTimelineItem {
-  id: number | string;
-  entityID: number | string;
-  direction: "incoming" | "outgoing" | string;
-  subject: string;
-  preview: string;
-  html?: string | null;
-  date?: string | null;
-  accountLabel: string;
-  folderLabel: string;
-  envelopeID: string;
-  isFlagged: boolean;
-  fromLabel: string;
-  toLabel: string;
-  hasAttachments: boolean;
-}
-
-type NativeBodyState =
-  | { status: "notRequested" }
-  | { status: "loading" }
-  | { status: "loaded"; body: { html?: string | null; text?: string | null } }
-  | { status: "failed"; message: string };
-
-type NativeAttachmentState =
-  | { status: "idle" }
-  | { status: "downloading" }
-  | { status: "downloaded"; result: { directoryPath: string; fileNames: string[] } }
-  | { status: "failed"; message: string };
 
 class NativeTimelineBridge implements TimelineBridge {
   readonly mode = "native";
@@ -148,16 +81,10 @@ class NativeTimelineBridge implements TimelineBridge {
   ) {
     window.mailiaTimeline = {
       receive: (event) => {
-        if (debugLogEnabled) {
-          debugLog("native receive event", { type: event.type });
-        }
         this.emit(event);
       },
       receiveState: (state) => {
-        if (debugLogEnabled) {
-          debugLog("native receive state", nativeStateSummary(state));
-        }
-        this.emit({ type: "state", state: adaptNativeState(state) });
+        this.emit({ type: "state", state });
       }
     };
   }
@@ -170,9 +97,6 @@ class NativeTimelineBridge implements TimelineBridge {
   }
 
   send(event: TimelineOutboundEvent) {
-    if (debugLogEnabled) {
-      debugLog("web send event", outboundEventSummary(event));
-    }
     const envelope = toNativeEnvelope(event);
     if (envelope) {
       this.handler.postMessage(envelope);
@@ -184,42 +108,6 @@ class NativeTimelineBridge implements TimelineBridge {
       listener(event);
     }
   }
-}
-
-function nativeStateSummary(state: NativeTimelineState) {
-  return {
-    entityID: state.entity?.id ?? null,
-    items: state.items.length,
-    loading: state.isLoadingTimeline,
-    loadingOlder: state.isLoadingOlderTimeline,
-    hasOlder: state.hasOlderTimeline,
-    anchor: state.scrollAnchor ?? null,
-    bodyStates: bodyStateCounts(state.bodyStates),
-    mode: state.bodyDisplayMode ?? null,
-    remote: state.loadRemoteContent === true,
-    avatars: state.showTimelineAvatars !== false
-  };
-}
-
-function outboundEventSummary(event: TimelineOutboundEvent) {
-  switch (event.type) {
-    case "requestBody":
-      return { type: event.type, messageID: event.messageID, bodyPriority: event.bodyPriority ?? null };
-    case "requestOlderMessages":
-      return { type: event.type, entityID: event.entityID, beforeMessageID: event.beforeMessageID ?? null };
-    case "downloadAttachments":
-      return { type: event.type, messageID: event.messageID };
-    default:
-      return { type: event.type };
-  }
-}
-
-function bodyStateCounts(states: Record<string, NativeBodyState>) {
-  const counts: Record<string, number> = {};
-  for (const state of Object.values(states)) {
-    counts[state.status] = (counts[state.status] ?? 0) + 1;
-  }
-  return counts;
 }
 
 function toNativeEnvelope(event: TimelineOutboundEvent) {
@@ -235,122 +123,14 @@ function toNativeEnvelope(event: TimelineOutboundEvent) {
       };
     case "downloadAttachments":
       return { type: "downloadAttachments", payload: { messageID: event.messageID } };
+    case "refreshEntities":
     case "selectEntity":
     case "setScrolledToBottom":
       return null;
   }
 }
 
-function adaptNativeState(nativeState: NativeTimelineState): TimelineState {
-  const entity = nativeState.entity;
-  const workspace = normalizeWorkspace(entity?.workspace);
-  const selectedEntityID = entity ? `${workspace}:${entity.id}` : null;
-  return {
-    workspace,
-    entities: entity
-      ? [
-          {
-            id: selectedEntityID ?? "",
-            name: entity.displayName,
-            kind: normalizeEntityKind(entity.kind),
-            primaryAddress: entity.primaryEmailAddress,
-            emailAddresses: entity.emailAddresses ?? [],
-            detail: entity.latestSubject,
-            messageCount: nativeState.items.length,
-            unreadCount: entity.unreadCount,
-            lastMessageAt: entity.latestDate ?? null,
-            sourceAccounts: [entity.accountLabel].filter(Boolean),
-            avatarImageDataURL: entity.avatarImageDataURL ?? null
-          }
-        ]
-      : [],
-    selectedEntityID,
-    messages: nativeState.items.map((item) => adaptNativeMessage(item, nativeState)),
-    isLoading: nativeState.isLoadingTimeline,
-    isLoadingOlderMessages: nativeState.isLoadingOlderTimeline,
-    isLoadingNewerMessages: nativeState.isLoadingNewerTimeline,
-    error: null,
-    syncStatus: entity ? `${entity.displayName} · ${nativeState.items.length} messages` : null,
-    hasOlderMessages: nativeState.hasOlderTimeline,
-    anchoredToBottom: nativeState.scrollAnchor?.edge === "bottom",
-    scrollAnchor: nativeState.scrollAnchor
-      ? {
-          id: nativeState.scrollAnchor.id,
-          edge: nativeState.scrollAnchor.edge,
-          generation: nativeState.scrollAnchor.generation
-        }
-      : null,
-    bodyDisplayMode: normalizeBodyDisplayMode(nativeState.bodyDisplayMode),
-    loadRemoteContent: nativeState.loadRemoteContent === true,
-    showTimelineAvatars: nativeState.showTimelineAvatars !== false,
-    attachmentDownloadStates: nativeState.attachmentDownloadStates
-  };
-}
-
-function normalizeBodyDisplayMode(value?: string | null): TimelineState["bodyDisplayMode"] {
-  return value === "markdown" ? "markdown" : "html";
-}
-
-function adaptNativeMessage(
-  item: NativeTimelineItem,
-  nativeState: NativeTimelineState
-): TimelineMessage {
-  const bodyState = nativeState.bodyStates[String(item.id)];
-  const loadedBody = bodyState?.status === "loaded" ? bodyState.body : undefined;
-  const bodyStatus = item.html ? "loaded" : (bodyState?.status ?? "notRequested");
-  return {
-    messageID: item.id,
-    accountKey: item.accountLabel,
-    folderName: item.folderLabel,
-    folderRole: null,
-    himalayaEnvelopeID: item.envelopeID,
-    flags: item.isFlagged ? ["flagged"] : [],
-    subject: item.subject,
-    from: {
-      displayName: item.fromLabel || undefined,
-      emailAddress: item.fromLabel || "unknown"
-    },
-    to: item.toLabel
-      ? [{ displayName: item.toLabel, emailAddress: item.toLabel }]
-      : [],
-    cc: [],
-    messageDate: item.date ?? null,
-    direction: item.direction === "outgoing" ? "outgoing" : "incoming",
-    hasAttachments: item.hasAttachments,
-    bodyStatus,
-    sanitizedHTML: loadedBody?.html ?? item.html ?? null,
-    textFallback: loadedBody?.text ?? (bodyState?.status === "failed" ? item.preview : null),
-    avatarSeed: nativeState.entity
-      ? `${nativeState.entity.id}-${nativeState.entity.displayName}`
-      : null,
-    avatarName: nativeState.entity?.displayName ?? item.fromLabel,
-    avatarImageDataURL: nativeState.entity?.avatarImageDataURL ?? null
-  };
-}
-
-function normalizeWorkspace(value?: string): TimelineState["workspace"] {
-  switch (value?.toLowerCase()) {
-    case "junk":
-      return "junk";
-    case "flagged":
-      return "flagged";
-    default:
-      return "main";
-  }
-}
-
-function normalizeEntityKind(value: string): TimelineEntity["kind"] {
-  switch (value) {
-    case "person":
-    case "organization":
-    case "service":
-    case "newsletter":
-    case "unknown":
-      return value;
-    default:
-      return "unknown";
-  }
-}
+let generatedDevItemID = -1;
 
 class InMemoryDevTimelineBridge implements DevTimelineBridge {
   readonly mode = "dev";
@@ -371,11 +151,14 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
       case "ready":
         this.emit({ type: "state", state: this.state });
         break;
+      case "refreshEntities":
+        this.refreshEntities();
+        break;
       case "selectEntity":
         this.selectEntity(event.entityID);
         break;
       case "requestOlderMessages":
-        this.prependOlderMessages(event.entityID);
+        this.prependOlderMessages();
         break;
       case "requestBody":
       case "setScrolledToBottom":
@@ -394,6 +177,16 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
     return this.fixtureID;
   }
 
+  getEntities() {
+    const fixture = this.currentFixture();
+    return fixture.entities.map((entity) =>
+      toEntityOption(entity, fixture.itemsByEntity[String(entity.id)] ?? [], {
+        hideQuotedReplyText: this.state.displayOptions.hideQuotedReplyText,
+        hideReplySubjects: this.state.displayOptions.hideReplySubjects
+      })
+    );
+  }
+
   setFixture(fixtureID: string) {
     const fixture = devFixtures.find((candidate) => candidate.id === fixtureID);
     if (!fixture) return;
@@ -403,50 +196,71 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
     this.emit({ type: "state", state: this.state });
   }
 
-  private selectEntity(entityID: string) {
-    const selected = this.state.entities.find((entity) => entity.id === entityID);
+  private selectEntity(entityID: TimelineEntityID) {
+    const fixture = this.currentFixture();
+    const selected = fixture.entities.find((entity) => sameID(entity.id, entityID));
     if (!selected) return;
-
-    const fixture = devFixtures.find((candidate) => candidate.id === this.fixtureID);
-    const messages = fixture?.messagesByEntity[entityID] ?? this.state.messages;
 
     this.state = {
       ...this.state,
-      selectedEntityID: entityID,
-      messages,
-      isLoading: false,
-      isLoadingOlderMessages: false,
-      isLoadingNewerMessages: false,
-      syncStatus: `${selected.messageCount} messages from ${selected.name}`,
-      anchoredToBottom: true
+      entity: selected,
+      items: fixture.itemsByEntity[String(selected.id)] ?? [],
+      isLoadingTimeline: false,
+      isLoadingOlderTimeline: false,
+      isLoadingNewerTimeline: false,
+      scrollAnchor: { id: selected.id, edge: "bottom", generation: Date.now() }
     };
 
     this.emit({ type: "state", state: this.state });
   }
 
-  private prependOlderMessages(entityID: string) {
-    const firstMessage = this.state.messages[0];
-    if (!firstMessage) return;
+  private refreshEntities() {
+    this.state = {
+      ...this.state,
+      isLoadingTimeline: true
+    };
+    this.emit({ type: "state", state: this.state });
 
-    const olderMessages = Array.from({ length: 12 }, (_, index) => {
+    window.setTimeout(() => {
+      this.state = {
+        ...this.state,
+        entity: this.state.entity
+          ? {
+              ...this.state.entity,
+              unreadCount: this.state.entity.unreadCount + 1,
+              latestSubject: "Refreshed just now",
+              latestBodyPreview: null,
+              latestDate: new Date().toISOString()
+            }
+          : null,
+        isLoadingTimeline: false
+      };
+      this.emit({ type: "state", state: this.state });
+    }, 700);
+  }
+
+  private prependOlderMessages() {
+    const firstItem = this.state.items[0];
+    if (!firstItem) return;
+
+    const olderItems = Array.from({ length: 12 }, (_, index) => {
       const offset = 12 - index;
       const date = new Date(Date.now() - (offset + 125) * 60 * 60 * 1000);
       return {
-        ...firstMessage,
-        messageID: `older-${entityID}-${Date.now()}-${index}`,
-        subject: `Older context ${offset}: ${firstMessage.subject ?? "Message"}`,
-        messageDate: date.toISOString(),
-        sanitizedHTML: `<p>This is an older fixture message generated by the dev bridge.</p><p>It exercises prepend behavior without requiring Swift.</p>`,
-        textFallback: "This is an older fixture message generated by the dev bridge."
+        ...firstItem,
+        id: generatedDevItemID--,
+        subject: `Older context ${offset}: ${firstItem.subject || "Message"}`,
+        preview: "This is an older fixture message generated by the dev bridge.",
+        html: `<p>This is an older fixture message generated by the dev bridge.</p><p>It exercises prepend behavior without requiring Swift.</p>`,
+        date: date.toISOString()
       };
     });
 
     this.state = {
       ...this.state,
-      messages: [...olderMessages, ...this.state.messages],
-      isLoadingOlderMessages: false,
-      hasOlderMessages: this.state.messages.length < 180,
-      anchoredToBottom: false
+      items: [...olderItems, ...this.state.items],
+      isLoadingOlderTimeline: false,
+      hasOlderTimeline: this.state.items.length < 180
     };
     this.emit({ type: "state", state: this.state });
   }
@@ -457,12 +271,12 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
     }
   }
 
-  private downloadAttachments(messageID: TimelineMessage["messageID"]) {
+  private downloadAttachments(messageID: TimelineMessageID) {
     const key = String(messageID);
     this.state = {
       ...this.state,
       attachmentDownloadStates: {
-        ...(this.state.attachmentDownloadStates ?? {}),
+        ...this.state.attachmentDownloadStates,
         [key]: { status: "downloading" }
       }
     };
@@ -472,7 +286,7 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
       this.state = {
         ...this.state,
         attachmentDownloadStates: {
-          ...(this.state.attachmentDownloadStates ?? {}),
+          ...this.state.attachmentDownloadStates,
           [key]: {
             status: "downloaded",
             result: {
@@ -486,6 +300,94 @@ class InMemoryDevTimelineBridge implements DevTimelineBridge {
     }, 700);
   }
 
+  private currentFixture() {
+    return devFixtures.find((fixture) => fixture.id === this.fixtureID) ?? getInitialDevFixture();
+  }
+}
+
+function sameID(left: TimelineEntityID, right: TimelineEntityID) {
+  return String(left) === String(right);
+}
+
+function toEntityOption(
+  entity: TimelineEntity,
+  items: TimelineItem[],
+  options: { hideQuotedReplyText: boolean; hideReplySubjects: boolean }
+): TimelineEntityOption {
+  const latestItem = items.at(-1);
+  return {
+    id: entity.id,
+    name: entity.displayName,
+    kind: normalizeEntityKind(entity.kind),
+    primaryAddress: entity.primaryEmailAddress ?? null,
+    detail: entityListPreview(entity, latestItem, options),
+    unreadCount: entity.unreadCount,
+    lastMessageAt: entity.latestDate ?? latestItem?.date ?? null,
+    avatarImageDataURL: entity.avatarImageDataURL ?? null
+  };
+}
+
+function entityListPreview(
+  entity: TimelineEntity,
+  latestItem: TimelineItem | undefined,
+  options: { hideQuotedReplyText: boolean; hideReplySubjects: boolean }
+) {
+  const subject = entity.latestSubject;
+  if (options.hideReplySubjects && isReplySubject(subject)) {
+    const bodyPreview = entity.latestBodyPreview ?? latestItem?.preview ?? "";
+    const visiblePreview = options.hideQuotedReplyText
+      ? stripTrailingQuotedReplyText(bodyPreview)
+      : bodyPreview;
+    const preview = compactPreviewText(visiblePreview);
+    if (preview) return preview;
+  }
+
+  return subject || entity.primaryEmailAddress || entity.kind;
+}
+
+function isReplySubject(subject: string) {
+  return /^\s*(re|回复|答复|回覆)\s*[:：]/i.test(subject);
+}
+
+function stripTrailingQuotedReplyText(text: string) {
+  const normalized = text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!/^On\s+.+\swrote:\s*$/i.test(lines[index].trim())) continue;
+
+    const followingLines = lines.slice(index + 1);
+    const nonBlankFollowingLines = followingLines.filter((line) => line.trim() !== "");
+    if (nonBlankFollowingLines.length === 0) continue;
+    if (!nonBlankFollowingLines.every((line) => line.trimStart().startsWith(">"))) continue;
+
+    const keptLines = lines.slice(0, index);
+    while (keptLines.length > 0 && keptLines.at(-1)?.trim() === "") {
+      keptLines.pop();
+    }
+    return keptLines.join("\n");
+  }
+
+  return text;
+}
+
+function compactPreviewText(text: string) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function normalizeEntityKind(value: string): TimelineEntityOption["kind"] {
+  switch (value) {
+    case "person":
+    case "organization":
+    case "service":
+    case "newsletter":
+    case "unknown":
+      return value;
+    default:
+      return "unknown";
+  }
 }
 
 function getInitialDevFixture() {

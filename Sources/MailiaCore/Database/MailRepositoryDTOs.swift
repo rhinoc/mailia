@@ -107,6 +107,37 @@ public struct StoredFolder: Equatable, Sendable {
     }
 }
 
+public struct SyncCheckpoint: Equatable, Sendable {
+    public var accountKey: String
+    public var folderID: Int64?
+    public var workspace: Workspace
+    public var lastSuccessfulSyncAt: Date?
+    public var lastSuccessfulSyncStartedAt: Date?
+    public var lastSuccessfulSyncFinishedAt: Date?
+    public var lastSuccessfulQueryStartAt: Date?
+    public var oldestSyncedMessageDate: Date?
+
+    public init(
+        accountKey: String,
+        folderID: Int64?,
+        workspace: Workspace,
+        lastSuccessfulSyncAt: Date? = nil,
+        lastSuccessfulSyncStartedAt: Date? = nil,
+        lastSuccessfulSyncFinishedAt: Date? = nil,
+        lastSuccessfulQueryStartAt: Date? = nil,
+        oldestSyncedMessageDate: Date? = nil
+    ) {
+        self.accountKey = accountKey
+        self.folderID = folderID
+        self.workspace = workspace
+        self.lastSuccessfulSyncAt = lastSuccessfulSyncAt
+        self.lastSuccessfulSyncStartedAt = lastSuccessfulSyncStartedAt
+        self.lastSuccessfulSyncFinishedAt = lastSuccessfulSyncFinishedAt
+        self.lastSuccessfulQueryStartAt = lastSuccessfulQueryStartAt
+        self.oldestSyncedMessageDate = oldestSyncedMessageDate
+    }
+}
+
 public struct MessageLocationTarget: Equatable, Sendable {
     public var messageID: Int64
     public var accountKey: String

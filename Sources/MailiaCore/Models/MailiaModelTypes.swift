@@ -36,3 +36,13 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
     case downloadAttachments = "download_attachments"
     case himalayaCommand = "himalaya_command"
 }
+
+public struct CacheStats: Equatable, Sendable {
+    public var itemCount: Int
+    public var byteSize: Int64
+
+    public init(itemCount: Int, byteSize: Int64) {
+        self.itemCount = itemCount
+        self.byteSize = byteSize
+    }
+}

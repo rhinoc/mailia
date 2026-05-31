@@ -19,7 +19,6 @@ final class TimelineWebBridgeCoordinator: NSObject {
     private let decoder: JSONDecoder
     private var pendingStateJSON: String?
     private var lastStateJSON: String?
-    private var skippedDuplicateStatePushes = 0
     private var hasFinishedInitialLoad = false
 
     init(
@@ -59,7 +58,6 @@ final class TimelineWebBridgeCoordinator: NSObject {
         hasFinishedInitialLoad = false
         pendingStateJSON = nil
         lastStateJSON = nil
-        skippedDuplicateStatePushes = 0
 
         if let indexURL = assetLocator.timelineIndexURL() {
             webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
@@ -74,30 +72,20 @@ final class TimelineWebBridgeCoordinator: NSObject {
         guard let json = String(data: data, encoding: .utf8) else {
             throw TimelineWebBridgeError.unableToEncodeState
         }
-        pushStateJSON(json, summary: Self.stateSummary(state))
+        pushStateJSON(json)
     }
 
-    func pushStateJSON(_ json: String, summary: String? = nil) {
+    func pushStateJSON(_ json: String) {
         guard json != lastStateJSON else {
-            skippedDuplicateStatePushes += 1
-            logDebug {
-                guard skippedDuplicateStatePushes == 1 || skippedDuplicateStatePushes.isMultiple(of: 50) else {
-                    return nil
-                }
-                return "skip duplicate native state count=\(skippedDuplicateStatePushes) \(summary ?? "")"
-            }
             return
         }
-        skippedDuplicateStatePushes = 0
         lastStateJSON = json
 
         guard hasFinishedInitialLoad else {
             pendingStateJSON = json
-            logDebug { "queue native state before load \(summary ?? "")" }
             return
         }
 
-        logDebug { "push native state \(summary ?? "")" }
         evaluateReceiveState(json)
     }
 
@@ -156,23 +144,6 @@ final class TimelineWebBridgeCoordinator: NSObject {
         }
     }
 
-    private static func stateSummary(_ state: TimelineWebState) -> String {
-        let bodyCounts = Dictionary(grouping: state.bodyStates.values, by: { $0.debugStatus })
-            .mapValues(\.count)
-            .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: ",")
-        let firstID = state.items.first?.id.description ?? "nil"
-        let lastID = state.items.last?.id.description ?? "nil"
-        let anchor: String
-        if let scrollAnchor = state.scrollAnchor {
-            anchor = "\(scrollAnchor.edge.rawValue):\(scrollAnchor.id)#\(scrollAnchor.generation)"
-        } else {
-            anchor = "nil"
-        }
-        return "entity=\(state.entity?.id.description ?? "nil") items=\(state.items.count) first=\(firstID) last=\(lastID) loading=\(state.isLoadingTimeline) older=\(state.hasOlderTimeline)/\(state.isLoadingOlderTimeline) anchor=\(anchor) bodies={\(bodyCounts)} mode=\(state.bodyDisplayMode) remote=\(state.loadRemoteContent)"
-    }
-
     private func configureInspectableWebView() {
         #if DEBUG
         webView.isInspectable = true
@@ -195,7 +166,7 @@ final class TimelineWebBridgeCoordinator: NSObject {
     private func configureScrollView() {
         guard let scrollView = firstScrollView(in: webView) else { return }
         scrollView.horizontalScrollElasticity = .none
-        scrollView.verticalScrollElasticity = .none
+        scrollView.verticalScrollElasticity = .allowed
         scrollView.drawsBackground = false
         scrollView.backgroundColor = .clear
         scrollView.contentView.drawsBackground = false
@@ -233,13 +204,6 @@ final class TimelineWebBridgeCoordinator: NSObject {
             )
         )
         return configuration
-    }
-
-    private func logDebug(_ message: () -> String?) {
-        #if DEBUG
-        guard let message = message() else { return }
-        NSLog("[MailiaTimelineWebDebug] \(message)")
-        #endif
     }
 
     private static let consoleBridgeScript = """
@@ -321,7 +285,7 @@ final class TimelineWebBridgeCoordinator: NSObject {
     <body>
       <main>
         <h1>Timeline web island unavailable</h1>
-        <p>Build Web/Timeline/dist/index.html to enable the WKWebView-backed timeline.</p>
+        <p>Build and sync Web/Timeline into the app resources to enable the WKWebView-backed timeline.</p>
       </main>
     </body>
     </html>
@@ -354,62 +318,6 @@ private final class TimelineInspectableWebView: WKWebView {
             return
         }
         super.mouseDown(with: event)
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        guard let scrollView = firstScrollView(in: self) else {
-            super.scrollWheel(with: event)
-            return
-        }
-
-        let isMostlyVertical = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
-        if isMostlyVertical {
-            guard canScroll(scrollView, withVerticalDelta: event.scrollingDeltaY) else { return }
-        } else {
-            guard canScroll(scrollView, withHorizontalDelta: event.scrollingDeltaX) else { return }
-        }
-
-        super.scrollWheel(with: event)
-    }
-
-    private func canScroll(_ scrollView: NSScrollView, withVerticalDelta deltaY: CGFloat) -> Bool {
-        guard abs(deltaY) > 0.1 else { return false }
-        let visibleBounds = scrollView.contentView.bounds
-        let maximumY = max((scrollView.documentView?.bounds.height ?? 0) - visibleBounds.height, 0)
-        if maximumY <= 1 {
-            return false
-        }
-        let originY = min(max(visibleBounds.origin.y, 0), maximumY)
-        if deltaY > 0 {
-            return originY > 1
-        }
-        return originY < maximumY - 1
-    }
-
-    private func canScroll(_ scrollView: NSScrollView, withHorizontalDelta deltaX: CGFloat) -> Bool {
-        guard abs(deltaX) > 0.1 else { return false }
-        let visibleBounds = scrollView.contentView.bounds
-        let maximumX = max((scrollView.documentView?.bounds.width ?? 0) - visibleBounds.width, 0)
-        if maximumX <= 1 {
-            return false
-        }
-        let originX = min(max(visibleBounds.origin.x, 0), maximumX)
-        if deltaX > 0 {
-            return originX > 1
-        }
-        return originX < maximumX - 1
-    }
-
-    private func firstScrollView(in view: NSView) -> NSScrollView? {
-        if let scrollView = view as? NSScrollView {
-            return scrollView
-        }
-        for subview in view.subviews {
-            if let scrollView = firstScrollView(in: subview) {
-                return scrollView
-            }
-        }
-        return nil
     }
 }
 
@@ -493,70 +401,43 @@ extension TimelineWebBridgeCoordinator: WKNavigationDelegate {
             return
         }
 
+        openExternalURLIfAllowed(url)
+        decisionHandler(.cancel)
+    }
+
+    private func openExternalURLIfAllowed(_ url: URL) {
         if ["http", "https", "mailto"].contains(url.scheme?.lowercased()) {
             NSWorkspace.shared.open(url)
-            decisionHandler(.cancel)
-        } else {
-            decisionHandler(.allow)
         }
     }
 }
 
-extension TimelineWebBridgeCoordinator: WKUIDelegate {}
+extension TimelineWebBridgeCoordinator: WKUIDelegate {
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if navigationAction.targetFrame == nil,
+           let url = navigationAction.request.url {
+            openExternalURLIfAllowed(url)
+        }
+        return nil
+    }
+}
 
 protocol TimelineWebAssetLocating {
     func timelineIndexURL() -> URL?
 }
 
 struct TimelineWebAssetLocator: TimelineWebAssetLocating {
-    private let fileManager: FileManager
-    private let additionalSearchRoots: [URL]
-
-    init(
-        fileManager: FileManager = .default,
-        additionalSearchRoots: [URL] = []
-    ) {
-        self.fileManager = fileManager
-        self.additionalSearchRoots = additionalSearchRoots
-    }
-
     func timelineIndexURL() -> URL? {
-        candidateRoots()
-            .lazy
-            .map { $0.appendingPathComponent("Web/Timeline/dist/index.html") }
-            .first { fileManager.fileExists(atPath: $0.path) }
-    }
-
-    private func candidateRoots() -> [URL] {
-        var roots: [URL] = []
-        roots.append(contentsOf: additionalSearchRoots)
-        roots.append(URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true))
-        roots.append(contentsOf: ancestorURLs(from: Bundle.main.bundleURL))
-        roots.append(contentsOf: ancestorURLs(from: URL(fileURLWithPath: #filePath)))
-        return uniqued(roots)
-    }
-
-    private func ancestorURLs(from url: URL) -> [URL] {
-        var result: [URL] = []
-        var current = (url.hasDirectoryPath ? url : url.deletingLastPathComponent()).standardizedFileURL
-        for _ in 0..<16 {
-            result.append(current)
-            let parent = current.deletingLastPathComponent()
-            guard parent.path != current.path else { break }
-            current = parent.standardizedFileURL
-        }
-        return result
-    }
-
-    private func uniqued(_ urls: [URL]) -> [URL] {
-        var seen: Set<String> = []
-        var result: [URL] = []
-        for url in urls {
-            let standardized = url.standardizedFileURL
-            guard seen.insert(standardized.path).inserted else { continue }
-            result.append(standardized)
-        }
-        return result
+        Bundle.module.url(
+            forResource: "index",
+            withExtension: "html",
+            subdirectory: "TimelineWeb"
+        )
     }
 }
 
