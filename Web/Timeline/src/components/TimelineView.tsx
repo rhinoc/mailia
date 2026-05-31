@@ -23,6 +23,8 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   const isScrollSettlingRef = useRef(false);
   const lastAtBottomRef = useRef<boolean | null>(null);
   const lastAppliedAnchorGenerationRef = useRef<number | null>(null);
+  const bottomAnchorSettlingRef = useRef(false);
+  const bottomAnchorSettleFrameRef = useRef<number | null>(null);
   const [bodyRequestWakeToken, setBodyRequestWakeToken] = useState(0);
   const [bodyHeightCache, setBodyHeightCache] = useState<Record<string, number>>({});
   const useNativeChrome = bridge.mode === "native";
@@ -87,8 +89,56 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
         window.clearTimeout(scrollSettleTimerRef.current);
         scrollSettleTimerRef.current = null;
       }
+      if (bottomAnchorSettleFrameRef.current !== null) {
+        window.cancelAnimationFrame(bottomAnchorSettleFrameRef.current);
+        bottomAnchorSettleFrameRef.current = null;
+      }
     };
   }, []);
+
+  const scrollToTimelineIndex = useCallback(
+    (index: number, edge: "top" | "bottom") => {
+      virtuosoRef.current?.scrollToIndex({
+        index,
+        align: edge === "bottom" ? "end" : "start",
+        behavior: "auto",
+        offset: edge === "top" ? topAnchorOffset : 0
+      });
+    },
+    [topAnchorOffset]
+  );
+
+  const cancelBottomAnchorSettling = useCallback(() => {
+    bottomAnchorSettlingRef.current = false;
+    if (bottomAnchorSettleFrameRef.current !== null) {
+      window.cancelAnimationFrame(bottomAnchorSettleFrameRef.current);
+      bottomAnchorSettleFrameRef.current = null;
+    }
+  }, []);
+
+  const settleBottomAnchor = useCallback(() => {
+    if (!bottomAnchorSettlingRef.current || state.scrollAnchor?.edge !== "bottom") {
+      return;
+    }
+
+    const index = state.items.length - 1;
+    if (index < 0) {
+      return;
+    }
+
+    if (bottomAnchorSettleFrameRef.current !== null) {
+      window.cancelAnimationFrame(bottomAnchorSettleFrameRef.current);
+    }
+
+    bottomAnchorSettleFrameRef.current = window.requestAnimationFrame(() => {
+      bottomAnchorSettleFrameRef.current = null;
+      if (!bottomAnchorSettlingRef.current || state.scrollAnchor?.edge !== "bottom") {
+        return;
+      }
+
+      scrollToTimelineIndex(index, "bottom");
+    });
+  }, [scrollToTimelineIndex, state.items.length, state.scrollAnchor?.edge]);
 
   const handleScrolling = useCallback((isScrolling: boolean) => {
     if (scrollSettleTimerRef.current !== null) {
@@ -125,7 +175,8 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
         [cacheKey]: height
       };
     });
-  }, []);
+    settleBottomAnchor();
+  }, [settleBottomAnchor]);
 
   const handleAtBottomStateChange = useCallback(
     (atBottom: boolean) => {
@@ -140,11 +191,12 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     lastAtBottomRef.current = null;
     lastAppliedAnchorGenerationRef.current = null;
     isScrollSettlingRef.current = false;
+    cancelBottomAnchorSettling();
     if (scrollSettleTimerRef.current !== null) {
       window.clearTimeout(scrollSettleTimerRef.current);
       scrollSettleTimerRef.current = null;
     }
-  }, [selectedEntityID]);
+  }, [cancelBottomAnchorSettling, selectedEntityID]);
 
   useEffect(() => {
     const anchor = state.scrollAnchor;
@@ -161,17 +213,17 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     }
 
     lastAppliedAnchorGenerationRef.current = anchor.generation;
+    bottomAnchorSettlingRef.current = anchor.edge === "bottom";
     const animationFrame = window.requestAnimationFrame(() => {
-      virtuosoRef.current?.scrollToIndex({
-        index,
-        align: anchor.edge === "bottom" ? "end" : "start",
-        behavior: "auto",
-        offset: anchor.edge === "top" ? topAnchorOffset : 0
-      });
+      scrollToTimelineIndex(index, anchor.edge);
     });
 
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [state.items, state.scrollAnchor, topAnchorOffset]);
+  }, [scrollToTimelineIndex, state.items, state.scrollAnchor]);
+
+  useEffect(() => {
+    settleBottomAnchor();
+  }, [bodyHeightCache, bottomChromeReserve, settleBottomAnchor]);
 
   return (
     <main
@@ -179,7 +231,12 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
       aria-label="Mail timeline"
       aria-busy={state.isLoadingTimeline && state.items.length === 0 ? true : undefined}
     >
-      <div className="timeline__list-shell">
+      <div
+        className="timeline__list-shell"
+        onPointerDown={cancelBottomAnchorSettling}
+        onTouchStart={cancelBottomAnchorSettling}
+        onWheel={cancelBottomAnchorSettling}
+      >
         <Virtuoso
           ref={virtuosoRef}
           key={selectedEntityID ?? "none"}
