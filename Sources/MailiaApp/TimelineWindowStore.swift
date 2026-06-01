@@ -21,16 +21,13 @@ struct TimelineWindowStore {
 
     private let maxCachedTimelinePages: Int
     private let maxCachedBodyStates: Int
-    private let maxLoadedBodyStates: Int
 
     init(
         maxCachedTimelinePages: Int = 24,
-        maxCachedBodyStates: Int = 240,
-        maxLoadedBodyStates: Int = 32
+        maxCachedBodyStates: Int = 240
     ) {
         self.maxCachedTimelinePages = maxCachedTimelinePages
         self.maxCachedBodyStates = maxCachedBodyStates
-        self.maxLoadedBodyStates = maxLoadedBodyStates
     }
 
     mutating func resetWindowState() {
@@ -142,18 +139,6 @@ struct TimelineWindowStore {
         }
 
         bodyAccessOrder.removeAll { !visibleIDs.contains($0) }
-
-        var loadedIDs = bodyAccessOrder.filter { id in
-            if case .loaded = bodyStates[id] {
-                return true
-            }
-            return false
-        }
-        while loadedIDs.count > maxLoadedBodyStates, let id = loadedIDs.first {
-            bodyStates[id] = .notRequested
-            bodyAccessOrder.removeAll { $0 == id }
-            loadedIDs.removeFirst()
-        }
 
         return removedIDs
     }

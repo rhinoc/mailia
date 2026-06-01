@@ -108,8 +108,8 @@ struct TimelineWebView: NSViewRepresentable {
             case .scrollAnchor:
                 break
             case .log(let level, let message):
-                if level.lowercased() == "error" {
-                    NSLog("[MailiaTimelineWeb:\(level)] \(message)")
+                if level.lowercased() == "error" || message.contains("[MailiaScrollDebug]") {
+                    MailiaScrollDebugLog("[MailiaTimelineWeb:\(level)] \(message)")
                 }
             case .unknown(let type, _):
                 NSLog("[MailiaTimelineWeb] Ignoring event '\(type)'")

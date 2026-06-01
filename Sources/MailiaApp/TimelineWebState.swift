@@ -55,14 +55,6 @@ struct TimelineDisplayOptions: Codable, Equatable, Sendable {
     }
 }
 
-struct TimelineWindowState: Codable, Equatable, Sendable {
-    var bottomOverlayHeight: CGFloat
-
-    init(bottomOverlayHeight: CGFloat = 0) {
-        self.bottomOverlayHeight = bottomOverlayHeight
-    }
-}
-
 struct TimelineWebState: Codable, Equatable, Sendable {
     var entity: Entity?
     var items: [Item]
@@ -78,7 +70,7 @@ struct TimelineWebState: Codable, Equatable, Sendable {
     var selectedSendAccountKey: String?
     var scrollAnchor: ScrollAnchor?
     var displayOptions: TimelineDisplayOptions
-    var windowState: TimelineWindowState
+    var chromeInsets: ChromeInsets
 
     init(
         entity: Entity?,
@@ -95,7 +87,7 @@ struct TimelineWebState: Codable, Equatable, Sendable {
         selectedSendAccountKey: String? = nil,
         scrollAnchor: ScrollAnchor? = nil,
         displayOptions: TimelineDisplayOptions = TimelineDisplayOptions(),
-        windowState: TimelineWindowState = TimelineWindowState()
+        chromeInsets: ChromeInsets = ChromeInsets()
     ) {
         self.entity = entity
         self.items = items
@@ -111,11 +103,19 @@ struct TimelineWebState: Codable, Equatable, Sendable {
         self.selectedSendAccountKey = selectedSendAccountKey
         self.scrollAnchor = scrollAnchor
         self.displayOptions = displayOptions
-        self.windowState = windowState
+        self.chromeInsets = chromeInsets
     }
 }
 
 extension TimelineWebState {
+    struct ChromeInsets: Codable, Equatable, Sendable {
+        var bottom: CGFloat
+
+        init(bottom: CGFloat = 0) {
+            self.bottom = bottom
+        }
+    }
+
     struct Entity: Codable, Equatable, Sendable {
         var id: Int64
         var displayName: String
@@ -203,7 +203,6 @@ extension TimelineWebState {
 
     struct Body: Codable, Equatable, Sendable {
         var html: String?
-        var text: String?
     }
 
     enum AttachmentDownloadState: Codable, Equatable, Sendable {
@@ -324,7 +323,7 @@ extension TimelineWebState {
         selectedSendAccountKey: String? = nil,
         scrollAnchor: MailiaTimelineScrollAnchor?,
         displayOptions: TimelineDisplayOptions = TimelineDisplayOptions(),
-        windowState: TimelineWindowState = TimelineWindowState()
+        chromeInsets: ChromeInsets = ChromeInsets()
     ) {
         self.init(
             entity: entity.map(Entity.init),
@@ -345,7 +344,7 @@ extension TimelineWebState {
             selectedSendAccountKey: selectedSendAccountKey,
             scrollAnchor: scrollAnchor.map(ScrollAnchor.init),
             displayOptions: displayOptions,
-            windowState: windowState
+            chromeInsets: chromeInsets
         )
     }
 }
@@ -424,7 +423,7 @@ extension TimelineWebState.BodyState {
 
 extension TimelineWebState.Body {
     init(_ body: MailiaTimelineBody) {
-        self.init(html: body.html, text: body.text)
+        self.init(html: body.html)
     }
 }
 

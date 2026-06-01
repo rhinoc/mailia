@@ -13,10 +13,37 @@ enum MailiaPreferenceKeys {
     static let autoSyncEnabled = "MailiaAutoSyncEnabled"
     static let autoSyncIntervalMinutes = "MailiaAutoSyncIntervalMinutes"
     static let downloadsDirectoryPath = "MailiaDownloadsDirectoryPath"
+    static let composerSendShortcut = "MailiaComposerSendShortcut"
+    static let composerAllowUndoAfterSend = "MailiaComposerAllowUndoAfterSend"
+    static let composerUndoDelaySeconds = "MailiaComposerUndoDelaySeconds"
 }
 
 private enum MailiaTopChrome {
     static let controlTopPadding: CGFloat = 8
+}
+
+private enum MailiaSidebarPreferences {
+    static let didChangeNotification = Notification.Name("MailiaSidebarVisibilityDidChange")
+    static let key = "MailiaSidebarVisibility"
+    private static let visibleValue = "visible"
+    private static let hiddenValue = "hidden"
+
+    static func preferredVisibility() -> NavigationSplitViewVisibility {
+        let storedValue = UserDefaults.standard.string(forKey: key)
+        return storedValue == hiddenValue ? .detailOnly : .all
+    }
+
+    static func save(_ visibility: NavigationSplitViewVisibility) {
+        let value = visibility == .detailOnly ? hiddenValue : visibleValue
+        UserDefaults.standard.set(value, forKey: key)
+    }
+
+    static func toggle() -> NavigationSplitViewVisibility {
+        let nextVisibility: NavigationSplitViewVisibility = preferredVisibility() == .detailOnly ? .all : .detailOnly
+        save(nextVisibility)
+        NotificationCenter.default.post(name: didChangeNotification, object: nil)
+        return nextVisibility
+    }
 }
 
 private enum MailiaSettingsChrome {
@@ -122,6 +149,7 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
     )
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
+    private var aboutWindow: NSWindow?
     private static var delegateReference: MailiaApplication?
     private static let mainWindowIdentifier = NSUserInterfaceItemIdentifier("MailiaMainWindow")
     private static let mainWindowDefaultContentSize = NSSize(width: 1180, height: 760)
@@ -148,6 +176,37 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    @objc private func showAboutWindow() {
+        if let aboutWindow {
+            aboutWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "About Mailia"
+        window.center()
+        window.isOpaque = true
+        window.backgroundColor = MailiaSettingsChrome.backgroundNSColor
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        let hostingView = NSHostingView(rootView: AboutView())
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = MailiaSettingsChrome.backgroundNSColor.cgColor
+        window.contentView = hostingView
+        window.contentView?.superview?.wantsLayer = true
+        window.contentView?.superview?.layer?.backgroundColor = MailiaSettingsChrome.backgroundNSColor.cgColor
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        aboutWindow = window
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func showSettingsWindow() {
@@ -183,6 +242,44 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
 
     @objc private func checkForUpdates(_ sender: Any?) {
         updaterController.checkForUpdates(sender)
+    }
+
+    @objc private func startComposingNewMessage() {
+        viewModel.startComposingNewMessage()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func refreshMailbox() {
+        Task { await viewModel.refresh() }
+    }
+
+    @objc private func confirmRefreshFullHistory() {
+        guard !viewModel.isRefreshing else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Sync all message history?"
+        alert.informativeText = "Mailia will scan all configured mailbox history. This can take a while."
+        alert.addButton(withTitle: "Sync All History")
+        alert.addButton(withTitle: "Cancel")
+
+        if let window {
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard response == .alertFirstButtonReturn else { return }
+                Task { await self?.viewModel.refreshFullHistory() }
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
+            Task { await viewModel.refreshFullHistory() }
+        }
+    }
+
+    @objc private func reloadAccounts() {
+        Task { await viewModel.refreshConfiguredAccounts() }
+    }
+
+    @objc private func toggleSidebar() {
+        _ = MailiaSidebarPreferences.toggle()
     }
 
     private func configureApplicationIcon() {
@@ -222,10 +319,17 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
 
-        let appMenu = NSMenu()
+        let appMenu = NSMenu(title: "Mailia")
         appMenuItem.submenu = appMenu
         appMenu.addItem(
-            NSMenuItem(
+            targetedMenuItem(
+                title: "About Mailia",
+                action: #selector(showAboutWindow),
+                keyEquivalent: ""
+            )
+        )
+        appMenu.addItem(
+            targetedMenuItem(
                 title: "Settings...",
                 action: #selector(showSettingsWindow),
                 keyEquivalent: ","
@@ -240,11 +344,48 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
         updateItem.target = self
         appMenu.addItem(updateItem)
         appMenu.addItem(.separator())
-        appMenu.addItem(
-            NSMenuItem(
-                title: "Quit Mailia",
-                action: #selector(NSApplication.terminate(_:)),
-                keyEquivalent: "q"
+        appMenu.addItem(NSMenuItem(title: "Quit Mailia", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        let fileMenuItem = NSMenuItem()
+        mainMenu.addItem(fileMenuItem)
+
+        let fileMenu = NSMenu(title: "File")
+        fileMenuItem.submenu = fileMenu
+        fileMenu.addItem(
+            targetedMenuItem(
+                title: "New Message",
+                action: #selector(startComposingNewMessage),
+                keyEquivalent: "n"
+            )
+        )
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+
+        let mailboxMenuItem = NSMenuItem()
+        mainMenu.addItem(mailboxMenuItem)
+
+        let mailboxMenu = NSMenu(title: "Mailbox")
+        mailboxMenuItem.submenu = mailboxMenu
+        mailboxMenu.addItem(
+            targetedMenuItem(
+                title: "Sync Now",
+                action: #selector(refreshMailbox),
+                keyEquivalent: "r"
+            )
+        )
+        mailboxMenu.addItem(
+            targetedMenuItem(
+                title: "Sync All History...",
+                action: #selector(confirmRefreshFullHistory),
+                keyEquivalent: ""
+            )
+        )
+        mailboxMenu.addItem(.separator())
+        mailboxMenu.addItem(
+            targetedMenuItem(
+                title: "Reload Accounts",
+                action: #selector(reloadAccounts),
+                keyEquivalent: ""
             )
         )
 
@@ -275,6 +416,20 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
         emojiItem.keyEquivalentModifierMask = [.control, .command]
         editMenu.addItem(emojiItem)
 
+        let viewMenuItem = NSMenuItem()
+        mainMenu.addItem(viewMenuItem)
+
+        let viewMenu = NSMenu(title: "View")
+        viewMenuItem.submenu = viewMenu
+        let sidebarItem = targetedMenuItem(
+            title: "Hide Sidebar",
+            action: #selector(toggleSidebar),
+            keyEquivalent: "s"
+        )
+        sidebarItem.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(sidebarItem)
+
+        #if DEBUG
         let debugMenuItem = NSMenuItem()
         mainMenu.addItem(debugMenuItem)
 
@@ -282,24 +437,38 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
         debugMenuItem.submenu = debugMenu
 
         let inspectorItem = NSMenuItem(
-            title: "Open Detached Timeline Inspector",
+            title: "Open Inspector",
             action: #selector(TimelineWebDebugMenuController.openDetachedTimelineInspector(_:)),
             keyEquivalent: "i"
         )
         inspectorItem.keyEquivalentModifierMask = [.command, .option]
         inspectorItem.target = TimelineWebDebugMenuController.shared
         debugMenu.addItem(inspectorItem)
-
-        let consoleItem = NSMenuItem(
-            title: "Open Timeline Console",
-            action: #selector(TimelineWebDebugMenuController.openTimelineConsole(_:)),
-            keyEquivalent: "j"
-        )
-        consoleItem.keyEquivalentModifierMask = [.command, .option]
-        consoleItem.target = TimelineWebDebugMenuController.shared
-        debugMenu.addItem(consoleItem)
+        #endif
 
         NSApp.mainMenu = mainMenu
+    }
+
+    private func targetedMenuItem(title: String, action: Selector, keyEquivalent: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        return item
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(refreshMailbox), #selector(confirmRefreshFullHistory):
+            return !viewModel.isRefreshing
+        case #selector(startComposingNewMessage):
+            return !viewModel.isComposingNewMessage
+        case #selector(toggleSidebar):
+            menuItem.title = MailiaSidebarPreferences.preferredVisibility() == .detailOnly
+                ? "Show Sidebar"
+                : "Hide Sidebar"
+            return true
+        default:
+            return true
+        }
     }
 }
 
@@ -312,9 +481,6 @@ private struct ContentView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility
     @State private var sidebarWasCollapsedByResize = false
 
-    private static let sidebarVisibilityPreferenceKey = "MailiaSidebarVisibility"
-    private static let sidebarVisiblePreference = "visible"
-    private static let sidebarHiddenPreference = "hidden"
     private let sidebarCollapseWidth: CGFloat = 900
     private let sidebarRestoreWidth: CGFloat = 980
     private var selectedEntity: MailiaEntitySummary? {
@@ -383,6 +549,9 @@ private struct ContentView: View {
         .onPreferenceChange(WindowWidthPreferenceKey.self) { width in
             updateSidebarVisibility(for: width)
         }
+        .onReceive(NotificationCenter.default.publisher(for: MailiaSidebarPreferences.didChangeNotification)) { _ in
+            applyPreferredSidebarVisibility()
+        }
         .toolbar {
             ComposeToolbarContent(
                 isComposingNewMessage: viewModel.isComposingNewMessage,
@@ -418,7 +587,7 @@ private struct ContentView: View {
             set: { newValue in
                 columnVisibility = newValue
                 sidebarWasCollapsedByResize = false
-                Self.saveSidebarVisibility(newValue)
+                MailiaSidebarPreferences.save(newValue)
             }
         )
     }
@@ -436,13 +605,12 @@ private struct ContentView: View {
     }
 
     private static func preferredSidebarVisibility() -> NavigationSplitViewVisibility {
-        let storedValue = UserDefaults.standard.string(forKey: sidebarVisibilityPreferenceKey)
-        return storedValue == sidebarHiddenPreference ? .detailOnly : .all
+        MailiaSidebarPreferences.preferredVisibility()
     }
 
-    private static func saveSidebarVisibility(_ visibility: NavigationSplitViewVisibility) {
-        let value = visibility == .detailOnly ? sidebarHiddenPreference : sidebarVisiblePreference
-        UserDefaults.standard.set(value, forKey: sidebarVisibilityPreferenceKey)
+    private func applyPreferredSidebarVisibility() {
+        columnVisibility = Self.preferredSidebarVisibility()
+        sidebarWasCollapsedByResize = false
     }
 
     private func refresh() {
@@ -460,23 +628,26 @@ private struct WindowWidthPreferenceKey: PreferenceKey {
     }
 }
 
-private struct ComposerHeightPreferenceKey: PreferenceKey {
-    static let defaultValue: ComposerHeightPreference? = nil
-
-    static func reduce(value: inout ComposerHeightPreference?, nextValue: () -> ComposerHeightPreference?) {
-        value = nextValue() ?? value
-    }
-}
-
-private struct ComposerHeightPreference: Equatable {
-    let contextID: String
-    let height: CGFloat
-}
-
 private struct WindowWidthReader: View {
     var body: some View {
         GeometryReader { proxy in
             Color.clear.preference(key: WindowWidthPreferenceKey.self, value: proxy.size.width)
+        }
+    }
+}
+
+private struct TimelineComposerHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct TimelineComposerHeightReader: View {
+    var body: some View {
+        GeometryReader { proxy in
+            Color.clear.preference(key: TimelineComposerHeightPreferenceKey.self, value: proxy.size.height)
         }
     }
 }
@@ -538,13 +709,15 @@ private struct EntityListPane: View {
                 return nil
             },
             set: { newSelection in
-                switch newSelection {
-                case .composeDraft:
-                    viewModel.startComposingNewMessage()
-                case .entity(let entityID):
-                    viewModel.selectedEntityID = entityID
-                case nil:
-                    break
+                DispatchQueue.main.async {
+                    switch newSelection {
+                    case .composeDraft:
+                        viewModel.startComposingNewMessage()
+                    case .entity(let entityID):
+                        viewModel.selectedEntityID = entityID
+                    case nil:
+                        break
+                    }
                 }
             }
         )
@@ -1232,6 +1405,7 @@ private struct EntityRowContent: View, Equatable {
             lhs.entity.unreadCount == rhs.entity.unreadCount &&
             lhs.entity.latestSubject == rhs.entity.latestSubject &&
             lhs.entity.latestBodyPreview == rhs.entity.latestBodyPreview &&
+            lhs.entity.latestMessageID == rhs.entity.latestMessageID &&
             lhs.entity.latestDate == rhs.entity.latestDate &&
             lhs.entity.primaryEmailAddress == rhs.entity.primaryEmailAddress &&
             lhs.entity.kind == rhs.entity.kind &&
@@ -1285,6 +1459,7 @@ private final class EntitySidebarPreviewCacheKey: NSObject {
     private let entityID: Int64
     private let latestSubject: String
     private let latestBodyPreview: String?
+    private let latestMessageID: Int64?
     private let primaryEmailAddress: String?
     private let kind: EntityKind
     private let hideQuotedReplyText: Bool
@@ -1294,6 +1469,7 @@ private final class EntitySidebarPreviewCacheKey: NSObject {
         self.entityID = entity.id
         self.latestSubject = entity.latestSubject
         self.latestBodyPreview = entity.latestBodyPreview
+        self.latestMessageID = entity.latestMessageID
         self.primaryEmailAddress = entity.primaryEmailAddress
         self.kind = entity.kind
         self.hideQuotedReplyText = hideQuotedReplyText
@@ -1301,6 +1477,7 @@ private final class EntitySidebarPreviewCacheKey: NSObject {
         hasher.combine(entityID)
         hasher.combine(latestSubject)
         hasher.combine(latestBodyPreview)
+        hasher.combine(latestMessageID)
         hasher.combine(primaryEmailAddress)
         hasher.combine(kind.rawValue)
         hasher.combine(hideQuotedReplyText)
@@ -1318,6 +1495,7 @@ private final class EntitySidebarPreviewCacheKey: NSObject {
         return entityID == other.entityID &&
             latestSubject == other.latestSubject &&
             latestBodyPreview == other.latestBodyPreview &&
+            latestMessageID == other.latestMessageID &&
             primaryEmailAddress == other.primaryEmailAddress &&
             kind == other.kind &&
             hideQuotedReplyText == other.hideQuotedReplyText
@@ -1594,8 +1772,8 @@ private struct TimelinePane: View {
     let onRequestOlder: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
-    let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
-    let onSendNewMessage: ([String], String?, String, String?) -> Void
+    let onSendReply: (MailiaTimelineItem, MailiaComposerContent, Bool, String?) -> Void
+    let onSendNewMessage: ([String], String?, MailiaComposerContent, String?) -> Void
     let onSelectSendAccount: (String) -> Void
     let onComposerEdited: () -> Void
     let onEntityAction: (MailiaEntityAction, MailiaEntitySummary) -> Void
@@ -1977,12 +2155,11 @@ private struct TimelineBody: View {
     let onRequestOlder: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
-    let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
+    let onSendReply: (MailiaTimelineItem, MailiaComposerContent, Bool, String?) -> Void
     let onSelectSendAccount: (String) -> Void
     let onComposerEdited: () -> Void
     let onEntityAction: (MailiaEntityAction, MailiaEntitySummary) -> Void
     let onSyncEntityHistory: (MailiaEntitySummary) -> Void
-    @State private var isPreparingInitialPosition = true
     @State private var isShowingEntityDrawer = false
     @State private var replyComposerHeight: CGFloat = 0
     @TimelineDisplayOptionsStorage
@@ -1998,62 +2175,47 @@ private struct TimelineBody: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            TimelineWebView(
-                state: webState,
-                items: items,
-                entity: entity,
-                onRequestBody: onRequestBody,
-                onRequestOlder: onRequestOlder,
-                onSetMessageFlag: onSetMessageFlag,
-                onDownloadAttachments: onDownloadAttachments,
-                onSendReply: onSendReply,
-                onSelectSendAccount: onSelectSendAccount,
-                onEntityAction: onEntityAction
-            )
+        ZStack(alignment: .trailing) {
+            ZStack(alignment: .bottom) {
+                ZStack(alignment: .top) {
+                    TimelineWebView(
+                        state: webState,
+                        items: items,
+                        entity: entity,
+                        onRequestBody: onRequestBody,
+                        onRequestOlder: onRequestOlder,
+                        onSetMessageFlag: onSetMessageFlag,
+                        onDownloadAttachments: onDownloadAttachments,
+                        onSendReply: { item, body, replyAll, accountKey in
+                            onSendReply(item, MailiaComposerContent(plainText: body), replyAll, accountKey)
+                        },
+                        onSelectSendAccount: onSelectSendAccount,
+                        onEntityAction: onEntityAction
+                    )
 
-            timelineFades
+                    timelineFades
 
-            VStack(spacing: 0) {
-                WindowDragRegion()
-                    .frame(height: Self.topDragRegionHeight)
+                    VStack(spacing: 0) {
+                        WindowDragRegion()
+                            .frame(height: Self.topDragRegionHeight)
 
-                if let entity {
-                    TimelineEntityHeader(entity: entity) {
-                        withAnimation(.easeOut(duration: 0.22)) {
-                            isShowingEntityDrawer = true
+                        if let entity {
+                            TimelineEntityHeader(entity: entity) {
+                                withAnimation(.easeOut(duration: 0.22)) {
+                                    isShowingEntityDrawer = true
+                                }
+                            }
+                            .padding(.top, 4)
                         }
+
+                        Spacer(minLength: 0)
                     }
-                    .padding(.top, 4)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
 
-                Spacer(minLength: 0)
-            }
-
-            if showsReplyComposer {
-                ReplyComposerBar(
-                    target: items.last,
-                    sendAccounts: sendAccounts,
-                    selectedSendAccountKey: replySendAccountKey,
-                    sendState: replySendState,
-                    onSend: { body, accountKey in
-                        guard let target = items.last else { return }
-                        onSendReply(target, body, false, accountKey)
-                    },
-                    onSelectSendAccount: onSelectSendAccount,
-                    onEdited: onComposerEdited
-                )
-                .id(timelineContextID)
-                .background {
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: ComposerHeightPreferenceKey.self,
-                            value: ComposerHeightPreference(
-                                contextID: timelineContextID,
-                                height: proxy.size.height
-                            )
-                        )
-                    }
+                if showsReplyComposer {
+                    replyComposer
                 }
             }
 
@@ -2086,18 +2248,16 @@ private struct TimelineBody: View {
         }
         .onChange(of: timelineContextID) { _, _ in
             isShowingEntityDrawer = false
-            replyComposerHeight = 0
         }
-        .onPreferenceChange(ComposerHeightPreferenceKey.self) { preference in
-            guard let preference,
-                  preference.contextID == timelineContextID,
-                  abs(replyComposerHeight - preference.height) > 1 else {
-                return
+        .onPreferenceChange(TimelineComposerHeightPreferenceKey.self) { height in
+            DispatchQueue.main.async {
+                if abs(replyComposerHeight - height) > 0.5 {
+                    replyComposerHeight = height
+                }
             }
-            replyComposerHeight = preference.height
         }
         .ignoresSafeArea(.container, edges: .top)
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(Color.clear)
         .contextMenu {
             if let entity {
                 EntityContextMenu(
@@ -2105,14 +2265,6 @@ private struct TimelineBody: View {
                     workspace: entity.workspace,
                     onAction: onEntityAction
                 )
-            }
-        }
-        .task(id: timelineContextID) {
-            isPreparingInitialPosition = true
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            if !Task.isCancelled {
-                isPreparingInitialPosition = false
             }
         }
     }
@@ -2125,6 +2277,23 @@ private struct TimelineBody: View {
         }
         .ignoresSafeArea(.container, edges: .vertical)
         .allowsHitTesting(false)
+    }
+
+    private var replyComposer: some View {
+        ReplyComposerBar(
+            target: items.last,
+            sendAccounts: sendAccounts,
+            selectedSendAccountKey: replySendAccountKey,
+            sendState: replySendState,
+            onSend: { content, accountKey in
+                guard let target = items.last else { return }
+                onSendReply(target, content, false, accountKey)
+            },
+            onSelectSendAccount: onSelectSendAccount,
+            onEdited: onComposerEdited
+        )
+        .id(timelineContextID)
+        .background(TimelineComposerHeightReader())
     }
 
     private var replySendAccountKey: String? {
@@ -2165,8 +2334,8 @@ private struct TimelineBody: View {
             selectedSendAccountKey: selectedSendAccountKey,
             scrollAnchor: scrollAnchor,
             displayOptions: displayOptions,
-            windowState: TimelineWindowState(
-                bottomOverlayHeight: showsReplyComposer ? replyComposerHeight : 0
+            chromeInsets: TimelineWebState.ChromeInsets(
+                bottom: showsReplyComposer ? replyComposerHeight : 0
             )
         )
     }
@@ -2269,6 +2438,152 @@ private func normalizedEmailAddress(_ emailAddress: String?) -> String? {
     return value.isEmpty ? nil : value
 }
 
+private struct AboutView: View {
+    private static let githubURL = URL(string: "https://github.com/rhinoc/mailia")!
+    private static let releasesURL = URL(string: "https://github.com/rhinoc/mailia/releases")!
+    private static let creditsURL = URL(string: "https://github.com/rhinoc/mailia/blob/main/CREDITS.md")!
+    private static let licenseURL = URL(string: "https://github.com/rhinoc/mailia/blob/main/LICENSE")!
+
+    private static let swiftDependencies = [
+        "GRDB.swift",
+        "Sparkle",
+        "SwiftSoup",
+        "TOMLKit"
+    ]
+
+    private static let webDependencies = [
+        "DOMPurify",
+        "React",
+        "React DOM",
+        "react-markdown",
+        "React Virtuoso",
+        "Turndown",
+        "TypeScript",
+        "Vite"
+    ]
+
+    private static let integrations = [
+        "Himalaya",
+        "simple-icons"
+    ]
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 22) {
+                header
+                linkRow
+                Divider()
+                acknowledgementsSection
+                Divider()
+                footer
+            }
+            .padding(.horizontal, 34)
+            .padding(.top, 34)
+            .padding(.bottom, 28)
+        }
+        .scrollContentBackground(.hidden)
+        .background(MailiaSettingsChrome.backgroundColor)
+        .frame(width: 520, height: 560)
+    }
+
+    private var header: some View {
+        VStack(spacing: 12) {
+            if let icon = appIcon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: 96, height: 96)
+                    .shadow(color: Color.black.opacity(0.14), radius: 12, y: 4)
+            }
+
+            VStack(spacing: 4) {
+                Text("Mailia")
+                    .font(.system(size: 28, weight: .bold))
+
+                Text("Timeline-style email for macOS")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+
+                Text(versionText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .multilineTextAlignment(.center)
+        }
+    }
+
+    private var linkRow: some View {
+        HStack(spacing: 10) {
+            Link("GitHub", destination: Self.githubURL)
+            Link("Releases", destination: Self.releasesURL)
+            Link("Credits", destination: Self.creditsURL)
+        }
+        .buttonStyle(.bordered)
+    }
+
+    private var acknowledgementsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Acknowledgements")
+                .font(.system(size: 15, weight: .semibold))
+
+            acknowledgementGroup(title: "Swift", names: Self.swiftDependencies)
+            acknowledgementGroup(title: "Web Timeline", names: Self.webDependencies)
+            acknowledgementGroup(title: "Mail and Metadata", names: Self.integrations)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func acknowledgementGroup(title: String, names: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text(names.joined(separator: ", "))
+                .font(.system(size: 13))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var footer: some View {
+        VStack(spacing: 8) {
+            Text("Original source code is licensed under the Mozilla Public License 2.0. Third-party dependencies keep their own licenses and terms.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Link("View License", destination: Self.licenseURL)
+                .font(.system(size: 12))
+        }
+    }
+
+    private var appIcon: NSImage? {
+        guard let iconURL = MailiaAppResources.bundle.url(forResource: "AppIcon", withExtension: "icns") else {
+            return NSApp.applicationIconImage
+        }
+        return NSImage(contentsOf: iconURL) ?? NSApp.applicationIconImage
+    }
+
+    private var versionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+
+        switch (version?.nilIfBlank, build?.nilIfBlank) {
+        case let (version?, build?) where version != build:
+            return "Version \(version) (\(build))"
+        case let (version?, _):
+            return "Version \(version)"
+        case let (_, build?):
+            return "Build \(build)"
+        default:
+            return "Version unknown"
+        }
+    }
+}
+
 private struct SettingsView: View {
     @ObservedObject var viewModel: AppViewModel
     @TimelineDisplayOptionsStorage
@@ -2279,9 +2594,12 @@ private struct SettingsView: View {
     private var autoSyncIntervalMinutes = 10
     @AppStorage(MailiaPreferenceKeys.downloadsDirectoryPath)
     private var downloadsDirectoryPath = ""
+    @ComposerBehaviorSettingsStorage
+    private var composerSettings
     @State private var appearanceDraft: TimelineDisplayOptions
     @State private var syncDraft: SyncSettingsDraft
     @State private var downloadsDraft: DownloadsSettingsDraft
+    @State private var composerDraft: MailiaComposerSettings
     @State private var accountDrafts: [String: AccountSettingsDraft] = [:]
 
     init(viewModel: AppViewModel) {
@@ -2289,99 +2607,20 @@ private struct SettingsView: View {
         _appearanceDraft = State(initialValue: TimelineDisplayOptions.saved())
         _syncDraft = State(initialValue: SyncSettingsDraft.saved())
         _downloadsDraft = State(initialValue: DownloadsSettingsDraft.saved())
+        _composerDraft = State(initialValue: MailiaComposerSettings.saved())
     }
 
     var body: some View {
         ZStack(alignment: .bottom) {
             Form {
-                Section("Sync") {
-                    LabeledContent("Status") {
-                        Text(viewModel.refreshStatus)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if let activity = viewModel.refreshActivity {
-                        if let fraction = activity.fraction {
-                            ProgressView(value: fraction)
-                                .help(activity.detail ?? activity.title)
-                        } else {
-                            ProgressView()
-                                .help(activity.detail ?? activity.title)
-                        }
-                    }
-
-                    Picker("Sync mode", selection: Binding(
-                        get: { syncDraft.autoSyncEnabled ? SettingsSyncMode.automatic : .manual },
-                        set: { mode in syncDraft.autoSyncEnabled = mode == .automatic }
-                    )) {
-                        ForEach(SettingsSyncMode.allCases) { mode in
-                            Text(mode.displayName).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    Picker("Automatic interval", selection: $syncDraft.intervalMinutes) {
-                        ForEach(SyncSettingsDraft.allowedIntervals, id: \.self) { minutes in
-                            Text(SyncSettingsDraft.intervalLabel(minutes)).tag(minutes)
-                        }
-                    }
-                    .disabled(!syncDraft.autoSyncEnabled)
-
-                    HStack {
-                        Spacer()
-
-                        Button("Sync Now") {
-                            Task { await viewModel.refresh() }
-                        }
-                        .disabled(viewModel.isRefreshing)
-
-                        Button("Sync All History Once") {
-                            Task { await viewModel.refreshFullHistory() }
-                        }
-                        .disabled(viewModel.isRefreshing)
-                    }
-                }
-
-                Section("Downloads") {
-                    LabeledContent("Attachment location") {
-                        HStack {
-                            Text(downloadsDraft.effectivePath)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .foregroundStyle(.secondary)
-                            Button("Choose...") {
-                                chooseDownloadsDirectory()
-                            }
-                            Button("Use Downloads") {
-                                downloadsDraft.path = ""
-                            }
-                        }
-                    }
-                }
-
-                Section("Cache Management") {
-                    CacheSettingsTable(
-                        summaries: viewModel.cacheSummaries,
-                        status: viewModel.cacheOperationStatus,
-                        onClear: { kind in
-                            viewModel.clearCache(kind)
-                        }
-                    )
-                }
-
-                Section("Privacy") {
-                    Toggle("Load remote images", isOn: $appearanceDraft.loadRemoteContent)
-                        .help("Allow message bodies to load remote image URLs.")
-                }
-
                 Section("Accounts") {
                     if viewModel.sendAccounts.isEmpty {
                         ContentUnavailableView {
                             Label("No Accounts", systemImage: "tray")
                         } description: {
-                            Text("Configured Himalaya accounts will appear here after the first refresh.")
+                            Text("No configured Himalaya accounts found.")
                         } actions: {
-                            Button("Refresh Accounts") {
+                            Button("Reload Accounts") {
                                 Task { await viewModel.refreshConfiguredAccounts() }
                             }
                         }
@@ -2415,7 +2654,29 @@ private struct SettingsView: View {
                     }
                 }
 
-                Section("Appearance") {
+                Section("Composer") {
+                    LabeledContent("Line break shortcut") {
+                        Text(composerDraft.lineBreakShortcut.displayName)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Picker("Send shortcut", selection: $composerDraft.sendShortcut) {
+                        ForEach(MailiaComposerShortcut.uniqueSendOptions) { shortcut in
+                            Text(shortcut.displayName).tag(shortcut)
+                        }
+                    }
+
+                    Toggle("Allow undo after sending", isOn: $composerDraft.allowUndoAfterSend)
+
+                    Picker("Undo duration", selection: $composerDraft.undoDelaySeconds) {
+                        ForEach(MailiaComposerSettings.allowedUndoDelaySeconds, id: \.self) { seconds in
+                            Text(MailiaComposerSettings.undoDelayLabel(seconds)).tag(seconds)
+                        }
+                    }
+                    .disabled(!composerDraft.allowUndoAfterSend)
+                }
+
+                Section("Reading") {
                     Picker("Message body rendering", selection: $appearanceDraft.bodyDisplayMode) {
                         ForEach(TimelineBodyDisplayMode.allCases) { mode in
                             Text(mode.displayName).tag(mode.rawValue)
@@ -2431,21 +2692,81 @@ private struct SettingsView: View {
 
                     Toggle("Hide reply subjects", isOn: $appearanceDraft.hideReplySubjects)
                 }
+
+                Section("Privacy") {
+                    Toggle("Load remote images", isOn: $appearanceDraft.loadRemoteContent)
+                        .help("Allow message bodies to load remote image URLs.")
+                }
+
+                Section("Sync") {
+                    Picker("Sync mode", selection: Binding(
+                        get: { syncDraft.autoSyncEnabled ? SettingsSyncMode.automatic : .manual },
+                        set: { mode in syncDraft.autoSyncEnabled = mode == .automatic }
+                    )) {
+                        ForEach(SettingsSyncMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Picker("Automatic interval", selection: $syncDraft.intervalMinutes) {
+                        ForEach(SyncSettingsDraft.allowedIntervals, id: \.self) { minutes in
+                            Text(SyncSettingsDraft.intervalLabel(minutes)).tag(minutes)
+                        }
+                    }
+                    .disabled(!syncDraft.autoSyncEnabled)
+                }
+
+                Section("Files") {
+                    LabeledContent("Attachment location") {
+                        HStack {
+                            Text(downloadsDraft.effectivePath)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundStyle(.secondary)
+                            Button("Choose...") {
+                                chooseDownloadsDirectory()
+                            }
+
+                            if downloadsDraft.isCustomPath {
+                                Button("Reset to Downloads") {
+                                    downloadsDraft.path = ""
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("Storage") {
+                    CacheSettingsTable(
+                        summaries: viewModel.cacheSummaries,
+                        status: viewModel.cacheOperationStatus,
+                        onClear: { kind in
+                            viewModel.clearCache(kind)
+                        }
+                    )
+                }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .background(MailiaSettingsChrome.backgroundColor)
             .padding()
-            .padding(.bottom, 58)
 
-            settingsSaveBar
+            if hasUnsavedSettingsChanges {
+                settingsSaveBar
+                    .padding(.trailing, 18)
+                    .padding(.bottom, 14)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
         }
+        .animation(.easeOut(duration: 0.16), value: hasUnsavedSettingsChanges)
         .frame(width: 700, height: 560)
         .background(MailiaSettingsChrome.backgroundColor)
         .task {
             syncSettingsDraft()
             syncAppearanceDraft()
             syncDownloadsDraft()
+            syncComposerDraft()
             syncAccountDrafts(with: viewModel.sendAccounts)
             await viewModel.refreshConfiguredAccounts()
             await viewModel.refreshCacheSummaries()
@@ -2456,22 +2777,22 @@ private struct SettingsView: View {
     }
 
     private var settingsSaveBar: some View {
-        HStack {
-            Spacer()
+        HStack(spacing: 8) {
             Button("Reset") {
                 resetSettingsDrafts()
             }
-            .disabled(!hasUnsavedSettingsChanges)
             Button("Save") {
                 saveSettingsDrafts()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!hasUnsavedSettingsChanges)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity)
-        .background(MailiaSettingsChrome.backgroundColor)
+        .padding(8)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .shadow(color: Color.black.opacity(0.12), radius: 12, y: 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
     }
 
     private var savedAppearanceDraft: TimelineDisplayOptions {
@@ -2489,8 +2810,16 @@ private struct SettingsView: View {
         DownloadsSettingsDraft(path: downloadsDirectoryPath)
     }
 
+    private var savedComposerDraft: MailiaComposerSettings {
+        composerSettings
+    }
+
     private var hasUnsavedSettingsChanges: Bool {
-        hasUnsavedSyncChanges || hasUnsavedDownloadsChanges || hasUnsavedAppearanceChanges || hasUnsavedAccountChanges
+        hasUnsavedSyncChanges
+            || hasUnsavedDownloadsChanges
+            || hasUnsavedComposerChanges
+            || hasUnsavedAppearanceChanges
+            || hasUnsavedAccountChanges
     }
 
     private var hasUnsavedSyncChanges: Bool {
@@ -2499,6 +2828,10 @@ private struct SettingsView: View {
 
     private var hasUnsavedDownloadsChanges: Bool {
         downloadsDraft != savedDownloadsDraft
+    }
+
+    private var hasUnsavedComposerChanges: Bool {
+        composerDraft != savedComposerDraft
     }
 
     private var hasUnsavedAppearanceChanges: Bool {
@@ -2546,10 +2879,15 @@ private struct SettingsView: View {
         downloadsDraft = savedDownloadsDraft
     }
 
+    private func syncComposerDraft() {
+        composerDraft = savedComposerDraft
+    }
+
     private func resetSettingsDrafts() {
         syncSettingsDraft()
         syncAppearanceDraft()
         syncDownloadsDraft()
+        syncComposerDraft()
         syncAccountDrafts(with: viewModel.sendAccounts)
     }
 
@@ -2558,6 +2896,7 @@ private struct SettingsView: View {
         saveSyncDraft()
         saveAppearanceDraft()
         saveDownloadsDraft()
+        saveComposerDraft()
         saveAccountDrafts()
     }
 
@@ -2572,6 +2911,10 @@ private struct SettingsView: View {
 
     private func saveDownloadsDraft() {
         downloadsDirectoryPath = downloadsDraft.normalizedPath
+    }
+
+    private func saveComposerDraft() {
+        composerSettings = composerDraft
     }
 
     private func saveAccountDrafts() {
@@ -2748,6 +3091,10 @@ private struct DownloadsSettingsDraft: Equatable {
 
     var effectivePath: String {
         normalizedPath.nilIfBlank ?? Self.defaultDownloadsPath()
+    }
+
+    var isCustomPath: Bool {
+        normalizedPath.nilIfBlank != nil
     }
 
     static func saved(defaults: UserDefaults = .standard) -> DownloadsSettingsDraft {

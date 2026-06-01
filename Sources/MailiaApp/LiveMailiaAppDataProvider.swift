@@ -37,6 +37,7 @@ protocol MailiaAppDataProviding {
         anchorID: Int64?,
         limit: Int
     ) async throws -> MailiaTimelinePage
+    func loadLatestTimelineItems(entityIDs: [Int64], workspace: MailiaWorkspace) async throws -> [MailiaTimelineItem]
     func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody
     func performEntityAction(
         _ action: MailiaEntityAction,
@@ -47,11 +48,11 @@ protocol MailiaAppDataProviding {
     func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws
     func downloadAttachments(for item: MailiaTimelineItem) async throws -> MailiaAttachmentDownloadResult
-    func sendReply(to item: MailiaTimelineItem, body: String, replyAll: Bool, accountKey: String?) async throws
+    func sendReply(to item: MailiaTimelineItem, content: MailiaComposerContent, replyAll: Bool, accountKey: String?) async throws
     func sendNewMessage(
         to recipients: [String],
         subject: String?,
-        body: String,
+        content: MailiaComposerContent,
         accountKey: String?
     ) async throws
     func loadSendAccounts() async throws -> [MailiaSendAccount]
@@ -98,8 +99,8 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
     private let himalayaCommandLimiter: HimalayaCommandLimiter
     private let downloadsDirectory: URL
     private let revealDownloadedFiles: @MainActor ([URL], URL) -> Void
-    private let htmlDisplayNormalizer = HTMLDisplayNormalizer()
-    private let messageTextNormalizer = MessageTextNormalizer()
+    private let emailDisplayPipeline = EmailHTMLDisplayPipeline()
+    private let htmlTextExtractor = HTMLTextExtractor()
 
     init() {
         do {
@@ -577,36 +578,132 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         return MailiaTimelinePage(items: items, hasMore: hasMore)
     }
 
+    func loadLatestTimelineItems(entityIDs: [Int64], workspace: MailiaWorkspace) async throws -> [MailiaTimelineItem] {
+        var seenEntityIDs = Set<Int64>()
+        let uniqueEntityIDs = entityIDs.filter { seenEntityIDs.insert($0).inserted }
+        guard !uniqueEntityIDs.isEmpty else { return [] }
+
+        let emojiByAccount: [String: String] = Dictionary(
+            uniqueKeysWithValues: try repository.accounts().compactMap { account -> (String, String)? in
+                guard let emoji = account.emoji?.nilIfBlank else { return nil }
+                return (account.accountKey, emoji)
+            }
+        )
+
+        var items: [MailiaTimelineItem] = []
+        items.reserveCapacity(uniqueEntityIDs.count)
+        for entityID in uniqueEntityIDs {
+            guard let message = try repository.messages(
+                entityID: entityID,
+                workspace: workspace.coreWorkspace,
+                includeBodies: false,
+                limit: 1
+            ).first else {
+                continue
+            }
+            items.append(makeTimelineItem(message: message, entityID: entityID, emojiByAccount: emojiByAccount))
+        }
+        return items
+    }
+
     func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody {
         if let cached = try repository.messageBody(messageID: item.id),
-           cached.sanitizedHTML?.nilIfBlank != nil || cached.textFallback?.nilIfBlank != nil {
+           let body = try cachedTimelineBody(cached, item: item) {
+            return body
+        }
+
+        let locations = try bodyFetchLocations(for: item)
+        guard !locations.isEmpty else {
+            return unavailableTimelineBody(item: item)
+        }
+
+        var lastBody: MessageBodyFetchResult?
+        for location in locations {
+            let body = try await fetchBody(
+                messageID: item.id,
+                accountKey: location.accountKey,
+                folderName: location.sourceFolderName,
+                envelopeID: location.himalayaEnvelopeID
+            )
+            if body.hasAttachments {
+                try repository.setMessageHasAttachments(messageID: item.id, hasAttachments: true)
+            }
+            guard body.hasDisplayContent else {
+                lastBody = body
+                continue
+            }
+
+            try repository.cacheMessageBody(
+                messageID: item.id,
+                sanitizedHTML: body.sanitizedHTML,
+                textFallback: body.textFallback,
+                sanitizerVersion: body.sanitizerVersion
+            )
             return MailiaTimelineBody(
-                html: displayHTML(cached.sanitizedHTML),
-                text: cached.textFallback?.nilIfBlank
+                html: body.sanitizedHTML?.nilIfBlank,
+                hasAttachments: item.hasAttachments || body.hasAttachments
             )
         }
 
-        guard let folderName = item.folderLabel.nilIfBlank,
-              let envelopeID = item.envelopeID.nilIfBlank else {
-            return MailiaTimelineBody(html: nil, text: nil)
-        }
-
-        let body = try await fetchBody(
-            messageID: item.id,
-            accountKey: item.accountLabel,
-            folderName: folderName,
-            envelopeID: envelopeID
+        let body = lastBody ?? MessageBodyFetchResult(
+            sanitizedHTML: nil,
+            textFallback: nil,
+            hasAttachments: false,
+            sanitizerVersion: EmailHTMLDisplayPipeline.sanitizerVersion
         )
         try repository.cacheMessageBody(
             messageID: item.id,
             sanitizedHTML: body.sanitizedHTML,
             textFallback: body.textFallback,
-            sanitizerVersion: 2
+            sanitizerVersion: body.sanitizerVersion
         )
+        if body.sanitizedHTML?.nilIfBlank == nil {
+            return unavailableTimelineBody(item: item)
+        }
         return MailiaTimelineBody(
-            html: displayHTML(body.sanitizedHTML),
-            text: body.textFallback?.nilIfBlank
+            html: body.sanitizedHTML?.nilIfBlank,
+            hasAttachments: item.hasAttachments || body.hasAttachments
         )
+    }
+
+    private func cachedTimelineBody(_ cached: TimelineMessageBody, item: MailiaTimelineItem) throws -> MailiaTimelineBody? {
+        if cached.sanitizerVersion != EmailHTMLDisplayPipeline.sanitizerVersion {
+            return nil
+        }
+
+        guard let html = cached.sanitizedHTML?.nilIfBlank else {
+            return nil
+        }
+
+        return MailiaTimelineBody(
+            html: html,
+            hasAttachments: item.hasAttachments
+        )
+    }
+
+    private func bodyFetchLocations(for item: MailiaTimelineItem) throws -> [MessageLocationTarget] {
+        var locations = try repository.messageLocations(messageID: item.id)
+        if let folderName = item.folderLabel.nilIfBlank,
+           let envelopeID = item.envelopeID.nilIfBlank {
+            let preferred = MessageLocationTarget(
+                messageID: item.id,
+                accountKey: item.accountLabel,
+                sourceFolderName: folderName,
+                sourceFolderRole: .unknown,
+                himalayaEnvelopeID: envelopeID
+            )
+            locations.removeAll {
+                $0.accountKey == preferred.accountKey &&
+                $0.sourceFolderName == preferred.sourceFolderName &&
+                $0.himalayaEnvelopeID == preferred.himalayaEnvelopeID
+            }
+            locations.insert(preferred, at: 0)
+        }
+        return locations
+    }
+
+    private func unavailableTimelineBody(item: MailiaTimelineItem) -> MailiaTimelineBody {
+        MailiaTimelineBody(html: nil, hasAttachments: item.hasAttachments)
     }
 
     private enum EntityActionOperation: Sendable {
@@ -946,19 +1043,25 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         )
     }
 
-    func sendReply(to item: MailiaTimelineItem, body: String, replyAll: Bool, accountKey: String?) async throws {
+    func sendReply(
+        to item: MailiaTimelineItem,
+        content: MailiaComposerContent,
+        replyAll: Bool,
+        accountKey: String?
+    ) async throws {
         guard let folderName = item.folderLabel.nilIfBlank,
               let envelopeID = item.envelopeID.nilIfBlank else {
             throw EntityActionError.noMatchingMessageLocation
         }
-        guard let body = body.nilIfBlank else {
+        let plainBody = content.plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard plainBody.nilIfBlank != nil || content.hasRenderableContent else {
             throw EntityActionError.noMessages
         }
 
         let templateResult = try await runHimalaya(
             .templateReply(
                 id: envelopeID,
-                body: body,
+                body: plainBody.nilIfBlank ?? " ",
                 folder: folderName,
                 account: item.accountLabel,
                 replyAll: replyAll
@@ -974,24 +1077,38 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             throw EntityActionError.noMessages
         }
 
-        _ = try await runHimalaya(
-            .templateSend(template: template, account: accountKey?.nilIfBlank ?? item.accountLabel),
-            timeout: 120,
-            priority: .interactive
-        ).requireSuccess()
+        if content.requiresRawMIME {
+            let parsedTemplate = MailiaEmailTemplate.parse(template)
+            let rawMessage = try OutgoingMessageMIMEBuilder.rawMessage(
+                headers: parsedTemplate.headers,
+                content: content
+            )
+            _ = try await runHimalaya(
+                .messageSend(message: rawMessage, account: accountKey?.nilIfBlank ?? item.accountLabel),
+                timeout: 300,
+                priority: .interactive
+            ).requireSuccess()
+        } else {
+            _ = try await runHimalaya(
+                .templateSend(template: template, account: accountKey?.nilIfBlank ?? item.accountLabel),
+                timeout: 120,
+                priority: .interactive
+            ).requireSuccess()
+        }
     }
 
     func sendNewMessage(
         to recipients: [String],
         subject: String?,
-        body: String,
+        content: MailiaComposerContent,
         accountKey: String?
     ) async throws {
         let cleanedRecipients = recipients.compactMap(Self.mailHeaderValue)
         guard !cleanedRecipients.isEmpty else {
             throw EntityActionError.noMessages
         }
-        guard let body = body.nilIfBlank else {
+        let plainBody = content.plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard plainBody.nilIfBlank != nil || content.hasRenderableContent else {
             throw EntityActionError.noMessages
         }
 
@@ -1001,7 +1118,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         }
 
         let templateResult = try await runHimalaya(
-            .templateWrite(body: body, headers: headers, account: accountKey?.nilIfBlank),
+            .templateWrite(body: plainBody.nilIfBlank ?? " ", headers: headers, account: accountKey?.nilIfBlank),
             timeout: 60,
             priority: .interactive
         ).requireSuccess()
@@ -1011,11 +1128,24 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             throw EntityActionError.noMessages
         }
 
-        _ = try await runHimalaya(
-            .templateSend(template: template, account: accountKey?.nilIfBlank),
-            timeout: 120,
-            priority: .interactive
-        ).requireSuccess()
+        if content.requiresRawMIME {
+            let parsedTemplate = MailiaEmailTemplate.parse(template)
+            let rawMessage = try OutgoingMessageMIMEBuilder.rawMessage(
+                headers: parsedTemplate.headers,
+                content: content
+            )
+            _ = try await runHimalaya(
+                .messageSend(message: rawMessage, account: accountKey?.nilIfBlank),
+                timeout: 300,
+                priority: .interactive
+            ).requireSuccess()
+        } else {
+            _ = try await runHimalaya(
+                .templateSend(template: template, account: accountKey?.nilIfBlank),
+                timeout: 120,
+                priority: .interactive
+            ).requireSuccess()
+        }
     }
 
     private static func mailHeaderValue(_ value: String?) -> String? {
@@ -1069,7 +1199,9 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             direction: message.direction,
             subject: message.subject?.nilIfBlank ?? "(No subject)",
             preview: preview(for: message),
-            html: displayHTML(message.sanitizedHTML),
+            html: message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion
+                ? message.sanitizedHTML?.nilIfBlank
+                : nil,
             date: HimalayaDateParser.parse(message.messageDate),
             accountLabel: message.accountKey,
             accountEmoji: emojiByAccount[message.accountKey],
@@ -1083,7 +1215,18 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         )
     }
 
-    private func fetchBody(messageID: Int64, accountKey: String, folderName: String, envelopeID: String) async throws -> (sanitizedHTML: String?, textFallback: String?) {
+    private struct MessageBodyFetchResult {
+        var sanitizedHTML: String?
+        var textFallback: String?
+        var hasAttachments: Bool
+        var sanitizerVersion: Int
+
+        var hasDisplayContent: Bool {
+            sanitizedHTML?.nilIfBlank != nil
+        }
+    }
+
+    private func fetchBody(messageID: Int64, accountKey: String, folderName: String, envelopeID: String) async throws -> MessageBodyFetchResult {
         let exportDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MailiaExport-\(messageID)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
@@ -1091,42 +1234,29 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             try? FileManager.default.removeItem(at: exportDirectory)
         }
 
-        do {
-            _ = try await runHimalaya(
-                .messageExport(id: envelopeID, folder: folderName, account: accountKey, destination: exportDirectory),
-                timeout: 30,
-                priority: .visibleBody
-            ).requireSuccess()
-
-            let htmlURL = exportDirectory.appendingPathComponent("index.html")
-            let textURL = exportDirectory.appendingPathComponent("plain.txt")
-            let html = try? String(contentsOf: htmlURL, encoding: .utf8)
-            let text = (try? String(contentsOf: textURL, encoding: .utf8))
-                .map(messageTextNormalizer.normalize)
-
-            if let html, let sanitized = try? HTMLSanitizer().sanitize(html) {
-                return (sanitized.content, text?.nilIfBlank)
-            }
-            if let text = text?.nilIfBlank {
-                return (nil, text)
-            }
-        } catch {
-            // Fall through to preview read below.
-        }
-
-        let result = try await runHimalaya(
-            .messageReadPreview(id: envelopeID, folder: folderName, account: accountKey),
-            timeout: 20,
+        _ = try await runHimalaya(
+            .messageExport(id: envelopeID, folder: folderName, account: accountKey, destination: exportDirectory),
+            timeout: 30,
             priority: .visibleBody
         ).requireSuccess()
-        return (nil, messageTextNormalizer.normalize(try result.decodeJSON(as: String.self)))
-    }
 
-    private func displayHTML(_ html: String?) -> String? {
-        guard let html = html?.nilIfBlank else {
-            return nil
-        }
-        return htmlDisplayNormalizer.normalize(html).nilIfBlank
+        let htmlURL = exportDirectory.appendingPathComponent("index.html")
+        let textURL = exportDirectory.appendingPathComponent("plain.txt")
+        let html = try? String(contentsOf: htmlURL, encoding: .utf8)
+        let rawText = try? String(contentsOf: textURL, encoding: .utf8)
+
+        let document = try emailDisplayPipeline.document(
+            exportedHTML: html,
+            exportedText: rawText,
+            exportDirectory: exportDirectory
+        )
+
+        return MessageBodyFetchResult(
+            sanitizedHTML: document.html,
+            textFallback: document.textFallback,
+            hasAttachments: document.hasAttachments,
+            sanitizerVersion: document.sanitizerVersion
+        )
     }
 
     private func runHimalaya(
@@ -1216,6 +1346,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                     unreadCount: item.unreadCount,
                     latestSubject: item.latestSubject?.nilIfBlank ?? "(No subject)",
                     latestBodyPreview: item.latestBodyPreview?.nilIfBlank,
+                    latestMessageID: item.latestMessageID,
                     latestDate: item.latestDate,
                     accountKeys: item.accountKeys,
                     accountLabel: item.accountKeys.isEmpty ? "" : item.accountKeys.joined(separator: ", "),
@@ -1230,7 +1361,10 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             return text
         }
         if let html = message.sanitizedHTML?.nilIfBlank {
-            return html
+            if message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion,
+               let preview = htmlTextExtractor.previewText(from: html) {
+                return preview
+            }
         }
         let from = message.from?.displayLabel
         let to = message.to.map(\.displayLabel).joined(separator: ", ")

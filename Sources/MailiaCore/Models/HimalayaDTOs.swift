@@ -55,6 +55,7 @@ public struct EntityListItem: Identifiable, Equatable, Sendable {
     public var emailAddresses: [String]
     public var latestSubject: String?
     public var latestBodyPreview: String?
+    public var latestMessageID: Int64?
     public var latestDate: Date?
     public var unreadCount: Int
     public var accountKeys: [String]
@@ -66,6 +67,7 @@ public struct EntityListItem: Identifiable, Equatable, Sendable {
         emailAddresses: [String] = [],
         latestSubject: String? = nil,
         latestBodyPreview: String? = nil,
+        latestMessageID: Int64? = nil,
         latestDate: Date? = nil,
         unreadCount: Int = 0,
         accountKeys: [String] = []
@@ -76,6 +78,7 @@ public struct EntityListItem: Identifiable, Equatable, Sendable {
         self.emailAddresses = emailAddresses
         self.latestSubject = latestSubject
         self.latestBodyPreview = latestBodyPreview
+        self.latestMessageID = latestMessageID
         self.latestDate = latestDate
         self.unreadCount = unreadCount
         self.accountKeys = accountKeys

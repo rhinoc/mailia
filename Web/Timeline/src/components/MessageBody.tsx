@@ -8,7 +8,6 @@ import type { BodyDisplayMode } from "../types";
 const REMOTE_IMAGE_PLACEHOLDER =
   "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 const REMOTE_IMAGE_PLACEHOLDER_CLASS = "mailia-remote-image-placeholder";
-const LEGACY_REMOTE_IMAGE_PLACEHOLDER_CLASS = "mail-body__blocked-image";
 const BLOCKED_REMOTE_IMAGE_LABEL = "Remote image blocked";
 const turndown = new TurndownService({
   headingStyle: "atx",
@@ -53,10 +52,7 @@ turndown.addRule("blockedRemoteImage", {
 
     return (
       classList !== null &&
-      (
-        classList.contains(REMOTE_IMAGE_PLACEHOLDER_CLASS) ||
-        classList.contains(LEGACY_REMOTE_IMAGE_PLACEHOLDER_CLASS)
-      )
+      classList.contains(REMOTE_IMAGE_PLACEHOLDER_CLASS)
     );
   },
   replacement() {
@@ -126,12 +122,13 @@ function markdownComponents(loadRemoteContent: boolean): Components {
       return <a className="mail-markdown__link" rel="noreferrer" {...props} />;
     },
     img({ node: _node, src, alt, ...props }) {
+      const displaySrc = httpsUpgradedImageURL(src) ?? src;
       if (!loadRemoteContent && src === REMOTE_IMAGE_PLACEHOLDER) {
         return <span className="mail-markdown__blocked-image" aria-label={BLOCKED_REMOTE_IMAGE_LABEL} />;
       }
 
-      if (loadRemoteContent || !isRemoteURL(src)) {
-        return <img className="mail-markdown__image" src={src} alt={alt ?? ""} {...props} />;
+      if (!isInsecureRemoteURL(displaySrc) && (loadRemoteContent || !isRemoteURL(displaySrc))) {
+        return <img className="mail-markdown__image" src={displaySrc} alt={alt ?? ""} {...props} />;
       }
 
       return <span className="mail-markdown__blocked-image" aria-label={BLOCKED_REMOTE_IMAGE_LABEL} />;
@@ -144,7 +141,6 @@ function markdownComponents(loadRemoteContent: boolean): Components {
 
 interface MessageBodyProps {
   html?: string | null;
-  text?: string | null;
   mode: BodyDisplayMode;
   loadRemoteContent: boolean;
   hideQuotedReplyText: boolean;
@@ -153,25 +149,16 @@ interface MessageBodyProps {
 
 export const MessageBody = memo(function MessageBody({
   html,
-  text,
   mode,
   loadRemoteContent,
   hideQuotedReplyText,
   onMeasuredHeight
 }: MessageBodyProps) {
   const markdownFrameRef = useRef<HTMLDivElement>(null);
-  const displayText = useMemo(() => {
-    if (!text) return "";
-    return hideQuotedReplyText ? stripTrailingQuotedReplyText(text) : text;
-  }, [hideQuotedReplyText, text]);
-
   const normalizedHTML = useMemo(() => {
     if (html) return html;
-    if (!text) return "<p>No body content is available for this message.</p>";
-    if (!displayText.trim()) return "";
-
-    return `<pre>${escapeHTML(displayText)}</pre>`;
-  }, [displayText, html, text]);
+    return "<p>No body content is available for this message.</p>";
+  }, [html]);
 
   const sanitizedHTML = useMemo(
     () => sanitizeEmailHTML(normalizedHTML, hideQuotedReplyText),
@@ -179,16 +166,13 @@ export const MessageBody = memo(function MessageBody({
   );
 
   const displayHTML = useMemo(() => {
-    if (loadRemoteContent) return sanitizedHTML;
-    return blockRemoteImages(sanitizedHTML);
+    return blockUnsafeRemoteImages(sanitizedHTML, loadRemoteContent);
   }, [loadRemoteContent, sanitizedHTML]);
 
   const markdown = useMemo(() => {
     if (mode !== "markdown") return "";
-    if (html) return turndown.turndown(displayHTML).trim();
-    if (text) return displayText.trim();
-    return "No body content is available for this message.";
-  }, [displayHTML, displayText, html, mode, text]);
+    return turndown.turndown(displayHTML).trim() || "No body content is available for this message.";
+  }, [displayHTML, mode]);
 
   const markdownRenderers = useMemo(
     () => markdownComponents(loadRemoteContent),
@@ -402,15 +386,6 @@ function fitHTMLZoom(contentWidth: number, availableWidth: number) {
   return Math.min(1, availableWidth / contentWidth);
 }
 
-function escapeHTML(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
 function compactMarkdownText(value: string) {
   return value
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
@@ -470,19 +445,101 @@ function removeUnsafeInlineStyle(element: Element) {
   const style = element.getAttribute("style");
   if (!style) return;
 
-  if (!isSafeInlineStyle(style)) {
+  const filteredStyle = filteredInlineStyle(style);
+  if (filteredStyle) {
+    element.setAttribute("style", filteredStyle);
+  } else {
     element.removeAttribute("style");
   }
 }
 
-function isSafeInlineStyle(style: string) {
-  const lowercased = style.toLowerCase();
-  return !(
+const SAFE_INLINE_STYLE_PROPERTIES = new Set([
+  "background",
+  "background-color",
+  "border",
+  "border-bottom",
+  "border-collapse",
+  "border-color",
+  "border-left",
+  "border-radius",
+  "border-right",
+  "border-spacing",
+  "border-style",
+  "border-top",
+  "border-width",
+  "box-sizing",
+  "clear",
+  "color",
+  "direction",
+  "display",
+  "font",
+  "font-family",
+  "font-size",
+  "font-style",
+  "font-variant",
+  "font-weight",
+  "height",
+  "letter-spacing",
+  "line-height",
+  "margin",
+  "margin-bottom",
+  "margin-left",
+  "margin-right",
+  "margin-top",
+  "max-height",
+  "max-width",
+  "min-height",
+  "min-width",
+  "opacity",
+  "overflow",
+  "padding",
+  "padding-bottom",
+  "padding-left",
+  "padding-right",
+  "padding-top",
+  "text-align",
+  "text-decoration",
+  "text-indent",
+  "text-transform",
+  "vertical-align",
+  "white-space",
+  "width",
+  "word-break",
+  "word-spacing",
+  "word-wrap"
+]);
+
+function filteredInlineStyle(style: string) {
+  const declarations: string[] = [];
+
+  for (const declaration of style.split(";")) {
+    const [rawProperty, ...rawValue] = declaration.split(":");
+    const property = rawProperty?.trim().toLowerCase();
+    const value = rawValue.join(":").trim();
+    if (!property || !value) continue;
+    if (!SAFE_INLINE_STYLE_PROPERTIES.has(property)) continue;
+    const safeValue = sanitizedInlineStyleValue(value);
+    if (!safeValue) continue;
+
+    declarations.push(`${property}: ${safeValue}`);
+  }
+
+  return declarations.join("; ");
+}
+
+function sanitizedInlineStyleValue(value: string) {
+  const withoutPriority = value.replace(/!\s*important/gi, "").trim();
+  const lowercased = withoutPriority.toLowerCase();
+  if (
     lowercased.includes("url(") ||
     lowercased.includes("@import") ||
     lowercased.includes("expression(") ||
     lowercased.includes("behavior:")
-  );
+  ) {
+    return null;
+  }
+
+  return withoutPriority;
 }
 
 function sanitizeEmailURLAttributes(element: Element) {
@@ -628,14 +685,15 @@ function isAllowedLinkURL(value: string) {
   return ["http:", "https:", "mailto:"].includes(schemeMatch[0].toLowerCase());
 }
 
-function blockRemoteImages(html: string) {
+function blockUnsafeRemoteImages(html: string, loadRemoteContent: boolean) {
   const template = document.createElement("template");
   template.innerHTML = html;
 
   for (const image of Array.from(template.content.querySelectorAll("img"))) {
+    upgradeInsecureImageAttributes(image);
     const src = image.getAttribute("src") ?? "";
     const srcset = image.getAttribute("srcset") ?? "";
-    if (!isRemoteURL(src) && !srcsetContainsRemoteURL(srcset)) continue;
+    if (!shouldBlockRemoteImage(src, srcset, loadRemoteContent)) continue;
 
     const placeholder = remoteImagePlaceholder(image);
     const imageOnlyLink = imageOnlyLinkParent(image);
@@ -647,6 +705,12 @@ function blockRemoteImages(html: string) {
   }
 
   return template.innerHTML;
+}
+
+function shouldBlockRemoteImage(src: string, srcset: string, loadRemoteContent: boolean) {
+  if (isInsecureRemoteURL(src) || srcsetContainsInsecureRemoteURL(srcset)) return true;
+  if (loadRemoteContent) return false;
+  return isRemoteURL(src) || srcsetContainsRemoteURL(srcset);
 }
 
 function imageOnlyLinkParent(image: HTMLImageElement) {
@@ -734,9 +798,62 @@ function isRemoteURL(value?: string | null) {
   return /^https?:\/\//i.test(trimmed) || trimmed.startsWith("//");
 }
 
+function isInsecureRemoteURL(value?: string | null) {
+  const trimmed = value?.trim() ?? "";
+  return /^http:\/\//i.test(trimmed);
+}
+
+function upgradeInsecureImageAttributes(image: HTMLImageElement) {
+  const src = image.getAttribute("src") ?? "";
+  const upgradedSrc = httpsUpgradedImageURL(src);
+  if (upgradedSrc) image.setAttribute("src", upgradedSrc);
+
+  const srcset = image.getAttribute("srcset") ?? "";
+  const upgradedSrcset = httpsUpgradedImageSrcset(srcset);
+  if (upgradedSrcset) image.setAttribute("srcset", upgradedSrcset);
+}
+
+function httpsUpgradedImageURL(value?: string | null) {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return null;
+
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:") return null;
+    url.protocol = "https:";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function srcsetContainsRemoteURL(value: string) {
   return value
     .split(",")
     .map((candidate) => candidate.trim().split(/\s+/)[0] ?? "")
     .some(isRemoteURL);
+}
+
+function httpsUpgradedImageSrcset(value: string) {
+  let changed = false;
+  const upgradedCandidates = value.split(",").map((candidate) => {
+    const trimmed = candidate.trim();
+    if (!trimmed) return candidate;
+
+    const parts = trimmed.split(/\s+/);
+    const upgradedURL = httpsUpgradedImageURL(parts[0]);
+    if (!upgradedURL) return candidate;
+
+    changed = true;
+    return [upgradedURL, ...parts.slice(1)].join(" ");
+  });
+
+  return changed ? upgradedCandidates.join(", ") : null;
+}
+
+function srcsetContainsInsecureRemoteURL(value: string) {
+  return value
+    .split(",")
+    .map((candidate) => candidate.trim().split(/\s+/)[0] ?? "")
+    .some(isInsecureRemoteURL);
 }

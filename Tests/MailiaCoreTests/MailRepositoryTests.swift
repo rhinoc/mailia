@@ -65,7 +65,7 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
         messageID: messages[0].messageID,
         sanitizedHTML: "<p>Build passed</p>",
         textFallback: "Build passed",
-        sanitizerVersion: 1
+        sanitizerVersion: EmailHTMLDisplayPipeline.sanitizerVersion
     )
     let entitiesWithCachedPreview = try repository.entityList(workspace: .main)
     #expect(entitiesWithCachedPreview.first?.latestBodyPreview == "Build passed")
@@ -79,6 +79,7 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
     let cachedBody = try #require(try repository.messageBody(messageID: messages[0].messageID))
     #expect(cachedBody.sanitizedHTML == "<p>Build passed</p>")
     #expect(cachedBody.textFallback == "Build passed")
+    #expect(cachedBody.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion)
     let bodyCacheStats = try repository.messageBodyCacheStats()
     #expect(bodyCacheStats.itemCount == 1)
     #expect(bodyCacheStats.byteSize > 0)
@@ -91,6 +92,15 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
 
     let locations = try repository.messageLocations(entityID: mainEntity.id, workspace: .main, sourceRoles: [.normal])
     #expect(locations.map(\.sourceFolderName).sorted() == ["Archive", "INBOX"])
+    let messageLocations = try repository.messageLocations(messageID: messages[0].messageID)
+    #expect(messageLocations.map(\.sourceFolderName).sorted() == ["Archive", "INBOX"])
+    let didSetAttachments = try repository.setMessageHasAttachments(
+        messageID: messages[0].messageID,
+        hasAttachments: true
+    )
+    #expect(didSetAttachments)
+    messages = try repository.messages(entityID: mainEntity.id, workspace: .main)
+    #expect(messages[0].hasAttachments)
     let flaggedEntities = try repository.entityList(workspace: .flagged)
     #expect(flaggedEntities.map(\.displayName) == ["GitHub"])
     let flaggedLocations = try repository.messageLocations(entityID: mainEntity.id, workspace: .flagged)

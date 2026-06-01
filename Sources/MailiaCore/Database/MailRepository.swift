@@ -371,6 +371,7 @@ public struct MailRepository {
                         ps.email_address AS primary_email_address,
                         eea.email_addresses,
                         e.kind,
+                        latest.id AS latest_message_id,
                         latest.subject AS latest_subject,
                         latest_body.text_fallback AS latest_body_preview,
                         COALESCE(latest.message_date, latest.created_at) AS latest_message_date,
@@ -382,7 +383,9 @@ public struct MailRepository {
                     JOIN entities e ON e.id = wm.entity_id
                     JOIN latest_messages lm ON lm.entity_id = wm.entity_id
                     JOIN messages latest ON latest.id = lm.message_id
-                    LEFT JOIN message_bodies latest_body ON latest_body.message_id = latest.id
+                    LEFT JOIN message_bodies latest_body
+                      ON latest_body.message_id = latest.id
+                     AND latest_body.sanitizer_version = \(EmailHTMLDisplayPipeline.sanitizerVersion)
                     LEFT JOIN primary_senders ps ON ps.entity_id = e.id AND ps.rank = 1
                     LEFT JOIN entity_email_addresses eea ON eea.entity_id = e.id
                     GROUP BY e.id
@@ -399,6 +402,7 @@ public struct MailRepository {
                     emailAddresses: splitCommaSeparatedValues(row["email_addresses"]),
                     latestSubject: row["latest_subject"],
                     latestBodyPreview: row["latest_body_preview"],
+                    latestMessageID: row["latest_message_id"],
                     latestDate: HimalayaDateParser.parse(row["latest_message_date"] as String?),
                     unreadCount: row["unread_count"],
                     accountKeys: splitCommaSeparatedValues(row["account_keys"])
@@ -431,14 +435,20 @@ public struct MailRepository {
             let bodySelect = includeBodies
                 ? """
                         mb.sanitized_html,
-                        mb.text_fallback
+                        mb.text_fallback,
+                        mb.sanitizer_version
                 """
                 : """
                         NULL AS sanitized_html,
-                        NULL AS text_fallback
+                        NULL AS text_fallback,
+                        NULL AS sanitizer_version
                 """
             let bodyJoin = includeBodies
-                ? "LEFT JOIN message_bodies mb ON mb.message_id = m.id"
+                ? """
+                    LEFT JOIN message_bodies mb
+                      ON mb.message_id = m.id
+                     AND mb.sanitizer_version = \(EmailHTMLDisplayPipeline.sanitizerVersion)
+                """
                 : ""
             let limitClause = limit.map { _ in "LIMIT ?" } ?? ""
             let windowOrder = afterMessageID == nil
@@ -582,7 +592,8 @@ public struct MailRepository {
                     direction: MessageDirection(rawValue: row["timeline_direction"]) ?? .incoming,
                     hasAttachments: hasAttachments != 0,
                     sanitizedHTML: row["sanitized_html"],
-                    textFallback: row["text_fallback"]
+                    textFallback: row["text_fallback"],
+                    sanitizerVersion: row["sanitizer_version"]
                 )
             }
         }
@@ -593,18 +604,20 @@ public struct MailRepository {
             guard let row = try Row.fetchOne(
                 db,
                 sql: """
-                    SELECT sanitized_html, text_fallback
+                    SELECT sanitized_html, text_fallback, sanitizer_version
                     FROM message_bodies
                     WHERE message_id = ?
+                      AND sanitizer_version = ?
                     """,
-                arguments: [messageID]
+                arguments: [messageID, EmailHTMLDisplayPipeline.sanitizerVersion]
             ) else {
                 return nil
             }
 
             return TimelineMessageBody(
                 sanitizedHTML: row["sanitized_html"],
-                textFallback: row["text_fallback"]
+                textFallback: row["text_fallback"],
+                sanitizerVersion: row["sanitizer_version"]
             )
         }
     }
@@ -687,6 +700,46 @@ public struct MailRepository {
         }
     }
 
+    public func messageLocations(messageID: Int64) throws -> [MessageLocationTarget] {
+        try databaseQueue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        ml.message_id,
+                        ml.account_key,
+                        f.provider_name,
+                        f.role,
+                        ml.himalaya_envelope_id
+                    FROM message_locations ml
+                    JOIN folders f ON f.id = ml.folder_id
+                    WHERE ml.message_id = ?
+                      AND ml.missing_since_at IS NULL
+                    ORDER BY
+                        ml.is_primary DESC,
+                        CASE f.role
+                            WHEN 'sent' THEN 0
+                            WHEN 'normal' THEN 1
+                            WHEN 'junk' THEN 2
+                            ELSE 3
+                        END,
+                        ml.id ASC
+                    """,
+                arguments: [messageID]
+            )
+
+            return rows.map { row in
+                MessageLocationTarget(
+                    messageID: row["message_id"],
+                    accountKey: row["account_key"],
+                    sourceFolderName: row["provider_name"],
+                    sourceFolderRole: FolderRole(rawValue: row["role"]) ?? .unknown,
+                    himalayaEnvelopeID: row["himalaya_envelope_id"]
+                )
+            }
+        }
+    }
+
     @discardableResult
     public func setMessageLocationFlag(
         accountKey: String,
@@ -735,6 +788,24 @@ public struct MailRepository {
                     folderName,
                     himalayaEnvelopeID
                 ]
+            )
+            return db.changesCount > 0
+        }
+    }
+
+    @discardableResult
+    public func setMessageHasAttachments(messageID: Int64, hasAttachments: Bool) throws -> Bool {
+        try databaseQueue.write { db in
+            let value = hasAttachments ? 1 : 0
+            try db.execute(
+                sql: """
+                    UPDATE messages
+                    SET has_attachments = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                      AND has_attachments != ?
+                    """,
+                arguments: [value, messageID, value]
             )
             return db.changesCount > 0
         }

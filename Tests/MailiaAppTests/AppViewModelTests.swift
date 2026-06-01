@@ -247,7 +247,7 @@ func newerTimelineRefreshDrivesGlobalRefreshState() async {
 func timelineBodyLoadPublishesLoadedStateAndReusesCache() async {
     let entity = mailiaEntitySummary(id: 1, displayName: "Alice")
     let item = mailiaTimelineItem(id: 10, entityID: entity.id)
-    let body = MailiaTimelineBody(html: "<p>Hello</p>", text: "Hello")
+    let body = MailiaTimelineBody(html: "<p>Hello</p>")
     let provider = FakeMailiaAppDataProvider(
         loadSnapshots: [
             MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date())
@@ -274,6 +274,47 @@ func timelineBodyLoadPublishesLoadedStateAndReusesCache() async {
 
     #expect(provider.loadBodyCallCount == 1)
     #expect(viewModel.timelineBodyStates[item.id] == .loaded(body))
+}
+
+@MainActor
+@Test
+func refreshResetsCancelledTimelineBodyLoadState() async {
+    let entity = mailiaEntitySummary(id: 1, displayName: "Alice")
+    let item = mailiaTimelineItem(id: 10, entityID: entity.id)
+    let snapshot = MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date())
+    let body = MailiaTimelineBody(html: "<p>Hello</p>")
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [snapshot],
+        refreshSnapshots: [snapshot],
+        timelinePages: [
+            MailiaTimelinePage(items: [item], hasMore: false),
+            MailiaTimelinePage(items: [item], hasMore: false)
+        ],
+        bodyResults: [
+            .success(body)
+        ],
+        bodyDelayNanoseconds: 500_000_000
+    )
+    let viewModel = AppViewModel(provider: provider)
+
+    await viewModel.load()
+    await waitUntil {
+        !viewModel.isLoadingTimeline && viewModel.timeline == [item]
+    }
+    viewModel.loadBodyIfNeeded(for: item)
+    await waitUntil {
+        viewModel.timelineBodyStates[item.id] == .loading
+    }
+
+    await viewModel.refresh()
+
+    viewModel.loadBodyIfNeeded(for: item)
+    await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+        viewModel.timelineBodyStates[item.id] == .loaded(body)
+    }
+
+    #expect(viewModel.timelineBodyStates[item.id] == .loaded(body))
+    #expect(provider.loadBodyCallCount == 2)
 }
 
 @MainActor
@@ -447,6 +488,20 @@ func sidebarPreviewKeepsTopicForNonReplySubjects() {
     #expect(entity.sidebarPreview(hideReplySubjects: true, hideQuotedReplyText: true) == "Roadmap")
 }
 
+@MainActor
+@Test
+func sidebarPreviewDoesNotFallbackToReplySubjectWhenBodyPreviewIsMissing() {
+    let entity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        primaryEmailAddress: "alice@example.com",
+        latestSubject: "Re: Roadmap",
+        latestBodyPreview: nil
+    )
+
+    #expect(entity.sidebarPreview(hideReplySubjects: true, hideQuotedReplyText: true) == "")
+}
+
 private func mailiaEntitySummary(
     id: Int64,
     displayName: String,
@@ -464,6 +519,7 @@ private func mailiaEntitySummary(
         unreadCount: 0,
         latestSubject: latestSubject,
         latestBodyPreview: latestBodyPreview,
+        latestMessageID: nil,
         latestDate: nil,
         accountKeys: accountKeys,
         accountLabel: "",
@@ -533,6 +589,7 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     private let lastRefreshFinishedAt: Date?
     private let refreshDelayNanoseconds: UInt64
     private let refreshAfterSendingDelayNanoseconds: UInt64
+    private let bodyDelayNanoseconds: UInt64
     private let refreshError: Error?
     private(set) var loadSnapshotCallCount = 0
     private(set) var lastRefreshFinishedAtCallCount = 0
@@ -555,6 +612,7 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         lastRefreshFinishedAt: Date? = nil,
         refreshDelayNanoseconds: UInt64 = 0,
         refreshAfterSendingDelayNanoseconds: UInt64 = 0,
+        bodyDelayNanoseconds: UInt64 = 0,
         refreshError: Error? = nil
     ) {
         self.loadSnapshots = loadSnapshots
@@ -567,6 +625,7 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         self.lastRefreshFinishedAt = lastRefreshFinishedAt
         self.refreshDelayNanoseconds = refreshDelayNanoseconds
         self.refreshAfterSendingDelayNanoseconds = refreshAfterSendingDelayNanoseconds
+        self.bodyDelayNanoseconds = bodyDelayNanoseconds
         self.refreshError = refreshError
     }
 
@@ -662,8 +721,18 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         return timelinePages.removeFirst()
     }
 
+    func loadLatestTimelineItems(entityIDs: [Int64], workspace: MailiaWorkspace) async throws -> [MailiaTimelineItem] {
+        []
+    }
+
     func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody {
         loadBodyCallCount += 1
+        if bodyDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: bodyDelayNanoseconds)
+        }
+        guard !bodyResults.isEmpty else {
+            throw FakeMailiaAppDataProviderError.noBodyResult
+        }
         return try bodyResults.removeFirst().get()
     }
 
@@ -688,14 +757,19 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         fatalError("downloadAttachments is not used in these tests")
     }
 
-    func sendReply(to item: MailiaTimelineItem, body: String, replyAll: Bool, accountKey: String?) async throws {
+    func sendReply(
+        to item: MailiaTimelineItem,
+        content: MailiaComposerContent,
+        replyAll: Bool,
+        accountKey: String?
+    ) async throws {
         fatalError("sendReply is not used in these tests")
     }
 
     func sendNewMessage(
         to recipients: [String],
         subject: String?,
-        body: String,
+        content: MailiaComposerContent,
         accountKey: String?
     ) async throws {
         sendNewMessageCallCount += 1
@@ -717,9 +791,15 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
 
 private enum FakeMailiaAppDataProviderError: LocalizedError {
     case refreshFailed
+    case noBodyResult
 
     var errorDescription: String? {
-        "refresh failed"
+        switch self {
+        case .refreshFailed:
+            "refresh failed"
+        case .noBodyResult:
+            "no body result"
+        }
     }
 }
 

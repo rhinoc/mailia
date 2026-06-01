@@ -4,10 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
     "build:app": "npm run build && npm run sync:app",
-    "preview": "vite preview --host 127.0.0.1",
     "sync:app": "rm -rf ../../Sources/MailiaApp/Resources/TimelineWeb && mkdir -p ../../Sources/MailiaApp/Resources/TimelineWeb && cp -R dist/. ../../Sources/MailiaApp/Resources/TimelineWeb/",
     "typecheck": "tsc -b"
   },
@@ -17,7 +15,6 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
-    "react-virtuoso": "^4.12.8",
     "turndown": "^7.2.4"
   },
   "devDependencies": {

@@ -349,17 +349,6 @@ public extension HimalayaCommand {
         return HimalayaCommand(arguments: jsonArguments(arguments))
     }
 
-    static func messageReadPreview(
-        id: String,
-        folder: String = "INBOX",
-        account: String? = nil
-    ) -> HimalayaCommand {
-        var arguments = ["message", "read", "--preview", "--folder", folder]
-        arguments += accountArguments(account)
-        arguments.append(id)
-        return HimalayaCommand(arguments: jsonArguments(arguments))
-    }
-
     static func flagSeen(
         id: String,
         folder: String = "INBOX",
@@ -470,6 +459,18 @@ public extension HimalayaCommand {
         return HimalayaCommand(
             arguments: jsonArguments(arguments),
             standardInput: template.data(using: .utf8)
+        )
+    }
+
+    static func messageSend(
+        message: String,
+        account: String? = nil
+    ) -> HimalayaCommand {
+        var arguments = ["message", "send"]
+        arguments += accountArguments(account)
+        return HimalayaCommand(
+            arguments: jsonArguments(arguments),
+            standardInput: message.data(using: .utf8)
         )
     }
 

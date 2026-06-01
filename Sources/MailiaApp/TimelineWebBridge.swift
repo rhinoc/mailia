@@ -72,6 +72,9 @@ final class TimelineWebBridgeCoordinator: NSObject {
         guard let json = String(data: data, encoding: .utf8) else {
             throw TimelineWebBridgeError.unableToEncodeState
         }
+        if json != lastStateJSON {
+            logPushedState(state, byteCount: data.count)
+        }
         pushStateJSON(json)
     }
 
@@ -142,6 +145,24 @@ final class TimelineWebBridgeCoordinator: NSObject {
             guard let error else { return }
             self?.onEventDecodingError?(TimelineWebBridgeError.javaScriptEvaluationFailed(error.localizedDescription))
         }
+    }
+
+    private func logPushedState(_ state: TimelineWebState, byteCount: Int) {
+        let delivery = hasFinishedInitialLoad ? "evaluate" : "pending"
+        let entityID = state.entity.map { String($0.id) } ?? "nil"
+        let firstID = state.items.first.map { String($0.id) } ?? "nil"
+        let lastID = state.items.last.map { String($0.id) } ?? "nil"
+        let anchor = state.scrollAnchor.map {
+            "\($0.edge.rawValue):\($0.id)#\($0.generation)"
+        } ?? "nil"
+        let loadedBodyCount = state.bodyStates.values.filter { $0.debugStatus == "loaded" }.count
+        MailiaScrollDebugLog(
+            "[MailiaScrollDebug] pushTimelineWebState delivery=\(delivery) entityID=\(entityID) itemCount=\(state.items.count) firstID=\(firstID) lastID=\(lastID) loading=\(state.isLoadingTimeline) hasOlder=\(state.hasOlderTimeline) hasNewer=\(state.hasNewerTimeline) anchor=\(anchor) bottomInset=\(roundedDebugMetric(state.chromeInsets.bottom)) bodyStates=\(state.bodyStates.count) loadedBodies=\(loadedBodyCount) bytes=\(byteCount)"
+        )
+    }
+
+    private func roundedDebugMetric(_ value: CGFloat) -> String {
+        String(format: "%.1f", Double(value))
     }
 
     private func configureInspectableWebView() {
@@ -334,26 +355,21 @@ final class TimelineWebDebugMenuController: NSObject {
     }
 
     @objc func openDetachedTimelineInspector(_ sender: Any?) {
-        openInspector(showConsole: false)
+        openInspector()
     }
 
-    @objc func openTimelineConsole(_ sender: Any?) {
-        openInspector(showConsole: true)
-    }
-
-    private func openInspector(showConsole: Bool) {
+    private func openInspector() {
         guard let inspector = activeInspector else {
             NSSound.beep()
             return
         }
 
-        let showSelector = showConsole ? Self.showConsoleSelector : Self.showInspectorSelector
-        guard inspector.responds(to: showSelector) else {
+        guard inspector.responds(to: Self.showInspectorSelector) else {
             NSSound.beep()
             return
         }
 
-        _ = inspector.perform(showSelector)
+        _ = inspector.perform(Self.showInspectorSelector)
 
         guard inspector.responds(to: Self.detachInspectorSelector) else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak inspector] in
@@ -368,13 +384,13 @@ final class TimelineWebDebugMenuController: NSObject {
 
     private static let inspectorSelector = NSSelectorFromString("_inspector")
     private static let showInspectorSelector = NSSelectorFromString("show")
-    private static let showConsoleSelector = NSSelectorFromString("showConsole")
     private static let detachInspectorSelector = NSSelectorFromString("detach")
 }
 
 extension TimelineWebBridgeCoordinator: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         configureScrollView()
+        MailiaScrollDebugLog("[MailiaScrollDebug] timelineWeb didFinish pendingState=\(pendingStateJSON != nil)")
         hasFinishedInitialLoad = true
         if let pendingStateJSON {
             self.pendingStateJSON = nil

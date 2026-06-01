@@ -175,6 +175,7 @@ public struct TimelineMessage: Equatable, Sendable {
     public var hasAttachments: Bool
     public var sanitizedHTML: String?
     public var textFallback: String?
+    public var sanitizerVersion: Int?
 
     public init(
         messageID: Int64,
@@ -190,7 +191,8 @@ public struct TimelineMessage: Equatable, Sendable {
         direction: MessageDirection,
         hasAttachments: Bool,
         sanitizedHTML: String? = nil,
-        textFallback: String? = nil
+        textFallback: String? = nil,
+        sanitizerVersion: Int? = nil
     ) {
         self.messageID = messageID
         self.accountKey = accountKey
@@ -206,15 +208,18 @@ public struct TimelineMessage: Equatable, Sendable {
         self.hasAttachments = hasAttachments
         self.sanitizedHTML = sanitizedHTML
         self.textFallback = textFallback
+        self.sanitizerVersion = sanitizerVersion
     }
 }
 
 public struct TimelineMessageBody: Equatable, Sendable {
     public var sanitizedHTML: String?
     public var textFallback: String?
+    public var sanitizerVersion: Int
 
-    public init(sanitizedHTML: String? = nil, textFallback: String? = nil) {
+    public init(sanitizedHTML: String? = nil, textFallback: String? = nil, sanitizerVersion: Int = 0) {
         self.sanitizedHTML = sanitizedHTML
         self.textFallback = textFallback
+        self.sanitizerVersion = sanitizerVersion
     }
 }

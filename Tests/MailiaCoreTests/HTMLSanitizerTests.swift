@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import MailiaCore
 
 @Test
@@ -51,36 +52,45 @@ func sanitizerKeepsRemoteImageSourcesForDisplayPolicy() throws {
     let result = try HTMLSanitizer().sanitize("<img src=\"https://example.com/pixel.png\" width=\"320\" height=\"180\" srcset=\"https://example.com/pixel@2x.png 2x\">")
 
     #expect(!result.remoteContentBlocked)
+    #expect(result.containsRemoteImages)
     #expect(result.content.contains("https://example.com/pixel.png"))
     #expect(result.content.contains("https://example.com/pixel@2x.png"))
     #expect(result.content.contains("width=\"320\""))
     #expect(result.content.contains("height=\"180\""))
+    #expect(result.content.contains("data-mailia-remote-image=\"true\""))
+    #expect(result.content.contains("data-mailia-has-explicit-size=\"true\""))
+    #expect(result.content.contains("height: 180px"))
+    #expect(result.content.contains("width: 320px"))
 }
 
 @Test
-func sanitizerBlocksRemoteImagesForDisplayWithSquarePlaceholders() throws {
-    let html = """
-    <a href="https://example.com/image-only"><img src="https://example.com/logo.png" width="144" height="40" alt="Start setup" style="border-radius: 8px; width: 144px;"></a>
-    <a href="https://example.com/mixed">Read <img src="https://example.com/icon.png" width="16" height="16"></a>
-    <img src="https://example.com/avatar.png" width="16" height="16" srcset="https://example.com/avatar@2x.png 2x">
-    """
+func sanitizerUpgradesHTTPImagesToHTTPS() throws {
+    let result = try HTMLSanitizer().sanitize("""
+    <img src="http://cdn.mcauto-images-production.sendgrid.net/fedb93c4bdeb888c/6b0badf1-2e15-4f63-ae41-fbbc26a4a393/240x240.png" srcset="http://cdn.mcauto-images-production.sendgrid.net/fedb93c4bdeb888c/6b0badf1-2e15-4f63-ae41-fbbc26a4a393/240x240.png 1x">
+    <img src="http://example.com/not-upgraded.png">
+    """)
 
-    let result = try HTMLSanitizer().blockRemoteImages(in: html)
+    #expect(result.content.contains("https://cdn.mcauto-images-production.sendgrid.net/fedb93c4bdeb888c/6b0badf1-2e15-4f63-ae41-fbbc26a4a393/240x240.png"))
+    #expect(result.content.contains("srcset=\"https://cdn.mcauto-images-production.sendgrid.net/fedb93c4bdeb888c/6b0badf1-2e15-4f63-ae41-fbbc26a4a393/240x240.png 1x\""))
+    #expect(result.content.contains("https://example.com/not-upgraded.png"))
+    #expect(!result.content.contains("http://"))
+}
 
-    #expect(result.remoteContentBlocked)
-    #expect(!result.content.contains("href=\"https://example.com/image-only\""))
-    #expect(result.content.contains("href=\"https://example.com/mixed\""))
-    #expect(!result.content.localizedCaseInsensitiveContains("<img"))
-    #expect(!result.content.contains("https://example.com/logo.png"))
-    #expect(!result.content.contains("https://example.com/icon.png"))
-    #expect(!result.content.contains("https://example.com/avatar.png"))
-    #expect(result.content.contains("mailia-remote-image-placeholder"))
-    #expect(result.content.contains("aria-label=\"Remote image blocked\""))
-    #expect(!result.content.contains(">Remote image blocked<"))
-    #expect(!result.content.contains("Start setup"))
-    #expect(result.content.contains("width: 144px"))
-    #expect(result.content.contains("height: 40px"))
-    #expect(!result.content.localizedCaseInsensitiveContains("border-radius"))
+@Test
+func sanitizerPreservesImageAttributeDimensionsAsInlineStyle() throws {
+    let result = try HTMLSanitizer().sanitize("""
+    <div style="display:flex; white-space:pre-wrap">
+      <img height="20" width="20" style="border-radius:50%; margin-right:4px" src="https://avatars.githubusercontent.com/u/79189721?s=20&amp;v=4">
+      <strong>wxtsky</strong> left a comment
+    </div>
+    """)
+
+    #expect(result.content.contains("height=\"20\""))
+    #expect(result.content.contains("width=\"20\""))
+    #expect(result.content.contains("height: 20px"))
+    #expect(result.content.contains("width: 20px"))
+    #expect(result.content.contains("border-radius:50%") || result.content.contains("border-radius: 50%"))
+    #expect(result.content.contains("margin-right:4px") || result.content.contains("margin-right: 4px"))
 }
 
 @Test
@@ -90,6 +100,182 @@ func sanitizerRemovesUnsafeImageURLs() throws {
     #expect(!result.content.localizedCaseInsensitiveContains("javascript:"))
     #expect(!result.content.localizedCaseInsensitiveContains("src="))
     #expect(!result.content.localizedCaseInsensitiveContains("srcset="))
+}
+
+@Test
+func displayPipelinePreservesAuthorColorsOnLightEmailSurface() throws {
+    let exportDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MailiaDisplayPipelineTest-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: exportDirectory) }
+
+    let html = """
+    <div style="padding:10px">
+      <div style="background:#ffffff !important; color:#333; width:510px">
+        <h1 style="color:#333; font-size:40px">Updated Permissions Request</h1>
+        <p style="color:#333">The GitHub App Claude is requesting additional access.</p>
+      </div>
+    </div>
+    """
+
+    let document = try EmailHTMLDisplayPipeline().document(
+        exportedHTML: html,
+        exportedText: "Updated Permissions Request",
+        exportDirectory: exportDirectory
+    )
+
+    let output = try #require(document.html)
+    #expect(document.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion)
+    #expect(output.contains("background:#ffffff"))
+    #expect(output.contains("color:#333"))
+    #expect(output.contains("font-size:40px"))
+    #expect(document.textFallback == "Updated Permissions Request The GitHub App Claude is requesting additional access.")
+}
+
+@Test
+func displayPipelineDerivesPreviewFromCanonicalHTMLInsteadOfExportedText() throws {
+    let exportDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MailiaDisplayPipelineTest-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: exportDirectory) }
+
+    let document = try EmailHTMLDisplayPipeline().document(
+        exportedHTML: """
+        <main>
+          <p>HTML body wins</p>
+          <p style="display:none">Hidden tracker text</p>
+        </main>
+        """,
+        exportedText: "Plain text must not become preview",
+        exportDirectory: exportDirectory
+    )
+
+    #expect(document.html?.contains("HTML body wins") == true)
+    #expect(document.textFallback == "HTML body wins")
+}
+
+@Test
+func displayPipelineBuildsCanonicalHTMLForTextOnlyExport() throws {
+    let exportDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MailiaDisplayPipelineTest-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: exportDirectory) }
+
+    let document = try EmailHTMLDisplayPipeline().document(
+        exportedHTML: nil,
+        exportedText: """
+        Hello <Ryan>
+        <#part type="image/png" filename="receipt.png"><#/part>
+        Thanks & bye
+        """,
+        exportDirectory: exportDirectory
+    )
+
+    let output = try #require(document.html)
+    #expect(output.hasPrefix("<pre>"))
+    #expect(output.contains("Hello &lt;Ryan&gt;"))
+    #expect(output.contains("Thanks &amp; bye"))
+    #expect(!output.contains("<#part"))
+    #expect(document.textFallback == "Hello <Ryan> Thanks & bye")
+    #expect(document.hasAttachments)
+}
+
+@Test
+func textExtractorIgnoresHiddenAndUnsafeEmailContent() {
+    let text = HTMLTextExtractor().previewText(from: """
+    <h1>Visible heading</h1>
+    <script>secret()</script>
+    <style>.x { color: red }</style>
+    <p aria-hidden="true">Hidden aria</p>
+    <p style="visibility:hidden">Hidden style</p>
+    <p>Visible paragraph<br>Next line</p>
+    """)
+
+    #expect(text == "Visible heading Visible paragraph Next line")
+}
+
+@Test
+func sanitizerInlinesLocalExportedRasterImagesOnlyInsideBaseDirectory() throws {
+    let baseDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MailiaSanitizerTest-\(UUID().uuidString)", isDirectory: true)
+    let nestedDirectory = baseDirectory.appendingPathComponent("nested", isDirectory: true)
+    try FileManager.default.createDirectory(at: nestedDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let relativeImage = baseDirectory.appendingPathComponent("relative.png")
+    let fileURLImage = nestedDirectory.appendingPathComponent("absolute.jpg")
+    let svgImage = baseDirectory.appendingPathComponent("beacon.svg")
+    let outsideImage = FileManager.default.temporaryDirectory.appendingPathComponent("outside.png")
+    defer { try? FileManager.default.removeItem(at: outsideImage) }
+
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: relativeImage)
+    try Data([0xFF, 0xD8, 0xFF]).write(to: fileURLImage)
+    try Data("""
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+      <path d="M10 10h80v80h-80z" fill="#6d84b4"/>
+    </svg>
+    """.utf8).write(to: svgImage)
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: outsideImage)
+
+    let html = """
+    <img src="relative.png" srcset="relative@2x.png 2x">
+    <img src="\(fileURLImage.absoluteString)">
+    <img src="beacon.svg">
+    <img src="../\(outsideImage.lastPathComponent)">
+    """
+
+    let inlined = try HTMLSanitizer().inlineLocalImageSources(in: html, baseDirectory: baseDirectory)
+    let sanitized = try HTMLSanitizer().sanitize(inlined)
+
+    #expect(sanitized.content.contains("data:image/png;base64,"))
+    #expect(sanitized.content.contains("data:image/jpeg;base64,"))
+    #expect(sanitized.content.contains("data:image/svg+xml;base64,"))
+    #expect(!sanitized.content.contains("srcset="))
+    #expect(!sanitized.content.contains(relativeImage.path))
+    #expect(!sanitized.content.contains(fileURLImage.path))
+    #expect(!sanitized.content.contains(outsideImage.path))
+    #expect(!sanitized.content.contains("beacon.svg"))
+}
+
+@Test
+func sanitizerRejectsUnsafeLocalSVGImages() throws {
+    let baseDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MailiaSanitizerTest-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let unsafeSVG = baseDirectory.appendingPathComponent("unsafe.svg")
+    try Data("""
+    <svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">
+      <script>alert(1)</script>
+      <image href="https://example.com/pixel.png"/>
+    </svg>
+    """.utf8).write(to: unsafeSVG)
+
+    let html = #"<img src="unsafe.svg" alt="Unsafe SVG">"#
+    let inlined = try HTMLSanitizer().inlineLocalImageSources(in: html, baseDirectory: baseDirectory)
+    let sanitized = try HTMLSanitizer().sanitize(inlined)
+
+    #expect(sanitized.content.contains("alt=\"Unsafe SVG\""))
+    #expect(!sanitized.content.contains("data:image/svg+xml"))
+    #expect(!sanitized.content.localizedCaseInsensitiveContains("onload"))
+    #expect(!sanitized.content.localizedCaseInsensitiveContains("<script"))
+    #expect(!sanitized.content.localizedCaseInsensitiveContains("https://example.com"))
+    #expect(!sanitized.content.localizedCaseInsensitiveContains("src="))
+}
+
+@Test
+func sanitizerRemovesLocalImagePathsThatCannotBeInlined() throws {
+    let result = try HTMLSanitizer().sanitize("""
+    <img src="/var/folders/example/MailiaExport-1/image.png" srcset="/var/folders/example/MailiaExport-1/image@2x.png 2x">
+    <img src="file:///var/folders/example/MailiaExport-1/image.jpg">
+    <img src="//example.com/pixel.png">
+    """)
+
+    #expect(!result.content.contains("/var/folders"))
+    #expect(!result.content.localizedCaseInsensitiveContains("file:///"))
+    #expect(!result.content.localizedCaseInsensitiveContains("srcset="))
+    #expect(!result.content.localizedCaseInsensitiveContains("src=\"//"))
 }
 
 @Test

@@ -20,6 +20,8 @@ interface MessageCardProps {
   bodyRequestPriority: number;
   reservedBodyHeight?: number;
   bodyHeightCacheKey: string;
+  canRequestBody: boolean;
+  canRevealBody: boolean;
   shouldDeferBodyRequest(): boolean;
   attachmentState: AttachmentDownloadState;
   onRequestBody(message: TimelineMessage, priority: number): void;
@@ -39,13 +41,16 @@ export function MessageCard({
   bodyRequestPriority,
   reservedBodyHeight,
   bodyHeightCacheKey,
+  canRequestBody,
+  canRevealBody,
   shouldDeferBodyRequest,
   attachmentState,
   onRequestBody,
   onBodyHeightMeasured,
   onDownloadAttachments
 }: MessageCardProps) {
-  const hasBody = Boolean(message.sanitizedHTML || message.textFallback);
+  const hasAvailableBody = Boolean(message.sanitizedHTML || message.bodyStatus === "loaded");
+  const hasBody = canRevealBody && hasAvailableBody;
   const messageID = message.messageID;
   const accountKey = message.accountKey;
   const folderName = message.folderName;
@@ -60,7 +65,7 @@ export function MessageCard({
     TimelineMessage["messageID"] | null
   >(hasBody ? messageID : null);
   const isBodyRevealed = hasBody && revealedBodyMessageID === messageID;
-  const shouldRequestBody = !hasBody && bodyStatus !== "loading";
+  const shouldRequestBody = canRequestBody && !hasAvailableBody && bodyStatus !== "loading";
   const showMessageAvatar =
     showAvatar && (cluster === "single" || cluster === "end");
 
@@ -108,8 +113,9 @@ export function MessageCard({
     bodyStatus,
     bodyRequestPriority,
     bodyRequestWakeToken,
+    canRequestBody,
     folderName,
-    hasBody,
+    hasAvailableBody,
     himalayaEnvelopeID,
     messageID,
     onRequestBody,
@@ -163,13 +169,16 @@ export function MessageCard({
           style={!isBodyRevealed ? { minHeight: committedBodyHeight } : undefined}
         >
           {!isBodyRevealed ? (
-            <div className="mail-body-frame mail-body--placeholder">
-              Loading message body...
+            <div
+              className="mail-body-frame mail-body--placeholder"
+              aria-label="Loading message body"
+              role="status"
+            >
+              <span className="mail-body-loading-spinner" aria-hidden="true" />
             </div>
           ) : (
             <MessageBody
               html={message.sanitizedHTML}
-              text={message.textFallback}
               mode={bodyDisplayMode}
               loadRemoteContent={loadRemoteContent}
               hideQuotedReplyText={hideQuotedReplyText}
@@ -190,8 +199,7 @@ export function MessageCard({
 }
 
 function estimateReservedBodyHeight(message: TimelineMessage, hasVisibleSubject: boolean) {
-  const textLength = message.textFallback?.length
-    ?? visibleTextLength(message.sanitizedHTML)
+  const textLength = visibleTextLength(message.sanitizedHTML)
     ?? message.subject?.length
     ?? 0;
   const lineEstimate = Math.max(1, Math.ceil(textLength / 78));

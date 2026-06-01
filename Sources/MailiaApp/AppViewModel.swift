@@ -1,5 +1,6 @@
 import Foundation
 import MailiaCore
+import os
 
 enum MailiaWorkspace: String, CaseIterable, Identifiable, Sendable {
     case main = "Main"
@@ -28,7 +29,8 @@ struct MailiaEntitySummary: Identifiable, Equatable, Sendable {
     let kind: EntityKind
     var unreadCount: Int
     let latestSubject: String
-    let latestBodyPreview: String?
+    var latestBodyPreview: String?
+    let latestMessageID: Int64?
     let latestDate: Date?
     let accountKeys: [String]
     let accountLabel: String
@@ -57,7 +59,12 @@ struct MailiaTimelineItem: Identifiable, Equatable, Sendable {
 
 struct MailiaTimelineBody: Equatable, Sendable {
     let html: String?
-    let text: String?
+    let hasAttachments: Bool
+
+    init(html: String?, hasAttachments: Bool = false) {
+        self.html = html
+        self.hasAttachments = hasAttachments
+    }
 }
 
 enum MailiaTimelineBodyState: Equatable, Sendable {
@@ -275,6 +282,12 @@ struct MailiaTimelineScrollAnchor: Equatable, Sendable {
     let generation: Int
 }
 
+private let mailiaScrollDebugOSLog = OSLog(subsystem: "dev.rhinoc.mailia", category: "ScrollDebug")
+
+func MailiaScrollDebugLog(_ message: String) {
+    os_log("%{public}@", log: mailiaScrollDebugOSLog, type: .default, message)
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var searchQuery: String = "" {
@@ -297,6 +310,7 @@ final class AppViewModel: ObservableObject {
     @Published var selectedEntityID: Int64? {
         didSet {
             guard selectedEntityID != oldValue else { return }
+            MailiaScrollDebugLog("[MailiaScrollDebug] selectedEntity changed old=\(oldValue.map { String($0) } ?? "nil") new=\(selectedEntityID.map { String($0) } ?? "nil") timelineGeneration=\(timelineGeneration)")
             replySendState = .idle
             if selectedEntityID != nil {
                 isComposingNewMessage = false
@@ -336,10 +350,12 @@ final class AppViewModel: ObservableObject {
     private let provider: any MailiaAppDataProviding
     private let startupRefreshStalenessThreshold: TimeInterval
     private let now: @Sendable () -> Date
+    private let htmlTextExtractor = HTMLTextExtractor()
     private var requestGeneration = 0
     private var timelineGeneration = 0
     private var timelineWindowStore = TimelineWindowStore()
-    private let bodyLoadQueue: TimelineBodyLoadQueue
+    private let listFetchQueue = ListFetchQueue()
+    private let bodyLoadQueue: BodyFetchQueue
     private var avatarResolutionTasks: [Int64: Task<Void, Never>] = [:]
     private var avatarResolutionTaskInfo: [Int64: AvatarResolutionTaskInfo] = [:]
     private var avatarResolutionBatches: [Int: AvatarResolutionProgressBatch] = [:]
@@ -353,14 +369,15 @@ final class AppViewModel: ObservableObject {
     private var partialRefreshSnapshotNeedsReload = false
     private var postSendFollowUpRefreshTasks: [UUID: Task<Void, Never>] = [:]
     private var sendAccountsRefreshTask: Task<Void, Never>?
-    private var timelineLoadTask: Task<Void, Never>?
-    private var timelinePageTasks: [MailiaTimelinePageDirection: Task<Void, Never>] = [:]
+    private var entityPreviewBodyPrefetchTask: Task<Void, Never>?
     private var optimisticHiddenEntityIDs: Set<Int64> = []
     private var optimisticReadEntityIDs: Set<Int64> = []
     private var pendingMarkReadTask: Task<Void, Never>?
     private var markReadTasks: [Int64: Task<Void, Never>] = [:]
     private let avatarResolver: EntityBrandAvatarResolver
     private let timelinePageSize = 80
+    private let selectedTimelineBodyPrefetchLimit = 1
+    private let entityPreviewBodyPrefetchLimit = 50
     private let maxConcurrentAvatarResolutions = 4
     private let partialRefreshSnapshotDelayNanoseconds: UInt64 = 350_000_000
     private let postSendFollowUpRefreshDelaysNanoseconds: [UInt64]
@@ -374,7 +391,7 @@ final class AppViewModel: ObservableObject {
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.provider = provider
-        self.bodyLoadQueue = TimelineBodyLoadQueue(provider: provider)
+        self.bodyLoadQueue = BodyFetchQueue(provider: provider)
         self.avatarResolver = avatarResolver
         self.postSendFollowUpRefreshDelaysNanoseconds = postSendFollowUpRefreshDelaysNanoseconds
         self.startupRefreshStalenessThreshold = startupRefreshStalenessThreshold
@@ -386,11 +403,8 @@ final class AppViewModel: ObservableObject {
         reloadTask?.cancel()
         partialRefreshSnapshotTask?.cancel()
         sendAccountsRefreshTask?.cancel()
+        entityPreviewBodyPrefetchTask?.cancel()
         for task in postSendFollowUpRefreshTasks.values {
-            task.cancel()
-        }
-        timelineLoadTask?.cancel()
-        for task in timelinePageTasks.values {
             task.cancel()
         }
         pendingMarkReadTask?.cancel()
@@ -646,8 +660,21 @@ final class AppViewModel: ObservableObject {
     }
 
     func sendReply(to item: MailiaTimelineItem, body: String, replyAll: Bool = false, accountKey: String? = nil) {
-        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedBody.isEmpty else { return }
+        sendReply(
+            to: item,
+            content: MailiaComposerContent(plainText: body),
+            replyAll: replyAll,
+            accountKey: accountKey
+        )
+    }
+
+    func sendReply(
+        to item: MailiaTimelineItem,
+        content: MailiaComposerContent,
+        replyAll: Bool = false,
+        accountKey: String? = nil
+    ) {
+        guard content.hasRenderableContent else { return }
         if case .sending = replySendState {
             return
         }
@@ -666,7 +693,7 @@ final class AppViewModel: ObservableObject {
             do {
                 try await provider.sendReply(
                     to: item,
-                    body: trimmedBody,
+                    content: content,
                     replyAll: replyAll,
                     accountKey: sendAccountKey
                 )
@@ -883,11 +910,24 @@ final class AppViewModel: ObservableObject {
     }
 
     func sendNewMessage(to recipients: [String], subject: String?, body: String, accountKey: String?) {
-        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        sendNewMessage(
+            to: recipients,
+            subject: subject,
+            content: MailiaComposerContent(plainText: body),
+            accountKey: accountKey
+        )
+    }
+
+    func sendNewMessage(
+        to recipients: [String],
+        subject: String?,
+        content: MailiaComposerContent,
+        accountKey: String?
+    ) {
         let cleanedRecipients = recipients
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard !trimmedBody.isEmpty, !cleanedRecipients.isEmpty else { return }
+        guard content.hasRenderableContent, !cleanedRecipients.isEmpty else { return }
         if case .sending = replySendState {
             return
         }
@@ -907,7 +947,7 @@ final class AppViewModel: ObservableObject {
                 try await provider.sendNewMessage(
                     to: cleanedRecipients,
                     subject: subject?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
-                    body: trimmedBody,
+                    content: content,
                     accountKey: sendAccountKey
                 )
                 replySendState = .sent
@@ -1126,10 +1166,9 @@ final class AppViewModel: ObservableObject {
         partialRefreshSnapshotTask?.cancel()
         partialRefreshSnapshotTask = nil
         partialRefreshSnapshotNeedsReload = false
-        timelineLoadTask?.cancel()
+        listFetchQueue.cancelAll()
         avatarCacheHydrationTask?.cancel()
         reloadTask = nil
-        timelineLoadTask = nil
         isLoadingEntityList = true
         selectedEntityID = nil
         entities = []
@@ -1396,6 +1435,7 @@ final class AppViewModel: ObservableObject {
     ) -> Bool {
         guard let before, let after else { return before != nil || after != nil }
         return before.latestDate != after.latestDate
+            || before.latestMessageID != after.latestMessageID
             || before.latestSubject != after.latestSubject
             || before.latestBodyPreview != after.latestBodyPreview
             || before.unreadCount != after.unreadCount
@@ -1438,10 +1478,10 @@ final class AppViewModel: ObservableObject {
         timelineGeneration += 1
         let generation = timelineGeneration
         let workspaceSnapshot = workspace
-        timelineLoadTask?.cancel()
-        cancelTimelinePageTasks()
+        listFetchQueue.cancelAll()
         cancelBodyLoadTasks()
         guard let selectedEntityID else {
+            MailiaScrollDebugLog("[MailiaScrollDebug] loadTimelineForSelection cleared selection generation=\(generation)")
             timeline = []
             timelineBodyStates = [:]
             resetTimelineWindowState()
@@ -1450,6 +1490,7 @@ final class AppViewModel: ObservableObject {
 
         resetTimelineWindowState()
         let hasCachedPage = timelineWindowStore.hasCachedPage(workspace: workspaceSnapshot, entityID: selectedEntityID)
+        MailiaScrollDebugLog("[MailiaScrollDebug] loadTimelineForSelection start entityID=\(selectedEntityID) generation=\(generation) hasCachedPage=\(hasCachedPage)")
         if let cached = timelineWindowStore.cachedPage(workspace: workspaceSnapshot, entityID: selectedEntityID) {
             timeline = cached.items
             applyAccountVisualsToTimeline()
@@ -1457,16 +1498,21 @@ final class AppViewModel: ObservableObject {
             hasOlderTimeline = cached.hasOlderTimeline
             hasNewerTimeline = cached.hasNewerTimeline
             timelineWindowStore.primeBodyAccessOrder(items: cached.items, bodyStates: timelineBodyStates)
+            MailiaScrollDebugLog("[MailiaScrollDebug] applied cached timeline entityID=\(selectedEntityID) generation=\(generation) itemCount=\(cached.items.count) latestID=\(cached.items.last?.id.description ?? "nil")")
             if let latestID = cached.items.last?.id {
                 publishTimelineScrollAnchor(id: latestID, edge: .bottom)
             }
+            prefetchSelectedTimelineBodies()
         } else if !timeline.contains(where: { $0.entityID == selectedEntityID }) {
             timeline = []
             timelineBodyStates = [:]
         }
         isLoadingTimeline = !hasCachedPage
 
-        timelineLoadTask = Task { [weak self] in
+        listFetchQueue.enqueue(
+            id: .selectedTimeline(entityID: selectedEntityID),
+            priority: .selected
+        ) { [weak self] in
             guard let self else { return }
             do {
                 let page = try await provider.loadTimelinePage(
@@ -1489,14 +1535,14 @@ final class AppViewModel: ObservableObject {
                 timelineBodyStates = cachedBodyStates(for: page.items)
                 hasOlderTimeline = page.hasMore
                 hasNewerTimeline = false
+                MailiaScrollDebugLog("[MailiaScrollDebug] loaded latest timeline entityID=\(selectedEntityID) generation=\(generation) itemCount=\(page.items.count) latestID=\(page.items.last?.id.description ?? "nil") hasOlder=\(page.hasMore)")
                 if let latestID = page.items.last?.id {
                     publishTimelineScrollAnchor(id: latestID, edge: .bottom)
                 }
+                prefetchSelectedTimelineBodies()
                 isLoadingTimeline = false
-                timelineLoadTask = nil
             } catch is CancellationError {
                 if generation == timelineGeneration {
-                    timelineLoadTask = nil
                     isLoadingTimeline = false
                 }
             } catch {
@@ -1507,7 +1553,6 @@ final class AppViewModel: ObservableObject {
                     resetTimelineWindowState()
                 }
                 isLoadingTimeline = false
-                timelineLoadTask = nil
                 NSLog("Unable to load timeline: \(error.localizedDescription)")
             }
         }
@@ -1599,7 +1644,56 @@ final class AppViewModel: ObservableObject {
     }
 
     func loadBodyIfNeeded(for item: MailiaTimelineItem, priority requestedPriority: Int? = nil) {
-        bodyLoadQueue.loadIfNeeded(for: item, priority: requestedPriority)
+        bodyLoadQueue.loadIfNeeded(for: item, priority: .visible)
+    }
+
+    private func prefetchSelectedTimelineBodies() {
+        guard selectedEntityID != nil, !timeline.isEmpty else { return }
+        for item in timeline.suffix(selectedTimelineBodyPrefetchLimit).reversed() {
+            bodyLoadQueue.loadIfNeeded(for: item, priority: .selectedPage)
+        }
+    }
+
+    private func scheduleEntityPreviewBodyPrefetch() {
+        entityPreviewBodyPrefetchTask?.cancel()
+        entityPreviewBodyPrefetchTask = nil
+        let workspaceSnapshot = workspace
+        let generation = requestGeneration
+        let candidateEntityIDs = entities
+            .filter { entity in
+                entity.latestMessageID != nil &&
+                    entity.latestBodyPreview?.nilIfBlank == nil
+            }
+            .prefix(entityPreviewBodyPrefetchLimit)
+            .map(\.id)
+        guard !candidateEntityIDs.isEmpty else { return }
+
+        entityPreviewBodyPrefetchTask = Task { [weak self] in
+            guard let self else { return }
+            defer { entityPreviewBodyPrefetchTask = nil }
+            do {
+                let items = try await provider.loadLatestTimelineItems(
+                    entityIDs: Array(candidateEntityIDs),
+                    workspace: workspaceSnapshot
+                )
+                guard generation == requestGeneration,
+                      workspace == workspaceSnapshot,
+                      !Task.isCancelled else {
+                    return
+                }
+                for item in items {
+                    bodyLoadQueue.loadIfNeeded(
+                        for: item,
+                        priority: .entityPreview,
+                        requiresTimelineMembership: false
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                NSLog("Unable to prefetch entity preview bodies: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func loadTimelinePage(direction: MailiaTimelinePageDirection, anchorID: Int64, preserveAnchorID: Int64) {
@@ -1616,8 +1710,10 @@ final class AppViewModel: ObservableObject {
             isLoadingTimeline = true
         }
 
-        timelinePageTasks[direction]?.cancel()
-        timelinePageTasks[direction] = Task { [weak self] in
+        listFetchQueue.enqueue(
+            id: .timelinePage(direction: direction),
+            priority: .incremental
+        ) { [weak self] in
             guard let self else { return }
             do {
                 let page = try await provider.loadTimelinePage(
@@ -1632,7 +1728,6 @@ final class AppViewModel: ObservableObject {
             } catch is CancellationError {
                 if generation == timelineGeneration {
                     clearTimelinePageLoadingFlag(direction)
-                    timelinePageTasks[direction] = nil
                 }
                 return
             } catch {
@@ -1640,9 +1735,6 @@ final class AppViewModel: ObservableObject {
                 NSLog("Unable to load timeline page: \(error.localizedDescription)")
             }
             clearTimelinePageLoadingFlag(direction)
-            if generation == timelineGeneration {
-                timelinePageTasks[direction] = nil
-            }
         }
     }
 
@@ -1775,6 +1867,7 @@ final class AppViewModel: ObservableObject {
         } else {
             scheduleMarkSelectedEntityReadIfNeeded()
         }
+        scheduleEntityPreviewBodyPrefetch()
         hydrateCachedAvatarImagesThenResolve()
     }
 
@@ -2410,6 +2503,7 @@ final class AppViewModel: ObservableObject {
             }
         }
         applyAccountVisualsToTimeline()
+        prefetchSelectedTimelineBodies()
         if let selectedEntityID {
             cacheTimelinePage(
                 workspace: workspace,
@@ -2441,7 +2535,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func resetTimelineWindowState() {
-        cancelTimelinePageTasks()
+        listFetchQueue.cancelAll()
         bodyLoadQueue.reset()
         hasOlderTimeline = false
         hasNewerTimeline = false
@@ -2449,13 +2543,6 @@ final class AppViewModel: ObservableObject {
         isLoadingNewerTimeline = false
         timelineWindowStore.resetWindowState()
         timelineScrollAnchor = nil
-    }
-
-    private func cancelTimelinePageTasks() {
-        for task in timelinePageTasks.values {
-            task.cancel()
-        }
-        timelinePageTasks.removeAll()
     }
 
     private func cancelBodyLoadTasks() {
@@ -2506,6 +2593,9 @@ final class AppViewModel: ObservableObject {
 
     private func publishTimelineScrollAnchor(id: Int64, edge: MailiaTimelineScrollAnchor.Edge) {
         timelineScrollAnchor = timelineWindowStore.publishScrollAnchor(id: id, edge: edge)
+        if let timelineScrollAnchor {
+            MailiaScrollDebugLog("[MailiaScrollDebug] publishTimelineScrollAnchor id=\(id) edge=\(edge) generation=\(timelineScrollAnchor.generation) timelineCount=\(timeline.count)")
+        }
     }
 
     private func cachedBodyStates(for items: [MailiaTimelineItem]) -> [Int64: MailiaTimelineBodyState] {
@@ -2552,7 +2642,7 @@ final class AppViewModel: ObservableObject {
     }()
 }
 
-extension AppViewModel: TimelineBodyLoadQueueDelegate {
+extension AppViewModel: BodyFetchQueueDelegate {
     var currentTimelineGeneration: Int {
         timelineGeneration
     }
@@ -2571,6 +2661,9 @@ extension AppViewModel: TimelineBodyLoadQueueDelegate {
 
     func setBodyState(_ state: MailiaTimelineBodyState?, id: Int64) {
         timelineBodyStates[id] = state
+        if case .loaded(let body) = state, body.hasAttachments {
+            markTimelineItemHasAttachments(id: id)
+        }
     }
 
     func cachedBodyState(id: Int64) -> MailiaTimelineBodyState? {
@@ -2585,22 +2678,82 @@ extension AppViewModel: TimelineBodyLoadQueueDelegate {
         timelineWindowStore.rememberBodyAccess(id)
     }
 
-    func bodyLoadQueueDidUpdateBodyStates() {
+    func bodyFetchQueueDidLoadBody(_ body: MailiaTimelineBody, for item: MailiaTimelineItem, priority: BodyFetchPriority) {
+        if body.hasAttachments {
+            markTimelineItemHasAttachments(id: item.id)
+        }
+        applyBodyPreviewIfNeeded(body, for: item)
+    }
+
+    func bodyFetchQueueDidUpdateBodyStates() {
         trimBodyStateWindow()
+    }
+
+    private func applyBodyPreviewIfNeeded(_ body: MailiaTimelineBody, for item: MailiaTimelineItem) {
+        guard let html = body.html?.nilIfBlank,
+              let preview = htmlTextExtractor.previewText(from: html)?.nilIfBlank else {
+            return
+        }
+
+        var didUpdate = false
+        entities = entities.map { entity in
+            guard entity.latestMessageID == item.id,
+                  entity.latestBodyPreview?.nilIfBlank != preview else {
+                return entity
+            }
+            var updated = entity
+            updated.latestBodyPreview = preview
+            didUpdate = true
+            return updated
+        }
+
+        if didUpdate {
+            scheduleEntityPreviewBodyPrefetch()
+        }
+    }
+
+    private func markTimelineItemHasAttachments(id: Int64) {
+        guard let index = timeline.firstIndex(where: { $0.id == id }),
+              !timeline[index].hasAttachments else {
+            return
+        }
+
+        let item = timeline[index]
+        timeline[index] = MailiaTimelineItem(
+            id: item.id,
+            entityID: item.entityID,
+            direction: item.direction,
+            subject: item.subject,
+            preview: item.preview,
+            html: item.html,
+            date: item.date,
+            accountLabel: item.accountLabel,
+            accountEmoji: item.accountEmoji,
+            accountAvatarImageDataURL: item.accountAvatarImageDataURL,
+            folderLabel: item.folderLabel,
+            envelopeID: item.envelopeID,
+            isFlagged: item.isFlagged,
+            fromLabel: item.fromLabel,
+            toLabel: item.toLabel,
+            hasAttachments: true
+        )
     }
 }
 
 extension MailiaEntitySummary {
     func sidebarPreview(hideReplySubjects: Bool, hideQuotedReplyText: Bool) -> String {
         if hideReplySubjects,
-           latestSubject.isReplySubject,
-           let replyPreview = latestBodyPreview?.nilIfBlank {
-            let visiblePreview = hideQuotedReplyText
-                ? MessageTextNormalizer().removingTrailingQuotedReplyText(replyPreview)
-                : replyPreview
-            if let compactPreview = visiblePreview.compactedPreviewText.nilIfBlank {
-                return compactPreview
+           latestSubject.isReplySubject {
+            if let replyPreview = latestBodyPreview?.nilIfBlank {
+                let visiblePreview = hideQuotedReplyText
+                    ? MessageTextNormalizer().removingTrailingQuotedReplyText(replyPreview)
+                    : replyPreview
+                if let compactPreview = visiblePreview.compactedPreviewText.nilIfBlank {
+                    return compactPreview
+                }
             }
+
+            return ""
         }
 
         if !latestSubject.isEmpty {

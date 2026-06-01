@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import type { TimelineBridge } from "../bridge/timelineBridge";
 import type { BodyDisplayMode, TimelineItem, TimelineMessageView, TimelineState } from "../types";
 import { MessageCard } from "./MessageCard";
@@ -9,56 +8,151 @@ interface TimelineViewProps {
   state: TimelineState;
 }
 
+type TimelineScrollDebugDetails = Record<string, unknown>;
+
+type TimelineListRow =
+  | { kind: "top-reserve"; key: "top-reserve" }
+  | { kind: "loading"; key: "loading"; messageIndex: number }
+  | { kind: "message"; key: string; message: TimelineMessageView; messageIndex: number }
+  | { kind: "bottom-reserve"; key: "bottom-reserve" };
+
+type TimelineDataChange =
+  | "append"
+  | "prepend"
+  | "remove-from-start"
+  | "remove-from-end"
+  | "replace";
+
+interface ReverseScrollMetrics {
+  scrollTop: number;
+  clientHeight: number;
+  scrollHeight: number;
+  bottomOffset: number;
+  topOffset: number;
+}
+
+interface RevealBoundary {
+  entityID?: number;
+  firstVisibleMessageID: number | null;
+}
+
 export function TimelineView({ bridge, state }: TimelineViewProps) {
   const selectedEntityID = state.entity?.id;
   const displayOptions = state.displayOptions;
-  const windowState = state.windowState;
+  const itemIDSignature = useMemo(
+    () => state.items.map((item) => item.id).join(":"),
+    [state.items]
+  );
+  const itemIDs = useMemo(
+    () => state.items.map((item) => item.id),
+    [itemIDSignature]
+  );
+  const itemCount = itemIDs.length;
   const messageViews = useMemo(
     () => state.items.map((item) => toMessageView(item, state)),
     [state]
   );
   const bodyDisplayMode = normalizeBodyDisplayMode(displayOptions.bodyDisplayMode);
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const nextBodyRequestIndex = useMemo(
+    () => firstUnsettledMessageIndexFromBottom(messageViews),
+    [messageViews]
+  );
+  const computedFirstVisibleIndex =
+    nextBodyRequestIndex === null ? 0 : nextBodyRequestIndex + 1;
+  const listRef = useRef<HTMLDivElement>(null);
   const scrollSettleTimerRef = useRef<number | null>(null);
   const isScrollSettlingRef = useRef(false);
-  const lastAtBottomRef = useRef<boolean | null>(null);
-  const lastAppliedAnchorGenerationRef = useRef<number | null>(null);
-  const bottomAnchorSettlingRef = useRef(false);
-  const bottomAnchorSettleFrameRef = useRef<number | null>(null);
+  const lastBodyRequestKeyRef = useRef<string | null>(null);
+  const lastOlderRequestRef = useRef<string | null>(null);
+  const previousItemIDsRef = useRef<{
+    entityID?: number;
+    itemIDs: number[];
+    signature: string;
+  } | null>(null);
   const [bodyRequestWakeToken, setBodyRequestWakeToken] = useState(0);
   const [bodyHeightCache, setBodyHeightCache] = useState<Record<string, number>>({});
-  const useNativeChrome = bridge.mode === "native";
-  const topAnchorOffset = useNativeChrome ? -86 : -34;
-  const bottomOverlayHeight = useNativeChrome ? Math.max(0, windowState.bottomOverlayHeight) : 0;
-  const bottomChromeReserve = useNativeChrome ? Math.max(104, bottomOverlayHeight + 28) : 0;
-  const anchoredToBottom = state.scrollAnchor?.edge === "bottom";
-  const TimelineTopReserveHeader = useMemo(
-    () =>
-      function TimelineTopReserveHeader() {
-        return (
-          <div
-            className="timeline__top-reserve"
-            data-native-chrome={useNativeChrome}
-            aria-hidden="true"
-          />
-        );
-      },
-    [useNativeChrome]
+  const [revealBoundary, setRevealBoundary] = useState<RevealBoundary>({
+    entityID: undefined,
+    firstVisibleMessageID: null
+  });
+  const bottomChromeReserve = Math.max(0, state.chromeInsets.bottom);
+  const scrollAnchorID = state.scrollAnchor?.id ?? null;
+  const scrollAnchorEdge = state.scrollAnchor?.edge ?? null;
+  const scrollAnchorGeneration = state.scrollAnchor?.generation ?? null;
+  const visibleStartIndex = readVisibleStartIndex(
+    revealBoundary,
+    selectedEntityID,
+    messageViews,
+    computedFirstVisibleIndex
   );
-  const BottomChromeReserveFooter = useMemo(
-    () =>
-      function BottomChromeReserveFooter() {
-        return <div aria-hidden="true" style={{ height: bottomChromeReserve }} />;
-      },
-    [bottomChromeReserve]
+
+  const debugScroll = useCallback(
+    (message: string, details: TimelineScrollDebugDetails = {}) => {
+      const payload = {
+        entityID: selectedEntityID ?? null,
+        anchorID: scrollAnchorID,
+        anchorEdge: scrollAnchorEdge,
+        anchorGeneration: scrollAnchorGeneration,
+        itemCount,
+        bottomChromeReserve,
+        metrics: readReverseScrollMetrics(listRef.current),
+        ...details
+      };
+      const line = `[MailiaScrollDebug] ${message} ${JSON.stringify(payload)}`;
+      console.info(line);
+      window.webkit?.messageHandlers?.mailiaTimeline?.postMessage({
+        type: "log",
+        payload: {
+          level: "debug",
+          message: line
+        }
+      });
+    },
+    [
+      bottomChromeReserve,
+      itemCount,
+      scrollAnchorEdge,
+      scrollAnchorGeneration,
+      scrollAnchorID,
+      selectedEntityID
+    ]
   );
-  const virtuosoComponents = useMemo(
-    () => ({
-      Header: TimelineTopReserveHeader,
-      ...(useNativeChrome ? { Footer: BottomChromeReserveFooter } : {})
-    }),
-    [useNativeChrome, BottomChromeReserveFooter, TimelineTopReserveHeader]
+
+  const listRows = useMemo<TimelineListRow[]>(
+    () => {
+      const firstVisibleIndex = clampIndex(visibleStartIndex, messageViews.length);
+      const loadingIndex =
+        nextBodyRequestIndex !== null && nextBodyRequestIndex < firstVisibleIndex
+          ? nextBodyRequestIndex
+          : null;
+      const rows: TimelineListRow[] = [
+        { kind: "bottom-reserve", key: "bottom-reserve" }
+      ];
+
+      for (let messageIndex = messageViews.length - 1; messageIndex >= firstVisibleIndex; messageIndex -= 1) {
+        const message = messageViews[messageIndex];
+        rows.push({
+          kind: "message",
+          key: String(message.messageID),
+          message,
+          messageIndex
+        });
+      }
+
+      if (loadingIndex !== null) {
+        rows.push({
+          kind: "loading",
+          key: "loading",
+          messageIndex: loadingIndex
+        });
+      }
+
+      rows.push({ kind: "top-reserve", key: "top-reserve" });
+      return rows;
+    },
+    [messageViews, nextBodyRequestIndex, visibleStartIndex]
   );
+
   const requestBody = useCallback(
     (message: TimelineMessageView, bodyPriority: number) => {
       bridge.send({
@@ -89,56 +183,8 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
         window.clearTimeout(scrollSettleTimerRef.current);
         scrollSettleTimerRef.current = null;
       }
-      if (bottomAnchorSettleFrameRef.current !== null) {
-        window.cancelAnimationFrame(bottomAnchorSettleFrameRef.current);
-        bottomAnchorSettleFrameRef.current = null;
-      }
     };
   }, []);
-
-  const scrollToTimelineIndex = useCallback(
-    (index: number, edge: "top" | "bottom") => {
-      virtuosoRef.current?.scrollToIndex({
-        index,
-        align: edge === "bottom" ? "end" : "start",
-        behavior: "auto",
-        offset: edge === "top" ? topAnchorOffset : 0
-      });
-    },
-    [topAnchorOffset]
-  );
-
-  const cancelBottomAnchorSettling = useCallback(() => {
-    bottomAnchorSettlingRef.current = false;
-    if (bottomAnchorSettleFrameRef.current !== null) {
-      window.cancelAnimationFrame(bottomAnchorSettleFrameRef.current);
-      bottomAnchorSettleFrameRef.current = null;
-    }
-  }, []);
-
-  const settleBottomAnchor = useCallback(() => {
-    if (!bottomAnchorSettlingRef.current || state.scrollAnchor?.edge !== "bottom") {
-      return;
-    }
-
-    const index = state.items.length - 1;
-    if (index < 0) {
-      return;
-    }
-
-    if (bottomAnchorSettleFrameRef.current !== null) {
-      window.cancelAnimationFrame(bottomAnchorSettleFrameRef.current);
-    }
-
-    bottomAnchorSettleFrameRef.current = window.requestAnimationFrame(() => {
-      bottomAnchorSettleFrameRef.current = null;
-      if (!bottomAnchorSettlingRef.current || state.scrollAnchor?.edge !== "bottom") {
-        return;
-      }
-
-      scrollToTimelineIndex(index, "bottom");
-    });
-  }, [scrollToTimelineIndex, state.items.length, state.scrollAnchor?.edge]);
 
   const handleScrolling = useCallback((isScrolling: boolean) => {
     if (scrollSettleTimerRef.current !== null) {
@@ -164,66 +210,169 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
 
   const shouldDeferBodyRequest = useCallback(() => isScrollSettlingRef.current, []);
 
-  const recordBodyHeight = useCallback((cacheKey: string, height: number) => {
-    setBodyHeightCache((current) => {
-      if (Math.abs((current[cacheKey] ?? 0) - height) <= 2) {
-        return current;
-      }
+  const recordBodyHeight = useCallback(
+    (cacheKey: string, height: number) => {
+      setBodyHeightCache((current) => {
+        if (Math.abs((current[cacheKey] ?? 0) - height) <= 2) {
+          return current;
+        }
 
-      return {
-        ...current,
-        [cacheKey]: height
-      };
-    });
-    settleBottomAnchor();
-  }, [settleBottomAnchor]);
-
-  const handleAtBottomStateChange = useCallback(
-    (atBottom: boolean) => {
-      if (lastAtBottomRef.current === atBottom) return;
-      lastAtBottomRef.current = atBottom;
-      bridge.send({ type: "setScrolledToBottom", atBottom });
+        return {
+          ...current,
+          [cacheKey]: height
+        };
+      });
     },
-    [bridge]
+    []
   );
 
+  const maybeRequestOlderMessages = useCallback(
+    (metrics: ReverseScrollMetrics | null) => {
+      if (
+        !metrics ||
+        metrics.topOffset > 96 ||
+        !state.hasOlderTimeline ||
+        state.isLoadingOlderTimeline ||
+        selectedEntityID === undefined
+      ) {
+        return;
+      }
+
+      const beforeMessageID = state.items[0]?.id;
+      if (beforeMessageID === undefined) {
+        return;
+      }
+
+      const requestKey = `${selectedEntityID}:${beforeMessageID}`;
+      if (lastOlderRequestRef.current === requestKey) {
+        return;
+      }
+
+      lastOlderRequestRef.current = requestKey;
+      bridge.send({
+        type: "requestOlderMessages",
+        entityID: selectedEntityID,
+        beforeMessageID
+      });
+    },
+    [
+      bridge,
+      selectedEntityID,
+      state.hasOlderTimeline,
+      state.isLoadingOlderTimeline,
+      state.items
+    ]
+  );
+
+  const handleListScroll = useCallback(() => {
+    const metrics = readReverseScrollMetrics(listRef.current);
+    handleScrolling(true);
+    maybeRequestOlderMessages(metrics);
+  }, [handleScrolling, maybeRequestOlderMessages]);
+
+  const handleListScrollEnd = useCallback(() => {
+    handleScrolling(false);
+  }, [handleScrolling]);
+
   useEffect(() => {
-    lastAtBottomRef.current = null;
-    lastAppliedAnchorGenerationRef.current = null;
+    lastBodyRequestKeyRef.current = null;
+    lastOlderRequestRef.current = null;
+    previousItemIDsRef.current = null;
     isScrollSettlingRef.current = false;
-    cancelBottomAnchorSettling();
     if (scrollSettleTimerRef.current !== null) {
       window.clearTimeout(scrollSettleTimerRef.current);
       scrollSettleTimerRef.current = null;
     }
-  }, [cancelBottomAnchorSettling, selectedEntityID]);
+  }, [selectedEntityID]);
 
   useEffect(() => {
-    const anchor = state.scrollAnchor;
-    if (!anchor || lastAppliedAnchorGenerationRef.current === anchor.generation) {
+    setRevealBoundary((current) => {
+      const nextBoundary = makeRevealBoundary(
+        selectedEntityID,
+        messageViews,
+        computedFirstVisibleIndex
+      );
+      if (current.entityID !== selectedEntityID) {
+        return nextBoundary;
+      }
+
+      const currentIndex = readVisibleStartIndex(
+        current,
+        selectedEntityID,
+        messageViews,
+        computedFirstVisibleIndex
+      );
+      if (computedFirstVisibleIndex < currentIndex) {
+        return nextBoundary;
+      }
+
+      return current;
+    });
+  }, [
+    computedFirstVisibleIndex,
+    messageViews,
+    selectedEntityID
+  ]);
+
+  useEffect(() => {
+    if (nextBodyRequestIndex === null) {
       return;
     }
 
-    const index =
-      anchor.edge === "bottom"
-        ? state.items.length - 1
-        : state.items.findIndex((item) => item.id === anchor.id);
-    if (index < 0) {
+    const message =
+      messageViews[nextBodyRequestIndex];
+    if (!message || isBodySettled(message) || message.bodyStatus === "loading") {
       return;
     }
 
-    lastAppliedAnchorGenerationRef.current = anchor.generation;
-    bottomAnchorSettlingRef.current = anchor.edge === "bottom";
-    const animationFrame = window.requestAnimationFrame(() => {
-      scrollToTimelineIndex(index, anchor.edge);
+    const requestKey = `${selectedEntityID ?? "none"}:${message.messageID}:${message.bodyStatus}`;
+    if (lastBodyRequestKeyRef.current === requestKey) {
+      return;
+    }
+
+    lastBodyRequestKeyRef.current = requestKey;
+    requestBody(message, bodyRequestWakeToken * 1_000_000 + nextBodyRequestIndex);
+  }, [
+    bodyRequestWakeToken,
+    messageViews,
+    nextBodyRequestIndex,
+    requestBody,
+    selectedEntityID
+  ]);
+
+  useEffect(() => {
+    const previous = previousItemIDsRef.current;
+    previousItemIDsRef.current = {
+      entityID: selectedEntityID,
+      itemIDs,
+      signature: itemIDSignature
+    };
+
+    if (
+      !previous ||
+      previous.entityID !== selectedEntityID ||
+      previous.signature === itemIDSignature
+    ) {
+      return;
+    }
+
+    const dataChange = classifyTimelineDataChange(previous.itemIDs, itemIDs);
+    debugScroll("timeline data change classified", {
+      dataChange,
+      previousCount: previous.itemIDs.length,
+      nextCount: itemIDs.length,
+      previousFirstID: previous.itemIDs[0] ?? null,
+      previousLastID: previous.itemIDs[previous.itemIDs.length - 1] ?? null,
+      nextFirstID: itemIDs[0] ?? null,
+      nextLastID: itemIDs[itemIDs.length - 1] ?? null
     });
 
-    return () => window.cancelAnimationFrame(animationFrame);
-  }, [scrollToTimelineIndex, state.items, state.scrollAnchor]);
-
-  useEffect(() => {
-    settleBottomAnchor();
-  }, [bodyHeightCache, bottomChromeReserve, settleBottomAnchor]);
+  }, [
+    debugScroll,
+    itemIDs,
+    itemIDSignature,
+    selectedEntityID
+  ]);
 
   return (
     <main
@@ -232,94 +381,112 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
       aria-busy={state.isLoadingTimeline && state.items.length === 0 ? true : undefined}
     >
       <div
-        className="timeline__list-shell"
-        onPointerDown={cancelBottomAnchorSettling}
-        onTouchStart={cancelBottomAnchorSettling}
-        onWheel={cancelBottomAnchorSettling}
+        key={selectedEntityID ?? "empty"}
+        ref={listRef}
+        className="timeline__list"
+        onScroll={handleListScroll}
+        onScrollEnd={handleListScrollEnd}
       >
-        <Virtuoso
-          ref={virtuosoRef}
-          key={selectedEntityID ?? "none"}
-          className="timeline__list"
-          style={{ height: "100%", minHeight: 0, width: "100%" }}
-          data={messageViews}
-          components={virtuosoComponents}
-          alignToBottom
-          defaultItemHeight={360}
-          followOutput={anchoredToBottom ? "auto" : false}
-          increaseViewportBy={{ top: 720, bottom: 720 }}
-          initialTopMostItemIndex={Math.max(0, messageViews.length - 1)}
-          computeItemKey={(index, message) =>
-            message?.messageID ?? `missing-message-${selectedEntityID ?? "none"}-${index}`
-          }
-          isScrolling={handleScrolling}
-          startReached={() => {
-            if (state.hasOlderTimeline && !state.isLoadingOlderTimeline && selectedEntityID !== undefined) {
-              bridge.send({
-                type: "requestOlderMessages",
-                entityID: selectedEntityID,
-                beforeMessageID: state.items[0]?.id
-              });
-            }
-          }}
-          atBottomStateChange={handleAtBottomStateChange}
-          itemContent={(index, message) => {
-            if (!message) {
-              return null;
-            }
-
-            const previousMessage = index > 0 ? messageViews[index - 1] : undefined;
-            const nextMessage =
-              index < messageViews.length - 1 ? messageViews[index + 1] : undefined;
-            const bodyHeightCacheKey = messageBodyHeightCacheKey(
-              message,
-              bodyDisplayMode,
-              displayOptions.loadRemoteContent,
-              displayOptions.hideQuotedReplyText,
-              displayOptions.hideReplySubjects
-            );
-
+        {listRows.map((row) => {
+          if (row.kind === "top-reserve") {
             return (
-              <div className="timeline__item">
-                {shouldShowDateSeparator(message, previousMessage) ? (
-                  <div className="timeline__date-separator">
-                    <span>{formatDateSeparator(message.messageDate)}</span>
-                  </div>
-                ) : null}
-                <MessageCard
-                  message={message}
-                  cluster={messageCluster(message, previousMessage, nextMessage)}
-                  showSubject={shouldShowSubject(
-                    message,
-                    previousMessage,
-                    displayOptions.hideReplySubjects
-                  )}
-                  bodyDisplayMode={bodyDisplayMode}
-                  loadRemoteContent={displayOptions.loadRemoteContent}
-                  hideQuotedReplyText={displayOptions.hideQuotedReplyText}
-                  showAvatar={
-                    message.direction === "outgoing"
-                      ? displayOptions.showOwnTimelineAvatars
-                      : displayOptions.showTimelineAvatars
-                  }
-                  bodyRequestWakeToken={bodyRequestWakeToken}
-                  bodyRequestPriority={bodyRequestWakeToken * 1_000_000 + index}
-                  reservedBodyHeight={bodyHeightCache[bodyHeightCacheKey]}
-                  bodyHeightCacheKey={bodyHeightCacheKey}
-                  shouldDeferBodyRequest={shouldDeferBodyRequest}
-                  attachmentState={
-                    state.attachmentDownloadStates[String(message.messageID)] ?? {
-                      status: "idle"
-                    }
-                  }
-                  onRequestBody={requestBody}
-                  onBodyHeightMeasured={recordBodyHeight}
-                  onDownloadAttachments={downloadAttachments}
-                />
+              <div
+                key={row.key}
+                className="timeline__top-reserve"
+                data-row-kind="top-reserve"
+                data-native-chrome="true"
+                aria-hidden="true"
+              />
+            );
+          }
+
+          if (row.kind === "bottom-reserve") {
+            return (
+              <div
+                key={row.key}
+                className="timeline__bottom-reserve"
+                data-row-kind="bottom-reserve"
+                aria-hidden="true"
+                style={{ height: bottomChromeReserve }}
+              />
+            );
+          }
+
+          if (row.kind === "loading") {
+            return (
+              <div
+                key={row.key}
+                className="timeline__loading-row"
+                data-row-kind="loading"
+                data-message-index={row.messageIndex}
+                aria-live="polite"
+                aria-label="Loading messages"
+              >
+                <span className="timeline__loading-spinner" aria-hidden="true" />
               </div>
             );
-          }}
-        />
+          }
+
+          const { message, messageIndex } = row;
+          const previousMessage = messageIndex > 0 ? messageViews[messageIndex - 1] : undefined;
+          const nextMessage =
+            messageIndex < messageViews.length - 1 ? messageViews[messageIndex + 1] : undefined;
+          const bodyHeightCacheKey = messageBodyHeightCacheKey(
+            message,
+            bodyDisplayMode,
+            displayOptions.loadRemoteContent,
+            displayOptions.hideQuotedReplyText,
+            displayOptions.hideReplySubjects
+          );
+
+          return (
+            <div
+              key={row.key}
+              className="timeline__item"
+              data-row-kind="message"
+              data-message-id={message.messageID}
+              data-message-index={messageIndex}
+            >
+              {shouldShowDateSeparator(message, previousMessage) ? (
+                <div className="timeline__date-separator">
+                  <span>{formatDateSeparator(message.messageDate)}</span>
+                </div>
+              ) : null}
+              <MessageCard
+                message={message}
+                cluster={messageCluster(message, previousMessage, nextMessage)}
+                showSubject={shouldShowSubject(
+                  message,
+                  previousMessage,
+                  displayOptions.hideReplySubjects
+                )}
+                bodyDisplayMode={bodyDisplayMode}
+                loadRemoteContent={displayOptions.loadRemoteContent}
+                hideQuotedReplyText={displayOptions.hideQuotedReplyText}
+                showAvatar={
+                  message.direction === "outgoing"
+                    ? displayOptions.showOwnTimelineAvatars
+                    : displayOptions.showTimelineAvatars
+                }
+                bodyRequestWakeToken={bodyRequestWakeToken}
+                bodyRequestPriority={bodyRequestWakeToken * 1_000_000 + messageIndex}
+                reservedBodyHeight={bodyHeightCache[bodyHeightCacheKey]}
+                bodyHeightCacheKey={bodyHeightCacheKey}
+                canRequestBody={true}
+                canRevealBody={true}
+                shouldDeferBodyRequest={shouldDeferBodyRequest}
+                attachmentState={
+                  state.attachmentDownloadStates[String(message.messageID)] ?? {
+                    status: "idle"
+                  }
+                }
+                onRequestBody={requestBody}
+                onBodyHeightMeasured={recordBodyHeight}
+                onDownloadAttachments={downloadAttachments}
+              />
+            </div>
+          );
+        })}
       </div>
     </main>
   );
@@ -327,6 +494,129 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
 
 function normalizeBodyDisplayMode(value: string): BodyDisplayMode {
   return value === "markdown" ? "markdown" : "html";
+}
+
+function makeRevealBoundary(
+  entityID: number | undefined,
+  messages: readonly TimelineMessageView[],
+  firstVisibleIndex: number
+): RevealBoundary {
+  return {
+    entityID,
+    firstVisibleMessageID: messages[firstVisibleIndex]?.messageID ?? null
+  };
+}
+
+function readVisibleStartIndex(
+  boundary: RevealBoundary,
+  entityID: number | undefined,
+  messages: readonly TimelineMessageView[],
+  fallbackIndex: number
+) {
+  if (boundary.entityID !== entityID) {
+    return fallbackIndex;
+  }
+
+  if (boundary.firstVisibleMessageID === null) {
+    return messages.length;
+  }
+
+  const index = messages.findIndex(
+    (message) => message.messageID === boundary.firstVisibleMessageID
+  );
+  return index === -1 ? fallbackIndex : index;
+}
+
+function clampIndex(index: number, length: number) {
+  return Math.max(0, Math.min(index, length));
+}
+
+function readReverseScrollMetrics(scroller: HTMLElement | null): ReverseScrollMetrics | null {
+  if (!scroller) {
+    return null;
+  }
+
+  const scrollTop = scroller.scrollTop;
+  const overflow = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  return {
+    scrollTop: roundMetric(scrollTop),
+    clientHeight: roundMetric(scroller.clientHeight),
+    scrollHeight: roundMetric(scroller.scrollHeight),
+    bottomOffset: roundMetric(Math.max(0, -scrollTop)),
+    topOffset: roundMetric(Math.max(0, overflow + scrollTop))
+  };
+}
+
+function roundMetric(value: number) {
+  return Math.round(value * 10) / 10;
+}
+
+function firstUnsettledMessageIndexFromBottom(messages: readonly TimelineMessageView[]) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (!isBodySettled(messages[index])) {
+      return index;
+    }
+  }
+
+  return null;
+}
+
+function isBodySettled(message: TimelineMessageView) {
+  return Boolean(message.sanitizedHTML) ||
+    message.bodyStatus === "loaded" ||
+    message.bodyStatus === "failed";
+}
+
+function classifyTimelineDataChange(
+  previousItemIDs: readonly number[],
+  nextItemIDs: readonly number[]
+): TimelineDataChange {
+  if (
+    nextItemIDs.length > previousItemIDs.length &&
+    arrayStartsWith(nextItemIDs, previousItemIDs)
+  ) {
+    return "append";
+  }
+
+  if (
+    nextItemIDs.length > previousItemIDs.length &&
+    arrayEndsWith(nextItemIDs, previousItemIDs)
+  ) {
+    return "prepend";
+  }
+
+  if (
+    nextItemIDs.length < previousItemIDs.length &&
+    arrayStartsWith(previousItemIDs, nextItemIDs)
+  ) {
+    return "remove-from-end";
+  }
+
+  if (
+    nextItemIDs.length < previousItemIDs.length &&
+    arrayEndsWith(previousItemIDs, nextItemIDs)
+  ) {
+    return "remove-from-start";
+  }
+
+  return "replace";
+}
+
+function arrayStartsWith(values: readonly number[], prefix: readonly number[]) {
+  if (prefix.length > values.length) {
+    return false;
+  }
+
+  return prefix.every((value, index) => values[index] === value);
+}
+
+function arrayEndsWith(values: readonly number[], suffix: readonly number[]) {
+  if (suffix.length > values.length) {
+    return false;
+  }
+
+  const offset = values.length - suffix.length;
+  return suffix.every((value, index) => values[offset + index] === value);
 }
 
 function toMessageView(item: TimelineItem, state: TimelineState): TimelineMessageView {
@@ -349,7 +639,6 @@ function toMessageView(item: TimelineItem, state: TimelineState): TimelineMessag
     hasAttachments: item.hasAttachments,
     bodyStatus,
     sanitizedHTML: loadedBody?.html ?? item.html ?? null,
-    textFallback: loadedBody?.text ?? (bodyState?.status === "failed" ? item.preview : null),
     avatarSeed: state.entity
       ? `${state.entity.id}-${state.entity.displayName}`
       : null,

@@ -43,7 +43,7 @@ export interface TimelineState {
   selectedSendAccountKey?: string | null;
   scrollAnchor?: TimelineScrollAnchor | null;
   displayOptions: TimelineDisplayOptions;
-  windowState: TimelineWindowState;
+  chromeInsets: TimelineChromeInsets;
 }
 
 export interface TimelineDisplayOptions {
@@ -55,8 +55,8 @@ export interface TimelineDisplayOptions {
   hideReplySubjects: boolean;
 }
 
-export interface TimelineWindowState {
-  bottomOverlayHeight: number;
+export interface TimelineChromeInsets {
+  bottom: number;
 }
 
 export interface TimelineEntity {
@@ -103,7 +103,6 @@ export interface SendAccount {
 
 export interface TimelineBody {
   html?: string | null;
-  text?: string | null;
 }
 
 export interface AttachmentDownloadResult {
@@ -115,17 +114,6 @@ export interface TimelineScrollAnchor {
   id: number;
   edge: "top" | "bottom";
   generation: number;
-}
-
-export interface TimelineEntityOption {
-  id: number;
-  name: string;
-  kind: EntityKind;
-  primaryAddress?: string | null;
-  detail?: string | null;
-  unreadCount: number;
-  lastMessageAt?: string | null;
-  avatarImageDataURL?: string | null;
 }
 
 export interface TimelineMessageView {
@@ -142,7 +130,6 @@ export interface TimelineMessageView {
   hasAttachments: boolean;
   bodyStatus?: TimelineBodyState["status"];
   sanitizedHTML?: string | null;
-  textFallback?: string | null;
   avatarSeed?: string | null;
   avatarName?: string | null;
   avatarEmoji?: string | null;

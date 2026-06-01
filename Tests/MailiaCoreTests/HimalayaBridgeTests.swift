@@ -38,11 +38,6 @@ func buildsEnvelopeListCommand() {
 
 @Test
 func buildsMessageMutationAndAttachmentCommands() {
-    #expect(HimalayaCommand.messageReadPreview(id: "42", folder: "INBOX").arguments == [
-        "--output", "json", "--quiet",
-        "message", "read", "--preview", "--folder", "INBOX", "42"
-    ])
-
     #expect(HimalayaCommand.flagSeen(id: "42", folder: "INBOX", account: "work").arguments == [
         "--output", "json", "--quiet",
         "flag", "add", "--folder", "INBOX", "--account", "work", "42", "seen"
@@ -130,6 +125,17 @@ func buildsMessageMutationAndAttachmentCommands() {
         "--account", "work"
     ])
     #expect(sendTemplateCommand.standardInput == Data("From: me@example.com\n\nHello".utf8))
+
+    let sendMessageCommand = HimalayaCommand.messageSend(
+        message: "From: me@example.com\r\n\r\nHello",
+        account: "work"
+    )
+    #expect(sendMessageCommand.arguments == [
+        "--output", "json", "--quiet",
+        "message", "send",
+        "--account", "work"
+    ])
+    #expect(sendMessageCommand.standardInput == Data("From: me@example.com\r\n\r\nHello".utf8))
 }
 
 @Test
@@ -217,7 +223,14 @@ func processBridgeTerminatesCancellableReadCommandWhenTaskIsCancelled() async th
     let bridge = ProcessHimalayaBridge(executableURL: scriptURL)
     let startedAt = Date()
     let task = Task {
-        try await bridge.run(.messageReadPreview(id: "42"), timeout: 10)
+        try await bridge.run(
+            .messageExport(
+                id: "42",
+                destination: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("mailia-cancel-test", isDirectory: true)
+            ),
+            timeout: 10
+        )
     }
     try await Task.sleep(for: .milliseconds(100))
     task.cancel()
@@ -256,7 +269,15 @@ func commandLimiterDoesNotLeakPermitWhenWaitingTaskIsCancelled() async throws {
 
     _ = try await first.value
     let third = try await withTestTimeout(.seconds(1)) {
-        try await limiter.run(.messageReadPreview(id: "42"), bridge: bridge, timeout: nil)
+        try await limiter.run(
+            .messageExport(
+                id: "42",
+                destination: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("mailia-limiter-test", isDirectory: true)
+            ),
+            bridge: bridge,
+            timeout: nil
+        )
     }
 
     #expect(third.succeeded)
@@ -290,7 +311,11 @@ func commandLimiterRunsHigherPriorityWaiterBeforeEarlierBackgroundWaiter() async
 
     let visible = Task {
         try await limiter.run(
-            .messageReadPreview(id: "visible"),
+            .messageExport(
+                id: "visible",
+                destination: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("mailia-priority-test", isDirectory: true)
+            ),
             bridge: bridge,
             timeout: nil,
             priority: .visibleBody

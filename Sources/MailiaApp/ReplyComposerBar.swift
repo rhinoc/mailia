@@ -21,6 +21,143 @@ private enum ComposerControlMetrics {
     static let composerBottomPadding: CGFloat = 20
 }
 
+enum MailiaComposerShortcut: String, CaseIterable, Identifiable, Sendable {
+    case off
+    case enter
+    case commandEnter
+    case shiftEnter
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .off:
+            "Off"
+        case .enter:
+            "Enter"
+        case .commandEnter:
+            "Command+Enter"
+        case .shiftEnter:
+            "Shift+Enter"
+        }
+    }
+
+    static var uniqueSendOptions: [MailiaComposerShortcut] {
+        unique(Self.allCases)
+    }
+
+    func matches(_ event: NSEvent) -> Bool {
+        guard self != .off, Self.isReturnKey(event) else { return false }
+
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+        switch self {
+        case .off:
+            return false
+        case .enter:
+            return modifiers.isEmpty
+        case .commandEnter:
+            return modifiers == .command
+        case .shiftEnter:
+            return modifiers == .shift
+        }
+    }
+
+    private static func isReturnKey(_ event: NSEvent) -> Bool {
+        event.keyCode == 36 || event.keyCode == 76
+    }
+
+    private static func unique(_ shortcuts: [MailiaComposerShortcut]) -> [MailiaComposerShortcut] {
+        var seen = Set<String>()
+        var result: [MailiaComposerShortcut] = []
+        for shortcut in shortcuts {
+            guard seen.insert(shortcut.rawValue).inserted else { continue }
+            result.append(shortcut)
+        }
+        return result
+    }
+}
+
+struct MailiaComposerSettings: Equatable, Sendable {
+    static let defaultSendShortcut = MailiaComposerShortcut.enter
+    static let defaultAllowUndoAfterSend = true
+    static let defaultUndoDelaySeconds = 5
+    static let allowedUndoDelaySeconds = unique([3, 5, 10, 15, 30])
+
+    var sendShortcut: MailiaComposerShortcut = Self.defaultSendShortcut
+    var allowUndoAfterSend: Bool = Self.defaultAllowUndoAfterSend
+    var undoDelaySeconds: Int = Self.defaultUndoDelaySeconds
+
+    var normalizedUndoDelaySeconds: Int {
+        Self.allowedUndoDelaySeconds.contains(undoDelaySeconds) ? undoDelaySeconds : Self.defaultUndoDelaySeconds
+    }
+
+    var lineBreakShortcut: MailiaComposerShortcut {
+        sendShortcut == .enter ? .shiftEnter : .enter
+    }
+
+    static func saved(defaults: UserDefaults = .standard) -> MailiaComposerSettings {
+        let shortcutRawValue = defaults.string(
+            forKey: MailiaPreferenceKeys.composerSendShortcut
+        ) ?? Self.defaultSendShortcut.rawValue
+        let sendShortcut = MailiaComposerShortcut(rawValue: shortcutRawValue) ?? Self.defaultSendShortcut
+        let allowUndo = defaults.object(
+            forKey: MailiaPreferenceKeys.composerAllowUndoAfterSend
+        ) as? Bool ?? Self.defaultAllowUndoAfterSend
+        let delay = defaults.object(
+            forKey: MailiaPreferenceKeys.composerUndoDelaySeconds
+        ) as? Int ?? Self.defaultUndoDelaySeconds
+
+        return MailiaComposerSettings(
+            sendShortcut: sendShortcut,
+            allowUndoAfterSend: allowUndo,
+            undoDelaySeconds: Self.allowedUndoDelaySeconds.contains(delay) ? delay : Self.defaultUndoDelaySeconds
+        )
+    }
+
+    static func undoDelayLabel(_ seconds: Int) -> String {
+        "\(seconds) seconds"
+    }
+
+    private static func unique(_ values: [Int]) -> [Int] {
+        var seen = Set<Int>()
+        var result: [Int] = []
+        for value in values {
+            guard seen.insert(value).inserted else { continue }
+            result.append(value)
+        }
+        return result
+    }
+}
+
+@propertyWrapper
+struct ComposerBehaviorSettingsStorage: DynamicProperty {
+    @AppStorage(MailiaPreferenceKeys.composerSendShortcut)
+    private var sendShortcut = MailiaComposerSettings.defaultSendShortcut.rawValue
+    @AppStorage(MailiaPreferenceKeys.composerAllowUndoAfterSend)
+    private var allowUndoAfterSend = MailiaComposerSettings.defaultAllowUndoAfterSend
+    @AppStorage(MailiaPreferenceKeys.composerUndoDelaySeconds)
+    private var undoDelaySeconds = MailiaComposerSettings.defaultUndoDelaySeconds
+
+    var wrappedValue: MailiaComposerSettings {
+        get {
+            MailiaComposerSettings(
+                sendShortcut: MailiaComposerShortcut(rawValue: sendShortcut)
+                    ?? MailiaComposerSettings.defaultSendShortcut,
+                allowUndoAfterSend: allowUndoAfterSend,
+                undoDelaySeconds: MailiaComposerSettings.allowedUndoDelaySeconds.contains(undoDelaySeconds)
+                    ? undoDelaySeconds
+                    : MailiaComposerSettings.defaultUndoDelaySeconds
+            )
+        }
+        nonmutating set {
+            sendShortcut = newValue.sendShortcut.rawValue
+            allowUndoAfterSend = newValue.allowUndoAfterSend
+            undoDelaySeconds = newValue.normalizedUndoDelaySeconds
+        }
+    }
+}
+
 @MainActor
 private final class ComposerSendStateController<Payload>: ObservableObject {
     private enum LocalStatus {
@@ -32,14 +169,12 @@ private final class ComposerSendStateController<Payload>: ObservableObject {
     @Published private(set) var queuedPayload: Payload?
     @Published private(set) var remainingSeconds: Int
 
-    private let sendDelaySeconds: Int
     @Published private var localStatus: LocalStatus = .idle
     private var sendTask: Task<Void, Never>?
     private var sentResetTask: Task<Void, Never>?
 
-    init(sendDelaySeconds: Int = 5) {
-        self.sendDelaySeconds = sendDelaySeconds
-        self.remainingSeconds = sendDelaySeconds
+    init() {
+        self.remainingSeconds = 0
     }
 
     var isQueued: Bool {
@@ -56,15 +191,26 @@ private final class ComposerSendStateController<Payload>: ObservableObject {
 
     func queue(
         _ payload: Payload,
+        settings: MailiaComposerSettings,
         send: @escaping @MainActor (Payload) -> Void
     ) {
         sentResetTask?.cancel()
         sendTask?.cancel()
+        let delaySeconds = settings.normalizedUndoDelaySeconds
+
+        guard settings.allowUndoAfterSend, delaySeconds > 0 else {
+            queuedPayload = nil
+            remainingSeconds = 0
+            localStatus = .sending
+            send(payload)
+            return
+        }
+
         queuedPayload = payload
-        remainingSeconds = sendDelaySeconds
+        remainingSeconds = delaySeconds
 
         sendTask = Task { @MainActor in
-            for second in stride(from: sendDelaySeconds, through: 1, by: -1) {
+            for second in stride(from: delaySeconds, through: 1, by: -1) {
                 remainingSeconds = second
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
@@ -79,7 +225,7 @@ private final class ComposerSendStateController<Payload>: ObservableObject {
         sendTask?.cancel()
         sendTask = nil
         queuedPayload = nil
-        remainingSeconds = sendDelaySeconds
+        remainingSeconds = 0
     }
 
     func handleSendStateChange(
@@ -158,6 +304,7 @@ private struct ComposerChrome<Input: View>: View {
     let isSending: Bool
     let isShowingSentConfirmation: Bool
     let canSend: Bool
+    let onAddContent: () -> Void
     let onSend: () -> Void
     let onUndo: () -> Void
     let onSelectSendAccount: (String) -> Void
@@ -187,7 +334,11 @@ private struct ComposerChrome<Input: View>: View {
 
     @ViewBuilder
     private var composerRow: some View {
-        let row = HStack(alignment: .center, spacing: 8) {
+        let row = HStack(alignment: .bottom, spacing: 8) {
+            ComposerAddContentButton(
+                isDisabled: isInputDisabled,
+                onAddContent: onAddContent
+            )
             input()
             if sendAccounts.count > 1 {
                 SendAccountPicker(
@@ -261,6 +412,26 @@ private struct SendAccountPicker: View {
         .fixedSize()
         .disabled(isDisabled)
         .help("Sending account: \(selection.currentAccountLabel)")
+    }
+}
+
+private struct ComposerAddContentButton: View {
+    let isDisabled: Bool
+    let onAddContent: () -> Void
+
+    var body: some View {
+        Button(action: onAddContent) {
+            Image(systemName: "plus")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: ComposerControlMetrics.controlSize, height: ComposerControlMetrics.controlSize)
+                .contentShape(Circle())
+                .modifier(GlassChrome(shape: AnyShape(Circle()), tint: nil, interactive: true))
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.55 : 1)
+        .help("Add photo or file")
     }
 }
 
@@ -339,27 +510,32 @@ private struct ComposerStatusText: View {
     }
 }
 
-/// Floating, native reply composer that sits over the bottom of the timeline.
+/// Native reply composer that occupies the bottom of the timeline pane.
 ///
 /// On macOS 26+ the input and controls use the system Liquid Glass material so
-/// the bar floats over the timeline like a native control. On earlier systems
-/// it falls back to a translucent rounded rectangle. The input expands upward
-/// once the draft wraps onto multiple lines (Shift+Enter).
+/// the bar keeps the native control treatment. On earlier systems it falls back
+/// to a translucent rounded rectangle. The input expands upward once the draft
+/// wraps onto multiple lines (Shift+Enter).
 struct ReplyComposerBar: View {
     let target: MailiaTimelineItem?
     let sendAccounts: [MailiaSendAccount]
     let selectedSendAccountKey: String?
     let sendState: MailiaReplySendState
-    let onSend: (String, String?) -> Void
+    let onSend: (MailiaComposerContent, String?) -> Void
     let onSelectSendAccount: (String) -> Void
     let onEdited: () -> Void
 
     private static let singleLineHeight = ComposerControlMetrics.singleLineHeight
     private static let maxInputHeight = ComposerControlMetrics.maxInputHeight
 
-    @State private var draft = ""
+    @State private var draft = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
+    @State private var attachments: [MailiaOutgoingAttachment] = []
     @State private var textHeight: CGFloat = ReplyComposerBar.singleLineHeight
-    @StateObject private var sendController = ComposerSendStateController<String>()
+    @StateObject private var sendController = ComposerSendStateController<MailiaComposerContent>()
+    @StateObject private var editorController = ComposerRichTextController()
+    @State private var validationMessage: String?
+    @ComposerBehaviorSettingsStorage
+    private var composerSettings
 
     private var selectedAccountID: String {
         SendAccountSelection(
@@ -375,10 +551,18 @@ struct ReplyComposerBar: View {
 
     private var hasTarget: Bool { target != nil }
     private var isInputDisabled: Bool { sendController.isQueued || isSending }
-    private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var canSend: Bool { hasTarget && !trimmedDraft.isEmpty && !sendController.isQueued && !isSending }
+    private var content: MailiaComposerContent {
+        MailiaComposerContent(attributedBody: draft, attachments: attachments)
+    }
+
+    private var canSend: Bool {
+        hasTarget && content.hasRenderableContent && !sendController.isQueued && !isSending
+    }
 
     private var sendFailureMessage: String? {
+        if let validationMessage {
+            return validationMessage
+        }
         if case .failed(let message) = sendState {
             return message
         }
@@ -394,9 +578,10 @@ struct ReplyComposerBar: View {
             isQueued: sendController.isQueued,
             remainingSeconds: sendController.remainingSeconds,
             isSending: isSending,
-            isShowingSentConfirmation: sendController.isShowingSentConfirmation,
-            canSend: canSend,
-            onSend: queueSend,
+                isShowingSentConfirmation: sendController.isShowingSentConfirmation,
+                canSend: canSend,
+                onAddContent: editorController.chooseFilesFromPanel,
+                onSend: queueSend,
             onUndo: sendController.undo,
             onSelectSendAccount: onSelectSendAccount
         ) {
@@ -408,6 +593,17 @@ struct ReplyComposerBar: View {
         .onChange(of: draft) { _, _ in
             clearFailedSendStateAfterEdit()
         }
+        .onChange(of: attachments) { _, _ in
+            clearFailedSendStateAfterEdit()
+        }
+        .onAppear {
+            editorController.onError = { message in
+                validationMessage = message
+            }
+            editorController.onAddAttachments = { newAttachments in
+                attachments.append(contentsOf: newAttachments)
+            }
+        }
         .onDisappear {
             sendController.cancel()
         }
@@ -415,45 +611,55 @@ struct ReplyComposerBar: View {
 
     private var inputField: some View {
         ComposerBodyInputField(
-            text: $draft,
+            attributedText: $draft,
             height: $textHeight,
+            attachments: attachments,
             placeholder: "Reply…",
             isEnabled: !isInputDisabled,
             maxHeight: Self.maxInputHeight,
+            sendShortcut: composerSettings.sendShortcut,
+            editorController: editorController,
+            onRemoveAttachment: removeAttachment,
             onSubmit: queueSend
         )
     }
 
     private func queueSend() {
         guard canSend else { return }
-        let body = trimmedDraft
-        guard !body.isEmpty else { return }
         let account = selectedAccountID
+        let payload = content
 
-        sendController.queue(body) { body in
-            onSend(body, account.isEmpty ? nil : account)
+        sendController.queue(payload, settings: composerSettings) { content in
+            onSend(content, account.isEmpty ? nil : account)
         }
     }
 
     private func handleSendStateChange(_ state: MailiaReplySendState) {
         sendController.handleSendStateChange(state) {
-            draft = ""
+            draft = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
+            attachments = []
             textHeight = Self.singleLineHeight
+            validationMessage = nil
         }
     }
 
     private func clearFailedSendStateAfterEdit() {
-        sendController.clearSentConfirmationIf(hasDraftContent: !trimmedDraft.isEmpty)
+        validationMessage = nil
+        sendController.clearSentConfirmationIf(hasDraftContent: content.hasRenderableContent)
         if case .failed = sendState {
             onEdited()
         }
+    }
+
+    private func removeAttachment(_ attachment: MailiaOutgoingAttachment) {
+        attachments.removeAll { $0.id == attachment.id }
     }
 }
 
 private struct NewMessageComposerPayload {
     let recipients: [String]
     let subject: String?
-    let body: String
+    let content: MailiaComposerContent
     let accountID: String
 }
 
@@ -462,7 +668,7 @@ struct NewMessageComposerView: View {
     let selectedSendAccountKey: String?
     let suggestions: [MailiaRecipientSuggestion]
     let sendState: MailiaReplySendState
-    let onSend: ([String], String?, String, String?) -> Void
+    let onSend: ([String], String?, MailiaComposerContent, String?) -> Void
     let onSelectSendAccount: (String) -> Void
     let onEdited: () -> Void
 
@@ -472,13 +678,17 @@ struct NewMessageComposerView: View {
     @State private var recipients: [String] = []
     @State private var recipientDraft = ""
     @State private var subject = ""
-    @State private var bodyText = ""
+    @State private var bodyText = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
+    @State private var attachments: [MailiaOutgoingAttachment] = []
     @State private var bodyHeight = NewMessageComposerView.singleLineHeight
     @State private var validationMessage: String?
     @StateObject private var sendController = ComposerSendStateController<NewMessageComposerPayload>()
+    @StateObject private var editorController = ComposerRichTextController()
     @State private var highlightedSuggestionID: String?
     @State private var selectedRecipient: String?
     @State private var isRecipientFieldFocused = false
+    @ComposerBehaviorSettingsStorage
+    private var composerSettings
     @FocusState private var focusedField: NewMessageComposerFocusedField?
 
     private var selectedAccountID: String {
@@ -493,8 +703,8 @@ struct NewMessageComposerView: View {
         return sendController.isSending
     }
 
-    private var trimmedBody: String {
-        bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+    private var content: MailiaComposerContent {
+        MailiaComposerContent(attributedBody: bodyText, attachments: attachments)
     }
 
     private var resolvedRecipients: [String] {
@@ -502,7 +712,7 @@ struct NewMessageComposerView: View {
     }
 
     private var canSend: Bool {
-        !trimmedBody.isEmpty && !resolvedRecipients.isEmpty && !sendController.isQueued && !isSending
+        content.hasRenderableContent && !resolvedRecipients.isEmpty && !sendController.isQueued && !isSending
     }
 
     private var statusMessage: String? {
@@ -552,6 +762,17 @@ struct NewMessageComposerView: View {
         }
         .onChange(of: bodyText) { _, _ in
             clearErrorsAfterEdit()
+        }
+        .onChange(of: attachments) { _, _ in
+            clearErrorsAfterEdit()
+        }
+        .onAppear {
+            editorController.onError = { message in
+                validationMessage = message
+            }
+            editorController.onAddAttachments = { newAttachments in
+                attachments.append(contentsOf: newAttachments)
+            }
         }
         .onDisappear {
             sendController.cancel()
@@ -700,9 +921,10 @@ struct NewMessageComposerView: View {
             isQueued: sendController.isQueued,
             remainingSeconds: sendController.remainingSeconds,
             isSending: isSending,
-            isShowingSentConfirmation: sendController.isShowingSentConfirmation,
-            canSend: canSend,
-            onSend: queueSend,
+                isShowingSentConfirmation: sendController.isShowingSentConfirmation,
+                canSend: canSend,
+                onAddContent: editorController.chooseFilesFromPanel,
+                onSend: queueSend,
             onUndo: sendController.undo,
             onSelectSendAccount: onSelectSendAccount
         ) {
@@ -712,11 +934,15 @@ struct NewMessageComposerView: View {
 
     private var bodyInput: some View {
         ComposerBodyInputField(
-            text: $bodyText,
+            attributedText: $bodyText,
             height: $bodyHeight,
+            attachments: attachments,
             placeholder: "Message...",
             isEnabled: !sendController.isQueued && !isSending,
             maxHeight: Self.maxBodyHeight,
+            sendShortcut: composerSettings.sendShortcut,
+            editorController: editorController,
+            onRemoveAttachment: removeAttachment,
             onSubmit: queueSend
         )
     }
@@ -732,8 +958,8 @@ struct NewMessageComposerView: View {
             return
         }
 
-        let body = trimmedBody
-        guard !body.isEmpty else { return }
+        let content = content
+        guard content.hasRenderableContent else { return }
 
         commitRecipientDraft()
 
@@ -743,15 +969,15 @@ struct NewMessageComposerView: View {
         let payload = NewMessageComposerPayload(
             recipients: sendRecipients,
             subject: subject,
-            body: body,
+            content: content,
             accountID: account
         )
 
-        sendController.queue(payload) { payload in
+        sendController.queue(payload, settings: composerSettings) { payload in
             onSend(
                 payload.recipients,
                 payload.subject,
-                payload.body,
+                payload.content,
                 payload.accountID.isEmpty ? nil : payload.accountID
             )
         }
@@ -762,7 +988,8 @@ struct NewMessageComposerView: View {
             recipients = []
             recipientDraft = ""
             subject = ""
-            bodyText = ""
+            bodyText = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
+            attachments = []
             bodyHeight = Self.singleLineHeight
             validationMessage = nil
         }
@@ -780,7 +1007,11 @@ struct NewMessageComposerView: View {
         !recipients.isEmpty
             || !recipientDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !trimmedBody.isEmpty
+            || content.hasRenderableContent
+    }
+
+    private func removeAttachment(_ attachment: MailiaOutgoingAttachment) {
+        attachments.removeAll { $0.id == attachment.id }
     }
 
     private func commitRecipientDraft() {
@@ -824,7 +1055,7 @@ struct NewMessageComposerView: View {
         case .tab, .enter:
             if let suggestion = highlightedSuggestion ?? filteredSuggestions.first {
                 acceptSuggestion(suggestion)
-                if key == .enter, !resolvedRecipients.isEmpty, !trimmedBody.isEmpty {
+                if key == .enter, !resolvedRecipients.isEmpty, content.hasRenderableContent {
                     queueSend()
                 }
                 return true
@@ -835,7 +1066,7 @@ struct NewMessageComposerView: View {
                     recipientDraft = currentText
                 }
                 commitRecipientDraft()
-                if !resolvedRecipients.isEmpty, !trimmedBody.isEmpty {
+                if !resolvedRecipients.isEmpty, content.hasRenderableContent {
                     queueSend()
                 } else {
                     focusedField = .subject
@@ -1299,35 +1530,51 @@ private struct AccountMenuEmojiLabel: View {
 }
 
 private struct ComposerBodyInputField: View {
-    @Binding var text: String
+    @Binding var attributedText: NSAttributedString
     @Binding var height: CGFloat
+    let attachments: [MailiaOutgoingAttachment]
     let placeholder: String
     let isEnabled: Bool
     let maxHeight: CGFloat
+    let sendShortcut: MailiaComposerShortcut
+    let editorController: ComposerRichTextController
+    let onRemoveAttachment: (MailiaOutgoingAttachment) -> Void
     let onSubmit: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            if text.isEmpty {
-                Text(placeholder)
-                    .font(.system(size: 15))
-                    .foregroundStyle(Color(nsColor: .placeholderTextColor))
-                    .padding(.horizontal, ComposerControlMetrics.inputHorizontalPadding)
-                    .padding(.vertical, ComposerControlMetrics.inputVerticalPadding)
-                    .allowsHitTesting(false)
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .topLeading) {
+                if isBodyEmpty {
+                    Text(placeholder)
+                        .font(.system(size: 15))
+                        .foregroundStyle(Color(nsColor: .placeholderTextColor))
+                        .padding(.horizontal, ComposerControlMetrics.inputHorizontalPadding)
+                        .padding(.vertical, ComposerControlMetrics.inputVerticalPadding)
+                        .allowsHitTesting(false)
+                }
+
+                RichComposerTextView(
+                    attributedText: $attributedText,
+                    height: $height,
+                    isEnabled: isEnabled,
+                    minHeight: ComposerControlMetrics.singleLineHeight,
+                    maxHeight: maxHeight,
+                    sendShortcut: sendShortcut,
+                    controller: editorController,
+                    onSubmit: onSubmit
+                )
+                .frame(height: min(max(height, ComposerControlMetrics.singleLineHeight), maxHeight))
+                .padding(.horizontal, ComposerControlMetrics.inputHorizontalPadding)
+                .padding(.vertical, ComposerControlMetrics.inputVerticalPadding)
             }
 
-            GrowingTextView(
-                text: $text,
-                height: $height,
-                isEnabled: isEnabled,
-                minHeight: ComposerControlMetrics.singleLineHeight,
-                maxHeight: maxHeight,
-                onSubmit: onSubmit
-            )
-            .frame(height: min(max(height, ComposerControlMetrics.singleLineHeight), maxHeight))
-            .padding(.horizontal, ComposerControlMetrics.inputHorizontalPadding)
-            .padding(.vertical, ComposerControlMetrics.inputVerticalPadding)
+            if !attachments.isEmpty {
+                ComposerAttachmentStrip(
+                    attachments: attachments,
+                    isEnabled: isEnabled,
+                    onRemove: onRemoveAttachment
+                )
+            }
         }
         .frame(minHeight: ComposerControlMetrics.controlSize)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1346,7 +1593,76 @@ private struct ComposerBodyInputField: View {
     }
 
     private var isSingleLineInput: Bool {
-        !text.contains("\n") && height <= ComposerControlMetrics.singleLineHeight + 2
+        attachments.isEmpty
+            && !ComposerMessageSerializer.containsInlineImage(attributedText)
+            && !attributedText.string.contains("\n")
+            && height <= ComposerControlMetrics.singleLineHeight + 2
+    }
+
+    private var isBodyEmpty: Bool {
+        attributedText.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !ComposerMessageSerializer.containsInlineImage(attributedText)
+    }
+}
+
+private struct ComposerAttachmentStrip: View {
+    let attachments: [MailiaOutgoingAttachment]
+    let isEnabled: Bool
+    let onRemove: (MailiaOutgoingAttachment) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(attachments) { attachment in
+                    ComposerAttachmentChip(
+                        attachment: attachment,
+                        isEnabled: isEnabled,
+                        onRemove: onRemove
+                    )
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.bottom, 8)
+        }
+    }
+}
+
+private struct ComposerAttachmentChip: View {
+    let attachment: MailiaOutgoingAttachment
+    let isEnabled: Bool
+    let onRemove: (MailiaOutgoingAttachment) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: iconName)
+                .font(.system(size: 12, weight: .semibold))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(attachment.displayName)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                Text(ByteCountFormatter.string(fromByteCount: attachment.byteSize, countStyle: .file))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            Button {
+                onRemove(attachment)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(.plain)
+            .disabled(!isEnabled)
+        }
+        .padding(.leading, 9)
+        .padding(.trailing, 5)
+        .frame(height: 34)
+        .background(Color.primary.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var iconName: String {
+        attachment.contentType.lowercased().hasPrefix("image/") ? "photo" : "doc"
     }
 }
 
@@ -1405,14 +1721,15 @@ struct OuterGlassShadow: View {
 }
 
 /// Auto-growing multiline text view backed by `NSTextView` so we get native
-/// IME handling, a system-blue insertion point, and Shift+Enter newlines while
-/// plain Enter submits the draft.
+/// IME handling, a system-blue insertion point, and configurable send/newline
+/// shortcuts.
 struct GrowingTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var height: CGFloat
     var isEnabled: Bool
     var minHeight: CGFloat
     var maxHeight: CGFloat
+    var sendShortcut: MailiaComposerShortcut
     var onSubmit: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -1425,6 +1742,7 @@ struct GrowingTextView: NSViewRepresentable {
         textView.onSubmit = { [weak coordinator = context.coordinator] in
             coordinator?.parent.onSubmit()
         }
+        textView.sendShortcut = sendShortcut
         textView.font = .systemFont(ofSize: 15)
         textView.isRichText = false
         textView.allowsUndo = true
@@ -1457,6 +1775,7 @@ struct GrowingTextView: NSViewRepresentable {
         textView.onSubmit = { [weak coordinator = context.coordinator] in
             coordinator?.parent.onSubmit()
         }
+        textView.sendShortcut = sendShortcut
         if textView.string != text {
             textView.string = text
         }
@@ -1497,6 +1816,7 @@ struct GrowingTextView: NSViewRepresentable {
 
 private final class SubmittableTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var sendShortcut: MailiaComposerShortcut = .enter
     private let insertionPointWidth: CGFloat = 2
     private let insertionPointBlinkAnimationKey = "mailiaInsertionPointBlink"
     private lazy var roundedInsertionPointLayer: CALayer = {
@@ -1514,10 +1834,10 @@ private final class SubmittableTextView: NSTextView {
     override func keyDown(with event: NSEvent) {
         // keyCode 36 == Return, 76 == numeric keypad Enter.
         if event.keyCode == 36 || event.keyCode == 76 {
-            if event.modifierFlags.contains(.shift) {
-                super.keyDown(with: event)
-            } else {
+            if sendShortcut.matches(event) {
                 onSubmit?()
+            } else {
+                insertNewline(nil)
             }
             return
         }

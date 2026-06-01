@@ -59,16 +59,30 @@ xattr -cr "$APP"
 mkdir -p "$ROOT/dist"
 DMG="$ROOT/dist/Mailia-${VERSION}-macos.dmg"
 rm -f "$DMG"
+
+DMG_BACKGROUND_COPY="$STAGE/dmg-background.png"
+DMG_BACKGROUND_RETINA_COPY="$STAGE/dmg-background@2x.png"
+sips -z 373 661 "$DMG_BACKGROUND" --out "$DMG_BACKGROUND_COPY" >/dev/null
+sips -z 746 1322 "$DMG_BACKGROUND" --out "$DMG_BACKGROUND_RETINA_COPY" >/dev/null
+sips -s dpiWidth 72 -s dpiHeight 72 "$DMG_BACKGROUND_COPY" >/dev/null
+sips -s dpiWidth 144 -s dpiHeight 144 "$DMG_BACKGROUND_RETINA_COPY" >/dev/null
+
 APPDMG_JSON="$STAGE/appdmg.json"
 cat >"$APPDMG_JSON" <<EOF
 {
   "title": "Mailia",
   "icon": "$ICON_SRC",
-  "background": "$DMG_BACKGROUND",
-  "icon-size": 96,
+  "background": "$DMG_BACKGROUND_COPY",
+  "icon-size": 80,
+  "window": {
+    "position": { "x": 120, "y": 559 },
+    "size": { "width": 661, "height": 379 }
+  },
+  "format": "UDZO",
+  "filesystem": "HFS+",
   "contents": [
-    { "x": 210, "y": 235, "type": "file", "path": "$APP" },
-    { "x": 590, "y": 235, "type": "link", "path": "/Applications" }
+    { "x": 180, "y": 197, "type": "file", "path": "$APP" },
+    { "x": 480, "y": 197, "type": "link", "path": "/Applications" }
   ]
 }
 EOF
