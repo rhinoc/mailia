@@ -45,6 +45,7 @@ struct MailiaTimelineItem: Identifiable, Equatable, Sendable {
     let subject: String
     let preview: String
     let html: String?
+    let htmlVariants: MailiaTimelineHTMLVariants?
     let date: Date?
     let accountLabel: String
     let accountEmoji: String?
@@ -57,12 +58,34 @@ struct MailiaTimelineItem: Identifiable, Equatable, Sendable {
     let hasAttachments: Bool
 }
 
+struct MailiaTimelineHTMLVariants: Equatable, Sendable {
+    let remoteContentBlockedHTML: String?
+    let quotedReplyHiddenHTML: String?
+    let quotedReplyHiddenRemoteContentBlockedHTML: String?
+
+    init?(_ variants: EmailHTMLDisplayVariants?) {
+        guard let variants else {
+            return nil
+        }
+        if variants.remoteContentBlockedHTML == nil,
+           variants.quotedReplyHiddenHTML == nil,
+           variants.quotedReplyHiddenRemoteContentBlockedHTML == nil {
+            return nil
+        }
+        remoteContentBlockedHTML = variants.remoteContentBlockedHTML
+        quotedReplyHiddenHTML = variants.quotedReplyHiddenHTML
+        quotedReplyHiddenRemoteContentBlockedHTML = variants.quotedReplyHiddenRemoteContentBlockedHTML
+    }
+}
+
 struct MailiaTimelineBody: Equatable, Sendable {
     let html: String?
+    let htmlVariants: MailiaTimelineHTMLVariants?
     let hasAttachments: Bool
 
-    init(html: String?, hasAttachments: Bool = false) {
+    init(html: String?, htmlVariants: MailiaTimelineHTMLVariants? = nil, hasAttachments: Bool = false) {
         self.html = html
+        self.htmlVariants = htmlVariants
         self.hasAttachments = hasAttachments
     }
 }
@@ -72,6 +95,21 @@ enum MailiaTimelineBodyState: Equatable, Sendable {
     case loading
     case loaded(MailiaTimelineBody)
     case failed(String)
+}
+
+private extension MailiaTimelineBodyState {
+    var bodyDebugStatus: String {
+        switch self {
+        case .notRequested:
+            "notRequested"
+        case .loading:
+            "loading"
+        case .loaded:
+            "loaded"
+        case .failed:
+            "failed"
+        }
+    }
 }
 
 struct MailiaAttachmentDownloadResult: Equatable, Sendable {
@@ -376,7 +414,7 @@ final class AppViewModel: ObservableObject {
     private var markReadTasks: [Int64: Task<Void, Never>] = [:]
     private let avatarResolver: EntityBrandAvatarResolver
     private let timelinePageSize = 80
-    private let selectedTimelineBodyPrefetchLimit = 1
+    private let selectedTimelineBodyPrefetchLimit = 4
     private let entityPreviewBodyPrefetchLimit = 50
     private let maxConcurrentAvatarResolutions = 4
     private let partialRefreshSnapshotDelayNanoseconds: UInt64 = 350_000_000
@@ -1644,7 +1682,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func loadBodyIfNeeded(for item: MailiaTimelineItem, priority requestedPriority: Int? = nil) {
-        bodyLoadQueue.loadIfNeeded(for: item, priority: .visible)
+        bodyLoadQueue.loadIfNeeded(for: item, priority: BodyFetchPriority(webPriority: requestedPriority))
     }
 
     private func prefetchSelectedTimelineBodies() {
@@ -1822,6 +1860,7 @@ final class AppViewModel: ObservableObject {
                 subject: item.subject,
                 preview: item.preview,
                 html: item.html,
+                htmlVariants: item.htmlVariants,
                 date: item.date,
                 accountLabel: item.accountLabel,
                 accountEmoji: emoji,
@@ -2660,7 +2699,21 @@ extension AppViewModel: BodyFetchQueueDelegate {
     }
 
     func setBodyState(_ state: MailiaTimelineBodyState?, id: Int64) {
+        let previousState = timelineBodyStates[id]
         timelineBodyStates[id] = state
+        if previousState != state {
+            let status = state?.bodyDebugStatus ?? "nil"
+            let previousStatus = previousState?.bodyDebugStatus ?? "nil"
+            let loadedBody: MailiaTimelineBody?
+            if case .loaded(let body) = state {
+                loadedBody = body
+            } else {
+                loadedBody = nil
+            }
+            MailiaScrollDebugLog(
+                "[MailiaBodyDebug] nativeBodyState messageID=\(id) previous=\(previousStatus) next=\(status) hasHTML=\(loadedBody?.html?.nilIfBlank != nil) hasHTMLVariants=\(loadedBody?.htmlVariants != nil) hasAttachments=\(loadedBody?.hasAttachments ?? false)"
+            )
+        }
         if case .loaded(let body) = state, body.hasAttachments {
             markTimelineItemHasAttachments(id: id)
         }
@@ -2726,6 +2779,7 @@ extension AppViewModel: BodyFetchQueueDelegate {
             subject: item.subject,
             preview: item.preview,
             html: item.html,
+            htmlVariants: item.htmlVariants,
             date: item.date,
             accountLabel: item.accountLabel,
             accountEmoji: item.accountEmoji,

@@ -174,6 +174,7 @@ public struct TimelineMessage: Equatable, Sendable {
     public var direction: MessageDirection
     public var hasAttachments: Bool
     public var sanitizedHTML: String?
+    public var htmlVariants: EmailHTMLDisplayVariants?
     public var textFallback: String?
     public var sanitizerVersion: Int?
 
@@ -191,6 +192,7 @@ public struct TimelineMessage: Equatable, Sendable {
         direction: MessageDirection,
         hasAttachments: Bool,
         sanitizedHTML: String? = nil,
+        htmlVariants: EmailHTMLDisplayVariants? = nil,
         textFallback: String? = nil,
         sanitizerVersion: Int? = nil
     ) {
@@ -207,6 +209,7 @@ public struct TimelineMessage: Equatable, Sendable {
         self.direction = direction
         self.hasAttachments = hasAttachments
         self.sanitizedHTML = sanitizedHTML
+        self.htmlVariants = htmlVariants
         self.textFallback = textFallback
         self.sanitizerVersion = sanitizerVersion
     }
@@ -214,11 +217,18 @@ public struct TimelineMessage: Equatable, Sendable {
 
 public struct TimelineMessageBody: Equatable, Sendable {
     public var sanitizedHTML: String?
+    public var htmlVariants: EmailHTMLDisplayVariants?
     public var textFallback: String?
     public var sanitizerVersion: Int
 
-    public init(sanitizedHTML: String? = nil, textFallback: String? = nil, sanitizerVersion: Int = 0) {
+    public init(
+        sanitizedHTML: String? = nil,
+        htmlVariants: EmailHTMLDisplayVariants? = nil,
+        textFallback: String? = nil,
+        sanitizerVersion: Int = 0
+    ) {
         self.sanitizedHTML = sanitizedHTML
+        self.htmlVariants = htmlVariants
         self.textFallback = textFallback
         self.sanitizerVersion = sanitizerVersion
     }

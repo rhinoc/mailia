@@ -7,6 +7,25 @@ enum BodyFetchPriority: Int, Comparable, Sendable {
     case nearby = 400
     case visible = 500
 
+    init(webPriority: Int?) {
+        guard let webPriority else {
+            self = .visible
+            return
+        }
+
+        if webPriority >= Self.visible.rawValue {
+            self = .visible
+        } else if webPriority >= Self.nearby.rawValue {
+            self = .nearby
+        } else if webPriority >= Self.selectedPage.rawValue {
+            self = .selectedPage
+        } else if webPriority >= Self.entityPreview.rawValue {
+            self = .entityPreview
+        } else {
+            self = .background
+        }
+    }
+
     static func < (lhs: BodyFetchPriority, rhs: BodyFetchPriority) -> Bool {
         lhs.rawValue < rhs.rawValue
     }

@@ -1,10 +1,11 @@
-import type { TimelineEntity, TimelineItem, TimelineState } from "../types";
+import type { TimelineEntity, TimelineItem, TimelineState, TimelineStatePatch } from "../types";
 
 type TimelineEntityID = TimelineEntity["id"];
 type TimelineMessageID = TimelineItem["id"];
 
 export type TimelineInboundEvent =
   | { type: "state"; state: TimelineState }
+  | { type: "statePatch"; patch: TimelineStatePatch }
   | { type: "error"; message: string };
 
 export type TimelineOutboundEvent =
@@ -41,9 +42,9 @@ declare global {
       };
     };
     mailiaTimeline?: {
-      receive(event: TimelineInboundEvent): void;
-      receiveState(state: TimelineState): void;
+      receive(event: unknown): void;
     };
+    __mailiaTimelinePendingEvents?: TimelineInboundEvent[];
   }
 }
 
@@ -51,6 +52,7 @@ type Listener = (event: TimelineInboundEvent) => void;
 
 class NativeTimelineBridge implements TimelineBridge {
   private listeners = new Set<Listener>();
+  private queuedEvents: TimelineInboundEvent[] = [];
 
   constructor(
     private readonly handler: {
@@ -59,16 +61,34 @@ class NativeTimelineBridge implements TimelineBridge {
   ) {
     window.mailiaTimeline = {
       receive: (event) => {
-        this.emit(event);
-      },
-      receiveState: (state) => {
-        this.emit({ type: "state", state });
+        const inboundEvent = normalizeInboundEvent(event);
+        if (inboundEvent) {
+          this.emit(inboundEvent);
+        }
       }
     };
+
+    const pendingEvents = window.__mailiaTimelinePendingEvents;
+    if (pendingEvents?.length) {
+      delete window.__mailiaTimelinePendingEvents;
+      for (const event of pendingEvents) {
+        const inboundEvent = normalizeInboundEvent(event);
+        if (inboundEvent) {
+          this.emit(inboundEvent);
+        }
+      }
+    }
   }
 
   subscribe(listener: Listener) {
     this.listeners.add(listener);
+    if (this.queuedEvents.length > 0) {
+      const queuedEvents = this.queuedEvents;
+      this.queuedEvents = [];
+      for (const event of queuedEvents) {
+        listener(event);
+      }
+    }
     return () => {
       this.listeners.delete(listener);
     };
@@ -82,10 +102,74 @@ class NativeTimelineBridge implements TimelineBridge {
   }
 
   private emit(event: TimelineInboundEvent) {
+    if (this.listeners.size === 0) {
+      this.queuedEvents.push(event);
+      return;
+    }
+
     for (const listener of this.listeners) {
       listener(event);
     }
   }
+}
+
+function normalizeInboundEvent(event: unknown): TimelineInboundEvent | null {
+  if (!event || typeof event !== "object") {
+    return null;
+  }
+
+  const candidate = event as Partial<TimelineInboundEvent>;
+  switch (candidate.type) {
+    case "state": {
+      const state = (candidate as { state?: unknown }).state;
+      return isTimelineState(state) ? { type: "state", state } : null;
+    }
+    case "statePatch": {
+      const patch = (candidate as { patch?: unknown }).patch;
+      return isTimelineStatePatch(patch) ? { type: "statePatch", patch } : null;
+    }
+    case "error": {
+      const message = (candidate as { message?: unknown }).message;
+      return { type: "error", message: typeof message === "string" ? message : "Timeline error" };
+    }
+    default:
+      return null;
+  }
+}
+
+function isTimelineState(value: unknown): value is TimelineState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<TimelineState>;
+  return (
+    Array.isArray(state.items) &&
+    isRecord(state.bodyStates) &&
+    isRecord(state.attachmentDownloadStates) &&
+    state.replySendState !== undefined &&
+    state.displayOptions !== undefined &&
+    state.chromeInsets !== undefined
+  );
+}
+
+function isTimelineStatePatch(value: unknown): value is TimelineStatePatch {
+  if (!value || typeof value !== "object") return false;
+  const patch = value as Partial<TimelineStatePatch>;
+  return (
+    typeof patch.isLoadingTimeline === "boolean" &&
+    typeof patch.isLoadingOlderTimeline === "boolean" &&
+    typeof patch.isLoadingNewerTimeline === "boolean" &&
+    typeof patch.hasOlderTimeline === "boolean" &&
+    typeof patch.hasNewerTimeline === "boolean" &&
+    isRecord(patch.bodyStateUpdates) &&
+    Array.isArray(patch.removedBodyStateKeys) &&
+    isRecord(patch.attachmentDownloadStateUpdates) &&
+    Array.isArray(patch.removedAttachmentDownloadStateKeys) &&
+    patch.replySendState !== undefined &&
+    patch.chromeInsets !== undefined
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function toNativeEnvelope(event: TimelineOutboundEvent) {

@@ -329,6 +329,60 @@ func displayNormalizerRemovesTrailingBlankSignature() throws {
 }
 
 @Test
+func displayVariantBuilderBlocksRemoteImagesWithPreservedBox() {
+    let html = #"<p>Hello <a href="https://example.com"><img src="https://example.com/pixel.png" width="320" height="180"></a></p>"#
+
+    let result = HTMLDisplayVariantBuilder().render(
+        html,
+        loadRemoteContent: false,
+        hideQuotedReplyText: false
+    )
+
+    #expect(result.contains("Hello"))
+    #expect(result.contains("mailia-remote-image-placeholder"))
+    #expect(result.contains("aria-label=\"Remote image blocked\""))
+    #expect(result.contains("width: 320px"))
+    #expect(result.contains("height: 180px"))
+    #expect(!result.localizedCaseInsensitiveContains("<img"))
+    #expect(!result.contains("https://example.com/pixel.png"))
+}
+
+@Test
+func displayVariantBuilderKeepsRemoteImagesWhenAllowed() {
+    let html = #"<p>Hello <img src="https://example.com/pixel.png" width="320" height="180"></p>"#
+
+    let result = HTMLDisplayVariantBuilder().render(
+        html,
+        loadRemoteContent: true,
+        hideQuotedReplyText: false
+    )
+
+    #expect(result.contains("<img"))
+    #expect(result.contains("https://example.com/pixel.png"))
+    #expect(!result.contains("mailia-remote-image-placeholder"))
+}
+
+@Test
+func displayVariantBuilderRemovesKnownQuotedReplyContainers() {
+    let html = """
+    <p>Current reply</p>
+    <div class="gmail_quote">
+      <p>Older message</p>
+    </div>
+    """
+
+    let result = HTMLDisplayVariantBuilder().render(
+        html,
+        loadRemoteContent: true,
+        hideQuotedReplyText: true
+    )
+
+    #expect(result.contains("Current reply"))
+    #expect(!result.contains("Older message"))
+    #expect(!result.contains("gmail_quote"))
+}
+
+@Test
 func textNormalizerRemovesHimalayaAttachmentPartMarkers() {
     let text = """
     See attached invoice.

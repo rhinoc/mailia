@@ -46,6 +46,20 @@ export interface TimelineState {
   chromeInsets: TimelineChromeInsets;
 }
 
+export interface TimelineStatePatch {
+  isLoadingTimeline: boolean;
+  isLoadingOlderTimeline: boolean;
+  isLoadingNewerTimeline: boolean;
+  hasOlderTimeline: boolean;
+  hasNewerTimeline: boolean;
+  bodyStateUpdates: Record<string, TimelineBodyState>;
+  removedBodyStateKeys: string[];
+  attachmentDownloadStateUpdates: Record<string, AttachmentDownloadState>;
+  removedAttachmentDownloadStateKeys: string[];
+  replySendState: ReplySendState;
+  chromeInsets: TimelineChromeInsets;
+}
+
 export interface TimelineDisplayOptions {
   bodyDisplayMode: BodyDisplayMode | string;
   loadRemoteContent: boolean;
@@ -81,6 +95,7 @@ export interface TimelineItem {
   subject: string;
   preview: string;
   html?: string | null;
+  htmlVariants?: TimelineHTMLVariants | null;
   date?: string | null;
   accountLabel: string;
   accountEmoji?: string | null;
@@ -103,6 +118,13 @@ export interface SendAccount {
 
 export interface TimelineBody {
   html?: string | null;
+  htmlVariants?: TimelineHTMLVariants | null;
+}
+
+export interface TimelineHTMLVariants {
+  remoteContentBlockedHTML?: string | null;
+  quotedReplyHiddenHTML?: string | null;
+  quotedReplyHiddenRemoteContentBlockedHTML?: string | null;
 }
 
 export interface AttachmentDownloadResult {
@@ -129,7 +151,9 @@ export interface TimelineMessageView {
   direction: MessageDirection;
   hasAttachments: boolean;
   bodyStatus?: TimelineBodyState["status"];
+  bodyErrorMessage?: string | null;
   sanitizedHTML?: string | null;
+  htmlVariants?: TimelineHTMLVariants | null;
   avatarSeed?: string | null;
   avatarName?: string | null;
   avatarEmoji?: string | null;

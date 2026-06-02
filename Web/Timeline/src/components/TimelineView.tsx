@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { TimelineBridge } from "../bridge/timelineBridge";
-import type { BodyDisplayMode, TimelineItem, TimelineMessageView, TimelineState } from "../types";
+import type {
+  BodyDisplayMode,
+  TimelineBodyState,
+  TimelineEntity,
+  TimelineItem,
+  TimelineMessageView,
+  TimelineState
+} from "../types";
 import { MessageCard } from "./MessageCard";
 
 interface TimelineViewProps {
@@ -8,12 +15,16 @@ interface TimelineViewProps {
   state: TimelineState;
 }
 
+const BODY_REQUEST_WINDOW_SIZE = 4;
+const VISIBLE_BODY_PRIORITY = 500;
+const NEARBY_BODY_PRIORITY = 400;
+
 type TimelineScrollDebugDetails = Record<string, unknown>;
 
 type TimelineListRow =
   | { kind: "top-reserve"; key: "top-reserve" }
   | { kind: "loading"; key: "loading"; messageIndex: number }
-  | { kind: "message"; key: string; message: TimelineMessageView; messageIndex: number }
+  | { kind: "message"; key: string; item: TimelineItem; messageIndex: number }
   | { kind: "bottom-reserve"; key: "bottom-reserve" };
 
 type TimelineDataChange =
@@ -36,6 +47,12 @@ interface RevealBoundary {
   firstVisibleMessageID: number | null;
 }
 
+interface BodyRequestCandidate {
+  item: TimelineItem;
+  bodyState?: TimelineBodyState;
+  priority: number;
+}
+
 export function TimelineView({ bridge, state }: TimelineViewProps) {
   const selectedEntityID = state.entity?.id;
   const displayOptions = state.displayOptions;
@@ -48,21 +65,17 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     [itemIDSignature]
   );
   const itemCount = itemIDs.length;
-  const messageViews = useMemo(
-    () => state.items.map((item) => toMessageView(item, state)),
-    [state]
-  );
   const bodyDisplayMode = normalizeBodyDisplayMode(displayOptions.bodyDisplayMode);
   const nextBodyRequestIndex = useMemo(
-    () => firstUnsettledMessageIndexFromBottom(messageViews),
-    [messageViews]
+    () => firstUnsettledItemIndexFromBottom(state.items, state.bodyStates),
+    [state.bodyStates, state.items]
   );
   const computedFirstVisibleIndex =
     nextBodyRequestIndex === null ? 0 : nextBodyRequestIndex + 1;
   const listRef = useRef<HTMLDivElement>(null);
   const scrollSettleTimerRef = useRef<number | null>(null);
   const isScrollSettlingRef = useRef(false);
-  const lastBodyRequestKeyRef = useRef<string | null>(null);
+  const requestedBodyKeysRef = useRef<Set<string>>(new Set());
   const lastOlderRequestRef = useRef<string | null>(null);
   const previousItemIDsRef = useRef<{
     entityID?: number;
@@ -82,7 +95,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   const visibleStartIndex = readVisibleStartIndex(
     revealBoundary,
     selectedEntityID,
-    messageViews,
+    state.items,
     computedFirstVisibleIndex
   );
 
@@ -120,7 +133,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
 
   const listRows = useMemo<TimelineListRow[]>(
     () => {
-      const firstVisibleIndex = clampIndex(visibleStartIndex, messageViews.length);
+      const firstVisibleIndex = clampIndex(visibleStartIndex, state.items.length);
       const loadingIndex =
         nextBodyRequestIndex !== null && nextBodyRequestIndex < firstVisibleIndex
           ? nextBodyRequestIndex
@@ -129,12 +142,12 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
         { kind: "bottom-reserve", key: "bottom-reserve" }
       ];
 
-      for (let messageIndex = messageViews.length - 1; messageIndex >= firstVisibleIndex; messageIndex -= 1) {
-        const message = messageViews[messageIndex];
+      for (let messageIndex = state.items.length - 1; messageIndex >= firstVisibleIndex; messageIndex -= 1) {
+        const item = state.items[messageIndex];
         rows.push({
           kind: "message",
-          key: String(message.messageID),
-          message,
+          key: String(item.id),
+          item,
           messageIndex
         });
       }
@@ -150,7 +163,16 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
       rows.push({ kind: "top-reserve", key: "top-reserve" });
       return rows;
     },
-    [messageViews, nextBodyRequestIndex, visibleStartIndex]
+    [nextBodyRequestIndex, state.items, visibleStartIndex]
+  );
+  const bodyRequestCandidates = useMemo(
+    () => bodyRequestCandidatesFromBottom(
+      state.items,
+      state.bodyStates,
+      nextBodyRequestIndex,
+      BODY_REQUEST_WINDOW_SIZE
+    ),
+    [nextBodyRequestIndex, state.bodyStates, state.items]
   );
 
   const requestBody = useCallback(
@@ -275,7 +297,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
   }, [handleScrolling]);
 
   useEffect(() => {
-    lastBodyRequestKeyRef.current = null;
+    requestedBodyKeysRef.current.clear();
     lastOlderRequestRef.current = null;
     previousItemIDsRef.current = null;
     isScrollSettlingRef.current = false;
@@ -289,7 +311,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     setRevealBoundary((current) => {
       const nextBoundary = makeRevealBoundary(
         selectedEntityID,
-        messageViews,
+        state.items,
         computedFirstVisibleIndex
       );
       if (current.entityID !== selectedEntityID) {
@@ -299,7 +321,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
       const currentIndex = readVisibleStartIndex(
         current,
         selectedEntityID,
-        messageViews,
+        state.items,
         computedFirstVisibleIndex
       );
       if (computedFirstVisibleIndex < currentIndex) {
@@ -310,32 +332,38 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     });
   }, [
     computedFirstVisibleIndex,
-    messageViews,
+    state.items,
     selectedEntityID
   ]);
 
   useEffect(() => {
-    if (nextBodyRequestIndex === null) {
-      return;
-    }
+    pruneRequestedBodyKeys(
+      requestedBodyKeysRef.current,
+      selectedEntityID,
+      state.items,
+      state.bodyStates
+    );
+    for (const candidate of bodyRequestCandidates) {
+      const message = toMessageView(candidate.item, state.entity, candidate.bodyState);
+      const requestKey = bodyRequestKey(
+        selectedEntityID,
+        message.messageID,
+        message.bodyStatus,
+        candidate.priority
+      );
+      if (requestedBodyKeysRef.current.has(requestKey)) {
+        continue;
+      }
 
-    const message =
-      messageViews[nextBodyRequestIndex];
-    if (!message || isBodySettled(message) || message.bodyStatus === "loading") {
-      return;
+      requestedBodyKeysRef.current.add(requestKey);
+      requestBody(message, candidate.priority);
     }
-
-    const requestKey = `${selectedEntityID ?? "none"}:${message.messageID}:${message.bodyStatus}`;
-    if (lastBodyRequestKeyRef.current === requestKey) {
-      return;
-    }
-
-    lastBodyRequestKeyRef.current = requestKey;
-    requestBody(message, bodyRequestWakeToken * 1_000_000 + nextBodyRequestIndex);
   }, [
     bodyRequestWakeToken,
-    messageViews,
-    nextBodyRequestIndex,
+    bodyRequestCandidates,
+    state.entity,
+    state.bodyStates,
+    state.items,
     requestBody,
     selectedEntityID
   ]);
@@ -427,10 +455,21 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
             );
           }
 
-          const { message, messageIndex } = row;
-          const previousMessage = messageIndex > 0 ? messageViews[messageIndex - 1] : undefined;
-          const nextMessage =
-            messageIndex < messageViews.length - 1 ? messageViews[messageIndex + 1] : undefined;
+          const { item, messageIndex } = row;
+          const message = toMessageView(
+            item,
+            state.entity,
+            state.bodyStates[String(item.id)]
+          );
+          const previousItem = messageIndex > 0 ? state.items[messageIndex - 1] : undefined;
+          const nextItem =
+            messageIndex < state.items.length - 1 ? state.items[messageIndex + 1] : undefined;
+          const previousMessage = previousItem
+            ? toMessageView(previousItem, state.entity, state.bodyStates[String(previousItem.id)])
+            : undefined;
+          const nextMessage = nextItem
+            ? toMessageView(nextItem, state.entity, state.bodyStates[String(nextItem.id)])
+            : undefined;
           const bodyHeightCacheKey = messageBodyHeightCacheKey(
             message,
             bodyDisplayMode,
@@ -498,19 +537,19 @@ function normalizeBodyDisplayMode(value: string): BodyDisplayMode {
 
 function makeRevealBoundary(
   entityID: number | undefined,
-  messages: readonly TimelineMessageView[],
+  items: readonly TimelineItem[],
   firstVisibleIndex: number
 ): RevealBoundary {
   return {
     entityID,
-    firstVisibleMessageID: messages[firstVisibleIndex]?.messageID ?? null
+    firstVisibleMessageID: items[firstVisibleIndex]?.id ?? null
   };
 }
 
 function readVisibleStartIndex(
   boundary: RevealBoundary,
   entityID: number | undefined,
-  messages: readonly TimelineMessageView[],
+  items: readonly TimelineItem[],
   fallbackIndex: number
 ) {
   if (boundary.entityID !== entityID) {
@@ -518,11 +557,11 @@ function readVisibleStartIndex(
   }
 
   if (boundary.firstVisibleMessageID === null) {
-    return messages.length;
+    return items.length;
   }
 
-  const index = messages.findIndex(
-    (message) => message.messageID === boundary.firstVisibleMessageID
+  const index = items.findIndex(
+    (item) => item.id === boundary.firstVisibleMessageID
   );
   return index === -1 ? fallbackIndex : index;
 }
@@ -551,9 +590,13 @@ function roundMetric(value: number) {
   return Math.round(value * 10) / 10;
 }
 
-function firstUnsettledMessageIndexFromBottom(messages: readonly TimelineMessageView[]) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (!isBodySettled(messages[index])) {
+function firstUnsettledItemIndexFromBottom(
+  items: readonly TimelineItem[],
+  bodyStates: TimelineState["bodyStates"]
+) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isItemBodySettled(item, bodyStates[String(item.id)])) {
       return index;
     }
   }
@@ -561,10 +604,71 @@ function firstUnsettledMessageIndexFromBottom(messages: readonly TimelineMessage
   return null;
 }
 
-function isBodySettled(message: TimelineMessageView) {
-  return Boolean(message.sanitizedHTML) ||
-    message.bodyStatus === "loaded" ||
-    message.bodyStatus === "failed";
+function bodyRequestCandidatesFromBottom(
+  items: readonly TimelineItem[],
+  bodyStates: TimelineState["bodyStates"],
+  firstRequestIndex: number | null,
+  windowSize: number
+) {
+  if (firstRequestIndex === null || windowSize <= 0) {
+    return [];
+  }
+
+  const candidates: BodyRequestCandidate[] = [];
+  for (let index = firstRequestIndex; index >= 0 && candidates.length < windowSize; index -= 1) {
+    const item = items[index];
+    const bodyState = item ? bodyStates[String(item.id)] : undefined;
+    if (!item || isItemBodySettled(item, bodyState) || bodyState?.status === "loading") {
+      continue;
+    }
+
+    candidates.push({
+      item,
+      bodyState,
+      priority: index === firstRequestIndex ? VISIBLE_BODY_PRIORITY : NEARBY_BODY_PRIORITY
+    });
+  }
+
+  return candidates;
+}
+
+function isItemBodySettled(item: TimelineItem, bodyState?: TimelineBodyState) {
+  return Boolean(item.html) ||
+    bodyState?.status === "loaded" ||
+    bodyState?.status === "failed";
+}
+
+function bodyRequestKey(
+  entityID: number | undefined,
+  messageID: number,
+  bodyStatus: TimelineMessageView["bodyStatus"],
+  priority: number
+) {
+  return [
+    entityID ?? "none",
+    messageID,
+    bodyStatus ?? "notRequested",
+    priority
+  ].join(":");
+}
+
+function pruneRequestedBodyKeys(
+  requestedKeys: Set<string>,
+  entityID: number | undefined,
+  items: readonly TimelineItem[],
+  bodyStates: TimelineState["bodyStates"]
+) {
+  const expectedEntity = String(entityID ?? "none");
+  const itemsByID = new Map(items.map((item) => [String(item.id), item]));
+  for (const key of requestedKeys) {
+    const [keyEntity, keyMessageID, keyBodyStatus] = key.split(":");
+    const item = itemsByID.get(keyMessageID);
+    const bodyState = item ? bodyStates[String(item.id)] : undefined;
+    const currentStatus = item?.html ? "loaded" : (bodyState?.status ?? "notRequested");
+    if (keyEntity !== expectedEntity || !item || currentStatus !== keyBodyStatus) {
+      requestedKeys.delete(key);
+    }
+  }
 }
 
 function classifyTimelineDataChange(
@@ -619,10 +723,14 @@ function arrayEndsWith(values: readonly number[], suffix: readonly number[]) {
   return suffix.every((value, index) => values[offset + index] === value);
 }
 
-function toMessageView(item: TimelineItem, state: TimelineState): TimelineMessageView {
-  const bodyState = state.bodyStates[String(item.id)];
+function toMessageView(
+  item: TimelineItem,
+  entity: TimelineEntity | null,
+  bodyState?: TimelineBodyState
+): TimelineMessageView {
   const loadedBody = bodyState?.status === "loaded" ? bodyState.body : undefined;
   const bodyStatus = item.html ? "loaded" : (bodyState?.status ?? "notRequested");
+  const bodyErrorMessage = bodyState?.status === "failed" ? bodyState.message : null;
   const direction = item.direction === "outgoing" ? "outgoing" : "incoming";
 
   return {
@@ -638,17 +746,19 @@ function toMessageView(item: TimelineItem, state: TimelineState): TimelineMessag
     direction,
     hasAttachments: item.hasAttachments,
     bodyStatus,
+    bodyErrorMessage,
     sanitizedHTML: loadedBody?.html ?? item.html ?? null,
-    avatarSeed: state.entity
-      ? `${state.entity.id}-${state.entity.displayName}`
+    htmlVariants: loadedBody?.htmlVariants ?? item.htmlVariants ?? null,
+    avatarSeed: entity
+      ? `${entity.id}-${entity.displayName}`
       : null,
     avatarName: direction === "outgoing"
       ? item.accountLabel
-      : (state.entity?.displayName ?? item.fromLabel),
+      : (entity?.displayName ?? item.fromLabel),
     avatarEmoji: direction === "outgoing" ? (item.accountEmoji ?? null) : null,
     avatarImageDataURL: direction === "outgoing"
       ? (item.accountAvatarImageDataURL ?? null)
-      : (state.entity?.avatarImageDataURL ?? null)
+      : (entity?.avatarImageDataURL ?? null)
   };
 }
 

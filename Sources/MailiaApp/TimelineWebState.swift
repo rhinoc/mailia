@@ -107,6 +107,73 @@ struct TimelineWebState: Codable, Equatable, Sendable {
     }
 }
 
+struct TimelineWebStatePatch: Codable, Equatable, Sendable {
+    var isLoadingTimeline: Bool
+    var isLoadingOlderTimeline: Bool
+    var isLoadingNewerTimeline: Bool
+    var hasOlderTimeline: Bool
+    var hasNewerTimeline: Bool
+    var bodyStateUpdates: [String: TimelineWebState.BodyState]
+    var removedBodyStateKeys: [String]
+    var attachmentDownloadStateUpdates: [String: TimelineWebState.AttachmentDownloadState]
+    var removedAttachmentDownloadStateKeys: [String]
+    var replySendState: TimelineWebState.ReplySendState
+    var chromeInsets: TimelineWebState.ChromeInsets
+
+    init?(from previous: TimelineWebState, to current: TimelineWebState) {
+        guard previous.entity == current.entity,
+              previous.items == current.items,
+              previous.sendAccounts == current.sendAccounts,
+              previous.selectedSendAccountKey == current.selectedSendAccountKey,
+              previous.scrollAnchor == current.scrollAnchor,
+              previous.displayOptions == current.displayOptions
+        else {
+            return nil
+        }
+
+        let bodyStateUpdates = current.bodyStates.filter { key, state in
+            previous.bodyStates[key] != state
+        }
+        let removedBodyStateKeys = previous.bodyStates.keys
+            .filter { current.bodyStates[$0] == nil }
+            .sorted()
+        let attachmentDownloadStateUpdates = current.attachmentDownloadStates.filter { key, state in
+            previous.attachmentDownloadStates[key] != state
+        }
+        let removedAttachmentDownloadStateKeys = previous.attachmentDownloadStates.keys
+            .filter { current.attachmentDownloadStates[$0] == nil }
+            .sorted()
+        let hasScalarChanges = previous.isLoadingTimeline != current.isLoadingTimeline
+            || previous.isLoadingOlderTimeline != current.isLoadingOlderTimeline
+            || previous.isLoadingNewerTimeline != current.isLoadingNewerTimeline
+            || previous.hasOlderTimeline != current.hasOlderTimeline
+            || previous.hasNewerTimeline != current.hasNewerTimeline
+            || previous.replySendState != current.replySendState
+            || previous.chromeInsets != current.chromeInsets
+
+        guard hasScalarChanges
+            || !bodyStateUpdates.isEmpty
+            || !removedBodyStateKeys.isEmpty
+            || !attachmentDownloadStateUpdates.isEmpty
+            || !removedAttachmentDownloadStateKeys.isEmpty
+        else {
+            return nil
+        }
+
+        self.isLoadingTimeline = current.isLoadingTimeline
+        self.isLoadingOlderTimeline = current.isLoadingOlderTimeline
+        self.isLoadingNewerTimeline = current.isLoadingNewerTimeline
+        self.hasOlderTimeline = current.hasOlderTimeline
+        self.hasNewerTimeline = current.hasNewerTimeline
+        self.bodyStateUpdates = bodyStateUpdates
+        self.removedBodyStateKeys = removedBodyStateKeys
+        self.attachmentDownloadStateUpdates = attachmentDownloadStateUpdates
+        self.removedAttachmentDownloadStateKeys = removedAttachmentDownloadStateKeys
+        self.replySendState = current.replySendState
+        self.chromeInsets = current.chromeInsets
+    }
+}
+
 extension TimelineWebState {
     struct ChromeInsets: Codable, Equatable, Sendable {
         var bottom: CGFloat
@@ -138,6 +205,7 @@ extension TimelineWebState {
         var subject: String
         var preview: String
         var html: String?
+        var htmlVariants: HTMLVariants?
         var date: Date?
         var accountLabel: String
         var accountEmoji: String?
@@ -203,6 +271,13 @@ extension TimelineWebState {
 
     struct Body: Codable, Equatable, Sendable {
         var html: String?
+        var htmlVariants: HTMLVariants?
+    }
+
+    struct HTMLVariants: Codable, Equatable, Sendable {
+        var remoteContentBlockedHTML: String?
+        var quotedReplyHiddenHTML: String?
+        var quotedReplyHiddenRemoteContentBlockedHTML: String?
     }
 
     enum AttachmentDownloadState: Codable, Equatable, Sendable {
@@ -392,6 +467,7 @@ extension TimelineWebState.Item {
             subject: item.subject,
             preview: item.preview,
             html: item.html,
+            htmlVariants: item.htmlVariants.map(TimelineWebState.HTMLVariants.init),
             date: item.date,
             accountLabel: item.accountLabel,
             accountEmoji: item.accountEmoji,
@@ -423,7 +499,20 @@ extension TimelineWebState.BodyState {
 
 extension TimelineWebState.Body {
     init(_ body: MailiaTimelineBody) {
-        self.init(html: body.html)
+        self.init(
+            html: body.html,
+            htmlVariants: body.htmlVariants.map(TimelineWebState.HTMLVariants.init)
+        )
+    }
+}
+
+extension TimelineWebState.HTMLVariants {
+    init(_ variants: MailiaTimelineHTMLVariants) {
+        self.init(
+            remoteContentBlockedHTML: variants.remoteContentBlockedHTML,
+            quotedReplyHiddenHTML: variants.quotedReplyHiddenHTML,
+            quotedReplyHiddenRemoteContentBlockedHTML: variants.quotedReplyHiddenRemoteContentBlockedHTML
+        )
     }
 }
 

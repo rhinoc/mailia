@@ -435,11 +435,17 @@ public struct MailRepository {
             let bodySelect = includeBodies
                 ? """
                         mb.sanitized_html,
+                        mb.remote_blocked_html,
+                        mb.quoted_reply_hidden_html,
+                        mb.quoted_reply_hidden_remote_blocked_html,
                         mb.text_fallback,
                         mb.sanitizer_version
                 """
                 : """
                         NULL AS sanitized_html,
+                        NULL AS remote_blocked_html,
+                        NULL AS quoted_reply_hidden_html,
+                        NULL AS quoted_reply_hidden_remote_blocked_html,
                         NULL AS text_fallback,
                         NULL AS sanitizer_version
                 """
@@ -592,6 +598,7 @@ public struct MailRepository {
                     direction: MessageDirection(rawValue: row["timeline_direction"]) ?? .incoming,
                     hasAttachments: hasAttachments != 0,
                     sanitizedHTML: row["sanitized_html"],
+                    htmlVariants: Self.htmlVariants(from: row),
                     textFallback: row["text_fallback"],
                     sanitizerVersion: row["sanitizer_version"]
                 )
@@ -604,7 +611,13 @@ public struct MailRepository {
             guard let row = try Row.fetchOne(
                 db,
                 sql: """
-                    SELECT sanitized_html, text_fallback, sanitizer_version
+                    SELECT
+                        sanitized_html,
+                        remote_blocked_html,
+                        quoted_reply_hidden_html,
+                        quoted_reply_hidden_remote_blocked_html,
+                        text_fallback,
+                        sanitizer_version
                     FROM message_bodies
                     WHERE message_id = ?
                       AND sanitizer_version = ?
@@ -616,6 +629,7 @@ public struct MailRepository {
 
             return TimelineMessageBody(
                 sanitizedHTML: row["sanitized_html"],
+                htmlVariants: Self.htmlVariants(from: row),
                 textFallback: row["text_fallback"],
                 sanitizerVersion: row["sanitizer_version"]
             )
@@ -631,6 +645,9 @@ public struct MailRepository {
                         COUNT(*) AS item_count,
                         COALESCE(SUM(
                             LENGTH(COALESCE(sanitized_html, '')) +
+                            LENGTH(COALESCE(remote_blocked_html, '')) +
+                            LENGTH(COALESCE(quoted_reply_hidden_html, '')) +
+                            LENGTH(COALESCE(quoted_reply_hidden_remote_blocked_html, '')) +
                             LENGTH(COALESCE(text_fallback, ''))
                         ), 0) AS byte_size
                     FROM message_bodies
@@ -859,6 +876,7 @@ public struct MailRepository {
     public func cacheMessageBody(
         messageID: Int64,
         sanitizedHTML: String?,
+        htmlVariants: EmailHTMLDisplayVariants? = nil,
         textFallback: String?,
         sanitizerVersion: Int
     ) throws {
@@ -866,16 +884,35 @@ public struct MailRepository {
             try db.execute(
                 sql: """
                     INSERT INTO message_bodies (
-                        message_id, sanitized_html, text_fallback, sanitizer_version, fetched_at, updated_at
+                        message_id,
+                        sanitized_html,
+                        remote_blocked_html,
+                        quoted_reply_hidden_html,
+                        quoted_reply_hidden_remote_blocked_html,
+                        text_fallback,
+                        sanitizer_version,
+                        fetched_at,
+                        updated_at
                     )
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(message_id) DO UPDATE SET
                         sanitized_html = excluded.sanitized_html,
+                        remote_blocked_html = excluded.remote_blocked_html,
+                        quoted_reply_hidden_html = excluded.quoted_reply_hidden_html,
+                        quoted_reply_hidden_remote_blocked_html = excluded.quoted_reply_hidden_remote_blocked_html,
                         text_fallback = excluded.text_fallback,
                         sanitizer_version = excluded.sanitizer_version,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                arguments: [messageID, sanitizedHTML, textFallback, sanitizerVersion]
+                arguments: [
+                    messageID,
+                    sanitizedHTML,
+                    htmlVariants?.remoteContentBlockedHTML,
+                    htmlVariants?.quotedReplyHiddenHTML,
+                    htmlVariants?.quotedReplyHiddenRemoteContentBlockedHTML,
+                    textFallback,
+                    sanitizerVersion
+                ]
             )
         }
     }
@@ -1462,6 +1499,20 @@ public struct MailRepository {
 
     private func normalizeEmail(_ emailAddress: String) -> String {
         emailAddress.trimmed.lowercased()
+    }
+
+    private static func htmlVariants(from row: Row) -> EmailHTMLDisplayVariants? {
+        let variants = EmailHTMLDisplayVariants(
+            remoteContentBlockedHTML: row["remote_blocked_html"],
+            quotedReplyHiddenHTML: row["quoted_reply_hidden_html"],
+            quotedReplyHiddenRemoteContentBlockedHTML: row["quoted_reply_hidden_remote_blocked_html"]
+        )
+        if variants.remoteContentBlockedHTML == nil,
+           variants.quotedReplyHiddenHTML == nil,
+           variants.quotedReplyHiddenRemoteContentBlockedHTML == nil {
+            return nil
+        }
+        return variants
     }
 
     private static func formatCheckpointDate(_ date: Date) -> String {

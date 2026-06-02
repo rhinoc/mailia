@@ -2,6 +2,7 @@ import Foundation
 
 public struct SanitizedEmailDocument: Equatable, Sendable {
     public let html: String?
+    public let htmlVariants: EmailHTMLDisplayVariants?
     public let textFallback: String?
     public let hasRemoteImages: Bool
     public let hasAttachments: Bool
@@ -9,12 +10,14 @@ public struct SanitizedEmailDocument: Equatable, Sendable {
 
     public init(
         html: String?,
+        htmlVariants: EmailHTMLDisplayVariants? = nil,
         textFallback: String?,
         hasRemoteImages: Bool,
         hasAttachments: Bool,
         sanitizerVersion: Int = EmailHTMLDisplayPipeline.sanitizerVersion
     ) {
         self.html = html
+        self.htmlVariants = htmlVariants
         self.textFallback = textFallback
         self.hasRemoteImages = hasRemoteImages
         self.hasAttachments = hasAttachments
@@ -23,10 +26,11 @@ public struct SanitizedEmailDocument: Equatable, Sendable {
 }
 
 public struct EmailHTMLDisplayPipeline: Sendable {
-    public static let sanitizerVersion = 4
+    public static let sanitizerVersion = 5
 
     private let sanitizer = HTMLSanitizer()
     private let htmlDisplayNormalizer = HTMLDisplayNormalizer()
+    private let htmlDisplayVariantBuilder = HTMLDisplayVariantBuilder()
     private let htmlTextExtractor = HTMLTextExtractor()
     private let messageTextNormalizer = MessageTextNormalizer()
 
@@ -67,6 +71,7 @@ public struct EmailHTMLDisplayPipeline: Sendable {
 
         return SanitizedEmailDocument(
             html: displayHTML,
+            htmlVariants: htmlDisplayVariantBuilder.variants(for: displayHTML),
             textFallback: htmlTextExtractor.previewText(from: displayHTML),
             hasRemoteImages: hasRemoteImages,
             hasAttachments: hasAttachments
@@ -78,6 +83,7 @@ public struct EmailHTMLDisplayPipeline: Sendable {
         let displayHTML = normalizedText.nilIfBlank.map(Self.plainTextHTML)
         return SanitizedEmailDocument(
             html: displayHTML,
+            htmlVariants: displayHTML.map { htmlDisplayVariantBuilder.variants(for: $0) },
             textFallback: displayHTML.flatMap { htmlTextExtractor.previewText(from: $0) },
             hasRemoteImages: false,
             hasAttachments: Self.containsHimalayaAttachmentPartMarker(rawText)

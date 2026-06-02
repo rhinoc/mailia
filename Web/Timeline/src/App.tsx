@@ -5,7 +5,7 @@ import {
   type TimelineInboundEvent
 } from "./bridge/timelineBridge";
 import { TimelineView } from "./components/TimelineView";
-import type { TimelineState } from "./types";
+import type { TimelineState, TimelineStatePatch } from "./types";
 
 const emptyState: TimelineState = {
   entity: null,
@@ -83,7 +83,55 @@ function reduceInboundEvent(
         };
       }
       return event.state;
+    case "statePatch":
+      return applyTimelineStatePatch(current, event.patch);
     case "error":
       return { ...current, isLoadingTimeline: false };
   }
+}
+
+function applyTimelineStatePatch(
+  current: TimelineState,
+  patch: TimelineStatePatch
+): TimelineState {
+  return {
+    ...current,
+    isLoadingTimeline: patch.isLoadingTimeline,
+    isLoadingOlderTimeline: patch.isLoadingOlderTimeline,
+    isLoadingNewerTimeline: patch.isLoadingNewerTimeline,
+    hasOlderTimeline: patch.hasOlderTimeline,
+    hasNewerTimeline: patch.hasNewerTimeline,
+    bodyStates: applyRecordPatch(
+      current.bodyStates,
+      patch.bodyStateUpdates,
+      patch.removedBodyStateKeys
+    ),
+    attachmentDownloadStates: applyRecordPatch(
+      current.attachmentDownloadStates,
+      patch.attachmentDownloadStateUpdates,
+      patch.removedAttachmentDownloadStateKeys
+    ),
+    replySendState: patch.replySendState,
+    chromeInsets: patch.chromeInsets
+  };
+}
+
+function applyRecordPatch<T>(
+  current: Record<string, T>,
+  updates: Record<string, T>,
+  removedKeys: string[]
+) {
+  const updateKeys = Object.keys(updates);
+  if (updateKeys.length === 0 && removedKeys.length === 0) {
+    return current;
+  }
+
+  const next = { ...current };
+  for (const key of removedKeys) {
+    delete next[key];
+  }
+  for (const key of updateKeys) {
+    next[key] = updates[key];
+  }
+  return next;
 }

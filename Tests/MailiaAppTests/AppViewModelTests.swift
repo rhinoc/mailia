@@ -552,6 +552,7 @@ private func mailiaTimelineItem(id: Int64, entityID: Int64) -> MailiaTimelineIte
         subject: "Hello",
         preview: "Hello",
         html: nil,
+        htmlVariants: nil,
         date: nil,
         accountLabel: "gmail",
         accountEmoji: nil,

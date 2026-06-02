@@ -23,8 +23,6 @@ Exact resolved versions are recorded in [Package.resolved](./Package.resolved).
 The timeline web island is built from [Web/Timeline](./Web/Timeline) and bundled
 into the native app resources.
 
-- [DOMPurify](https://github.com/cure53/DOMPurify), licensed under MPL-2.0 or
-  Apache-2.0.
 - [React](https://react.dev/) and [React DOM](https://react.dev/), licensed
   under MIT.
 - [react-markdown](https://github.com/remarkjs/react-markdown), licensed under

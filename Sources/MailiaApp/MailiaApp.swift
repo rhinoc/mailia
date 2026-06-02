@@ -2452,7 +2452,6 @@ private struct AboutView: View {
     ]
 
     private static let webDependencies = [
-        "DOMPurify",
         "React",
         "React DOM",
         "react-markdown",

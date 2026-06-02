@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { AttachmentDownloadState, BodyDisplayMode, TimelineMessageView } from "../types";
 import { MessageBody } from "./MessageBody";
 
@@ -7,6 +7,18 @@ type TimelineMessage = TimelineMessageView;
 const MIN_PLACEHOLDER_BODY_HEIGHT = 36;
 const MAX_ESTIMATED_BODY_HEIGHT = 420;
 const MAX_CACHED_BODY_HEIGHT = 1400;
+
+function logBodyDebug(event: string, details: Record<string, unknown>) {
+  const line = `[MailiaBodyDebug] ${event} ${JSON.stringify(details)}`;
+  console.info(line);
+  window.webkit?.messageHandlers?.mailiaTimeline?.postMessage({
+    type: "log",
+    payload: {
+      level: "debug",
+      message: line
+    }
+  });
+}
 
 interface MessageCardProps {
   message: TimelineMessage;
@@ -64,8 +76,13 @@ export function MessageCard({
   const [revealedBodyMessageID, setRevealedBodyMessageID] = useState<
     TimelineMessage["messageID"] | null
   >(hasBody ? messageID : null);
+  const lastBodyDebugKeyRef = useRef<string | null>(null);
   const isBodyRevealed = hasBody && revealedBodyMessageID === messageID;
-  const shouldRequestBody = canRequestBody && !hasAvailableBody && bodyStatus !== "loading";
+  const hasBodyFailed = bodyStatus === "failed";
+  const shouldRequestBody = canRequestBody &&
+    !hasAvailableBody &&
+    bodyStatus !== "loading" &&
+    !hasBodyFailed;
   const showMessageAvatar =
     showAvatar && (cluster === "single" || cluster === "end");
 
@@ -84,18 +101,47 @@ export function MessageCard({
 
   useEffect(() => {
     if (!hasBody) {
+      if (revealedBodyMessageID !== null) {
+        logBodyDebug("clearReveal", {
+          messageID,
+          bodyStatus,
+          hasSanitizedHTML: Boolean(message.sanitizedHTML),
+          previousRevealedBodyMessageID: revealedBodyMessageID
+        });
+      }
       setRevealedBodyMessageID(null);
       return;
     }
 
     if (revealedBodyMessageID === messageID) return;
-    if (shouldDeferBodyRequest()) return;
+    if (shouldDeferBodyRequest()) {
+      logBodyDebug("revealDeferred", {
+        messageID,
+        bodyStatus,
+        bodyRequestWakeToken,
+        hasSanitizedHTML: Boolean(message.sanitizedHTML),
+        hasHTMLVariants: Boolean(message.htmlVariants),
+        revealedBodyMessageID
+      });
+      return;
+    }
 
+    logBodyDebug("revealBody", {
+      messageID,
+      bodyStatus,
+      bodyRequestWakeToken,
+      hasSanitizedHTML: Boolean(message.sanitizedHTML),
+      hasHTMLVariants: Boolean(message.htmlVariants),
+      previousRevealedBodyMessageID: revealedBodyMessageID
+    });
     setRevealedBodyMessageID(messageID);
   }, [
     bodyRequestWakeToken,
+    bodyStatus,
     hasBody,
     messageID,
+    message.htmlVariants,
+    message.sanitizedHTML,
     revealedBodyMessageID,
     shouldDeferBodyRequest
   ]);
@@ -104,9 +150,22 @@ export function MessageCard({
     if (!shouldRequestBody) return;
 
     if (shouldDeferBodyRequest()) {
+      logBodyDebug("requestDeferred", {
+        messageID,
+        bodyStatus,
+        bodyRequestWakeToken,
+        bodyRequestPriority,
+        hasAvailableBody
+      });
       return;
     }
 
+    logBodyDebug("requestBody", {
+      messageID,
+      bodyStatus,
+      bodyRequestWakeToken,
+      bodyRequestPriority
+    });
     onRequestBody(message, bodyRequestPriority);
   }, [
     accountKey,
@@ -121,6 +180,48 @@ export function MessageCard({
     onRequestBody,
     shouldDeferBodyRequest,
     shouldRequestBody
+  ]);
+
+  useEffect(() => {
+    if (isBodyRevealed) {
+      return;
+    }
+
+    const debugKey = [
+      messageID,
+      bodyStatus,
+      hasAvailableBody ? "available" : "unavailable",
+      hasBody ? "hasBody" : "noBody",
+      revealedBodyMessageID ?? "none",
+      bodyRequestWakeToken
+    ].join(":");
+    if (lastBodyDebugKeyRef.current === debugKey) {
+      return;
+    }
+    lastBodyDebugKeyRef.current = debugKey;
+
+    logBodyDebug("placeholderVisible", {
+      messageID,
+      bodyStatus,
+      bodyRequestWakeToken,
+      hasAvailableBody,
+      hasBody,
+      hasSanitizedHTML: Boolean(message.sanitizedHTML),
+      hasHTMLVariants: Boolean(message.htmlVariants),
+      canRevealBody,
+      revealedBodyMessageID
+    });
+  }, [
+    bodyRequestWakeToken,
+    bodyStatus,
+    canRevealBody,
+    hasAvailableBody,
+    hasBody,
+    isBodyRevealed,
+    message.htmlVariants,
+    message.sanitizedHTML,
+    messageID,
+    revealedBodyMessageID
   ]);
 
   const handleMeasuredBodyHeight = useCallback((height: number) => {
@@ -168,7 +269,9 @@ export function MessageCard({
           className="mail-body-reserve"
           style={!isBodyRevealed ? { minHeight: committedBodyHeight } : undefined}
         >
-          {!isBodyRevealed ? (
+          {hasBodyFailed ? (
+            <MessageBodyFailure message={message.bodyErrorMessage} />
+          ) : !isBodyRevealed ? (
             <div
               className="mail-body-frame mail-body--placeholder"
               aria-label="Loading message body"
@@ -179,6 +282,7 @@ export function MessageCard({
           ) : (
             <MessageBody
               html={message.sanitizedHTML}
+              htmlVariants={message.htmlVariants}
               mode={bodyDisplayMode}
               loadRemoteContent={loadRemoteContent}
               hideQuotedReplyText={hideQuotedReplyText}
@@ -195,6 +299,29 @@ export function MessageCard({
         ) : null}
       </div>
     </article>
+  );
+}
+
+function MessageBodyFailure({ message }: { message?: string | null }) {
+  const label = message
+    ? `Message body failed to load: ${message}`
+    : "Message body failed to load";
+
+  return (
+    <div
+      className="mail-body-frame mail-body--failed"
+      aria-label={label}
+      role="status"
+    >
+      <span className="mail-body-failure-icon" tabIndex={0}>
+        <span className="mail-body-failure-icon__glyph" aria-hidden="true">!</span>
+        {message ? (
+          <span className="mail-body-failure-tooltip" role="tooltip">
+            {message}
+          </span>
+        ) : null}
+      </span>
+    </div>
   );
 }
 

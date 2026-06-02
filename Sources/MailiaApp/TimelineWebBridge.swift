@@ -2,6 +2,50 @@ import Foundation
 import AppKit
 import WebKit
 
+private struct TimelineWebStateDelivery {
+    enum Kind: String {
+        case state
+        case statePatch
+
+        var javascriptLiteral: String {
+            "'\(rawValue)'"
+        }
+
+        var payloadName: String {
+            switch self {
+            case .state:
+                "state"
+            case .statePatch:
+                "patch"
+            }
+        }
+    }
+
+    let kind: Kind
+    let json: String
+    let byteCount: Int
+
+    static func state(_ state: TimelineWebState, encoder: JSONEncoder) throws -> TimelineWebStateDelivery {
+        try make(kind: .state, payload: state, encoder: encoder)
+    }
+
+    static func patch(_ patch: TimelineWebStatePatch, encoder: JSONEncoder) throws -> TimelineWebStateDelivery {
+        try make(kind: .statePatch, payload: patch, encoder: encoder)
+    }
+
+    private static func make<T: Encodable>(
+        kind: Kind,
+        payload: T,
+        encoder: JSONEncoder
+    ) throws -> TimelineWebStateDelivery {
+        let data = try encoder.encode(payload)
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw TimelineWebBridgeError.unableToEncodeState
+        }
+        return TimelineWebStateDelivery(kind: kind, json: json, byteCount: data.count)
+    }
+}
+
 @MainActor
 final class TimelineWebBridgeCoordinator: NSObject {
     static let scriptMessageHandlerName = "mailiaTimeline"
@@ -17,8 +61,8 @@ final class TimelineWebBridgeCoordinator: NSObject {
     private let assetLocator: TimelineWebAssetLocating
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
-    private var pendingStateJSON: String?
-    private var lastStateJSON: String?
+    private var pendingDelivery: TimelineWebStateDelivery?
+    private var lastDeliveredState: TimelineWebState?
     private var hasFinishedInitialLoad = false
 
     init(
@@ -56,8 +100,8 @@ final class TimelineWebBridgeCoordinator: NSObject {
 
     func load() {
         hasFinishedInitialLoad = false
-        pendingStateJSON = nil
-        lastStateJSON = nil
+        pendingDelivery = nil
+        lastDeliveredState = nil
 
         if let indexURL = assetLocator.timelineIndexURL() {
             webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
@@ -68,28 +112,31 @@ final class TimelineWebBridgeCoordinator: NSObject {
     }
 
     func pushState(_ state: TimelineWebState) throws {
-        let data = try encoder.encode(state)
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw TimelineWebBridgeError.unableToEncodeState
-        }
-        if json != lastStateJSON {
-            logPushedState(state, byteCount: data.count)
-        }
-        pushStateJSON(json)
+        guard let delivery = try makeDelivery(for: state) else { return }
+        lastDeliveredState = state
+        logPushedState(state, delivery: delivery)
+        pushDelivery(delivery)
     }
 
-    func pushStateJSON(_ json: String) {
-        guard json != lastStateJSON else {
-            return
+    private func makeDelivery(for state: TimelineWebState) throws -> TimelineWebStateDelivery? {
+        if lastDeliveredState == state {
+            return nil
         }
-        lastStateJSON = json
+        if hasFinishedInitialLoad,
+           let previous = lastDeliveredState,
+           let patch = TimelineWebStatePatch(from: previous, to: state) {
+            return try .patch(patch, encoder: encoder)
+        }
+        return try .state(state, encoder: encoder)
+    }
 
+    private func pushDelivery(_ delivery: TimelineWebStateDelivery) {
         guard hasFinishedInitialLoad else {
-            pendingStateJSON = json
+            pendingDelivery = delivery
             return
         }
 
-        evaluateReceiveState(json)
+        evaluateReceiveDelivery(delivery)
     }
 
     func dismantle() {
@@ -130,15 +177,18 @@ final class TimelineWebBridgeCoordinator: NSObject {
         return try decoder.decode(TimelineWebEventEnvelope.self, from: data)
     }
 
-    private func evaluateReceiveState(_ json: String) {
+    private func evaluateReceiveDelivery(_ delivery: TimelineWebStateDelivery) {
         let script = """
         (() => {
-          const state = \(json);
-          if (window.mailiaTimeline && typeof window.mailiaTimeline.receiveState === 'function') {
-            window.mailiaTimeline.receiveState(state);
-          } else {
-            window.__mailiaTimelinePendingState = state;
+          const payload = \(delivery.json);
+          if (window.mailiaTimeline) {
+            if (typeof window.mailiaTimeline.receive === 'function') {
+              window.mailiaTimeline.receive({ type: \(delivery.kind.javascriptLiteral), \(delivery.kind.payloadName): payload });
+              return;
+            }
           }
+          window.__mailiaTimelinePendingEvents = window.__mailiaTimelinePendingEvents || [];
+          window.__mailiaTimelinePendingEvents.push({ type: \(delivery.kind.javascriptLiteral), \(delivery.kind.payloadName): payload });
         })();
         """
         webView.evaluateJavaScript(script) { [weak self] _, error in
@@ -147,8 +197,8 @@ final class TimelineWebBridgeCoordinator: NSObject {
         }
     }
 
-    private func logPushedState(_ state: TimelineWebState, byteCount: Int) {
-        let delivery = hasFinishedInitialLoad ? "evaluate" : "pending"
+    private func logPushedState(_ state: TimelineWebState, delivery: TimelineWebStateDelivery) {
+        let deliveryMode = hasFinishedInitialLoad ? "evaluate" : "pending"
         let entityID = state.entity.map { String($0.id) } ?? "nil"
         let firstID = state.items.first.map { String($0.id) } ?? "nil"
         let lastID = state.items.last.map { String($0.id) } ?? "nil"
@@ -157,7 +207,7 @@ final class TimelineWebBridgeCoordinator: NSObject {
         } ?? "nil"
         let loadedBodyCount = state.bodyStates.values.filter { $0.debugStatus == "loaded" }.count
         MailiaScrollDebugLog(
-            "[MailiaScrollDebug] pushTimelineWebState delivery=\(delivery) entityID=\(entityID) itemCount=\(state.items.count) firstID=\(firstID) lastID=\(lastID) loading=\(state.isLoadingTimeline) hasOlder=\(state.hasOlderTimeline) hasNewer=\(state.hasNewerTimeline) anchor=\(anchor) bottomInset=\(roundedDebugMetric(state.chromeInsets.bottom)) bodyStates=\(state.bodyStates.count) loadedBodies=\(loadedBodyCount) bytes=\(byteCount)"
+            "[MailiaScrollDebug] pushTimelineWebState delivery=\(deliveryMode) packet=\(delivery.kind.rawValue) entityID=\(entityID) itemCount=\(state.items.count) firstID=\(firstID) lastID=\(lastID) loading=\(state.isLoadingTimeline) hasOlder=\(state.hasOlderTimeline) hasNewer=\(state.hasNewerTimeline) anchor=\(anchor) bottomInset=\(roundedDebugMetric(state.chromeInsets.bottom)) bodyStates=\(state.bodyStates.count) loadedBodies=\(loadedBodyCount) bytes=\(delivery.byteCount)"
         )
     }
 
@@ -390,11 +440,11 @@ final class TimelineWebDebugMenuController: NSObject {
 extension TimelineWebBridgeCoordinator: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         configureScrollView()
-        MailiaScrollDebugLog("[MailiaScrollDebug] timelineWeb didFinish pendingState=\(pendingStateJSON != nil)")
+        MailiaScrollDebugLog("[MailiaScrollDebug] timelineWeb didFinish pendingState=\(pendingDelivery != nil)")
         hasFinishedInitialLoad = true
-        if let pendingStateJSON {
-            self.pendingStateJSON = nil
-            evaluateReceiveState(pendingStateJSON)
+        if let pendingDelivery {
+            self.pendingDelivery = nil
+            evaluateReceiveDelivery(pendingDelivery)
         }
     }
 

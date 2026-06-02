@@ -402,7 +402,8 @@ button {
   min-height: 0;
 }
 
-.mail-body-reserve > .mail-body--placeholder {
+.mail-body-reserve > .mail-body--placeholder,
+.mail-body-reserve > .mail-body--failed {
   min-height: inherit;
 }
 
@@ -418,6 +419,83 @@ button {
   display: grid;
   place-items: center;
   color: CanvasText;
+}
+
+.mail-body--failed {
+  display: grid;
+  place-items: center;
+  overflow: visible;
+  color: var(--mailia-error);
+}
+
+.mail-body-failure-icon {
+  position: relative;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  border: 2px solid color-mix(in srgb, var(--mailia-error) 86%, CanvasText);
+  border-radius: 50%;
+  background: var(--mailia-error);
+  color: #ffffff;
+  outline: 0;
+  place-items: center;
+}
+
+.mail-body-failure-icon::after {
+  position: absolute;
+  inset: -5px;
+  border: 1px solid var(--mailia-error);
+  border-radius: inherit;
+  animation: mail-body-failure-pulse 1.6s ease-out infinite;
+  content: "";
+  opacity: 0.34;
+}
+
+.mail-body-failure-icon:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--mailia-error) 24%, transparent);
+}
+
+.mail-body-failure-icon__glyph {
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.mail-body-failure-tooltip {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  width: min(360px, calc(100vw - 48px));
+  max-height: 180px;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, CanvasText 16%, Canvas);
+  border-radius: 8px;
+  background: Canvas;
+  box-shadow: 0 10px 26px rgb(0 0 0 / 18%);
+  color: CanvasText;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+  opacity: 0;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  transform: translate(-50%, 4px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.mail-body-failure-icon:hover .mail-body-failure-tooltip,
+.mail-body-failure-icon:focus-visible .mail-body-failure-tooltip {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+@keyframes mail-body-failure-pulse {
+  to {
+    inset: -9px;
+    opacity: 0;
+  }
 }
 
 .mail-body-loading-spinner {

@@ -64,6 +64,11 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
     try repository.cacheMessageBody(
         messageID: messages[0].messageID,
         sanitizedHTML: "<p>Build passed</p>",
+        htmlVariants: EmailHTMLDisplayVariants(
+            remoteContentBlockedHTML: "<p>Build passed</p>",
+            quotedReplyHiddenHTML: "<p>Build passed</p>",
+            quotedReplyHiddenRemoteContentBlockedHTML: "<p>Build passed</p>"
+        ),
         textFallback: "Build passed",
         sanitizerVersion: EmailHTMLDisplayPipeline.sanitizerVersion
     )
@@ -72,12 +77,16 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
 
     messages = try repository.messages(entityID: mainEntity.id, workspace: .main)
     #expect(messages[0].sanitizedHTML == "<p>Build passed</p>")
+    #expect(messages[0].htmlVariants?.remoteContentBlockedHTML == "<p>Build passed</p>")
     #expect(messages[0].textFallback == "Build passed")
     messages = try repository.messages(entityID: mainEntity.id, workspace: .main, includeBodies: false)
     #expect(messages[0].sanitizedHTML == nil)
     #expect(messages[0].textFallback == nil)
     let cachedBody = try #require(try repository.messageBody(messageID: messages[0].messageID))
     #expect(cachedBody.sanitizedHTML == "<p>Build passed</p>")
+    #expect(cachedBody.htmlVariants?.remoteContentBlockedHTML == "<p>Build passed</p>")
+    #expect(cachedBody.htmlVariants?.quotedReplyHiddenHTML == "<p>Build passed</p>")
+    #expect(cachedBody.htmlVariants?.quotedReplyHiddenRemoteContentBlockedHTML == "<p>Build passed</p>")
     #expect(cachedBody.textFallback == "Build passed")
     #expect(cachedBody.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion)
     let bodyCacheStats = try repository.messageBodyCacheStats()
@@ -588,6 +597,18 @@ func migrationCreatesSyncCheckpointMetadataColumns() throws {
         "last_successful_sync_started_at",
         "last_successful_sync_finished_at",
         "last_successful_query_start_at"
+    ]))
+}
+
+@Test
+func migrationCreatesMessageBodyDisplayVariantColumns() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let bodyColumns = try DatabaseSchemaInspector.columnNames(in: "message_bodies", databaseQueue: databaseQueue)
+
+    #expect(bodyColumns.isSuperset(of: [
+        "remote_blocked_html",
+        "quoted_reply_hidden_html",
+        "quoted_reply_hidden_remote_blocked_html"
     ]))
 }
 

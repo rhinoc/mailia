@@ -636,17 +636,20 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             try repository.cacheMessageBody(
                 messageID: item.id,
                 sanitizedHTML: body.sanitizedHTML,
+                htmlVariants: body.htmlVariants,
                 textFallback: body.textFallback,
                 sanitizerVersion: body.sanitizerVersion
             )
             return MailiaTimelineBody(
                 html: body.sanitizedHTML?.nilIfBlank,
+                htmlVariants: MailiaTimelineHTMLVariants(body.htmlVariants),
                 hasAttachments: item.hasAttachments || body.hasAttachments
             )
         }
 
         let body = lastBody ?? MessageBodyFetchResult(
             sanitizedHTML: nil,
+            htmlVariants: nil,
             textFallback: nil,
             hasAttachments: false,
             sanitizerVersion: EmailHTMLDisplayPipeline.sanitizerVersion
@@ -654,6 +657,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         try repository.cacheMessageBody(
             messageID: item.id,
             sanitizedHTML: body.sanitizedHTML,
+            htmlVariants: body.htmlVariants,
             textFallback: body.textFallback,
             sanitizerVersion: body.sanitizerVersion
         )
@@ -662,6 +666,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         }
         return MailiaTimelineBody(
             html: body.sanitizedHTML?.nilIfBlank,
+            htmlVariants: MailiaTimelineHTMLVariants(body.htmlVariants),
             hasAttachments: item.hasAttachments || body.hasAttachments
         )
     }
@@ -677,6 +682,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
         return MailiaTimelineBody(
             html: html,
+            htmlVariants: MailiaTimelineHTMLVariants(cached.htmlVariants),
             hasAttachments: item.hasAttachments
         )
     }
@@ -1202,6 +1208,9 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             html: message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion
                 ? message.sanitizedHTML?.nilIfBlank
                 : nil,
+            htmlVariants: message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion
+                ? MailiaTimelineHTMLVariants(message.htmlVariants)
+                : nil,
             date: HimalayaDateParser.parse(message.messageDate),
             accountLabel: message.accountKey,
             accountEmoji: emojiByAccount[message.accountKey],
@@ -1217,6 +1226,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
     private struct MessageBodyFetchResult {
         var sanitizedHTML: String?
+        var htmlVariants: EmailHTMLDisplayVariants?
         var textFallback: String?
         var hasAttachments: Bool
         var sanitizerVersion: Int
@@ -1253,6 +1263,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
         return MessageBodyFetchResult(
             sanitizedHTML: document.html,
+            htmlVariants: document.htmlVariants,
             textFallback: document.textFallback,
             hasAttachments: document.hasAttachments,
             sanitizerVersion: document.sanitizerVersion

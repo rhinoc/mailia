@@ -203,6 +203,19 @@ public enum DatabaseMigratorFactory {
             }
         }
 
+        migrator.registerMigration("v5_message_body_display_variants") { db in
+            let columns = Set(try db.columns(in: "message_bodies").map(\.name))
+            if !columns.contains("remote_blocked_html") {
+                try db.execute(sql: "ALTER TABLE message_bodies ADD COLUMN remote_blocked_html TEXT")
+            }
+            if !columns.contains("quoted_reply_hidden_html") {
+                try db.execute(sql: "ALTER TABLE message_bodies ADD COLUMN quoted_reply_hidden_html TEXT")
+            }
+            if !columns.contains("quoted_reply_hidden_remote_blocked_html") {
+                try db.execute(sql: "ALTER TABLE message_bodies ADD COLUMN quoted_reply_hidden_remote_blocked_html TEXT")
+            }
+        }
+
         return migrator
     }
 }
