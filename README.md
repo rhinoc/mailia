@@ -34,23 +34,14 @@ conversation timeline.
 
 ## Features
 
-- 👥 **People-first mail** — Start from a sender, company, newsletter, or
-  service, then read the full cross-account history in one place.
-- 🧵 **Timeline conversations** — Browse email like an IM thread, with incoming
-  and outgoing messages, account labels, folders, dates, and attachments kept in
-  context.
-- 📬 **Multiple mailboxes, one view** — Use your existing accounts without
-  switching between inboxes just to understand who said what.
-- 🧹 **Junk review without losing context** — Review likely false positives by
-  sender and move messages back when something important lands in Junk.
-- 🖼️ **Safer HTML mail** — Read rich email with remote images blocked by default,
-  unsafe content filtered, and message layout preserved.
-- ✍️ **Reply from the right account** — Reply or start a message from the
-  mailbox identity that already belongs to the conversation.
-- 🔒 **Local-first by design** — Mailia keeps app data local and leaves account
-  credentials with your existing mail toolchain.
-- 🔄 **Native macOS updates** — Sparkle powers in-app updates for packaged
-  releases.
+- 👥 **People and organizations first** — Start from who sent the mail, not which
+  folder or account it landed in.
+- 🧵 **One cross-account timeline** — See incoming and outgoing history together
+  with account labels, folders, dates, and attachments kept in context.
+- 🧹 **Review what needs attention** — Move sender history between Main, Junk,
+  Trash, and Flagged without losing the surrounding conversation.
+- 🔒 **Local, safer mail reading** — Keep credentials in Himalaya, store Mailia
+  data locally, and read sanitized HTML with remote images blocked by default.
 
 ## Requirements
 
@@ -95,9 +86,20 @@ Start with the official Himalaya project:
 - [Pimalaya project](https://github.com/pimalaya)
 
 After Himalaya can list and read your accounts from the command line, Mailia
-can discover the same accounts automatically. If you keep the Himalaya
-configuration in a nonstandard location, launch Mailia with `HIMALAYA_CONFIG`
-pointing at that file.
+can discover the same accounts automatically:
+
+```bash
+himalaya account list
+himalaya folder list -a <account>
+```
+
+Mailia looks for Himalaya configuration in this order:
+
+1. Paths listed in `HIMALAYA_CONFIG`, separated with `:`.
+2. `~/Library/Application Support/himalaya/config.toml`.
+3. `$XDG_CONFIG_HOME/himalaya/config.toml`.
+4. `~/.config/himalaya/config.toml`.
+5. `~/.himalayarc`.
 
 ## Local Data and Privacy
 
@@ -107,17 +109,21 @@ metadata locally, while credentials stay with Himalaya.
 | Data | Location or owner |
 | --- | --- |
 | Provider credentials and OAuth tokens | Himalaya configuration and credential storage |
-| Mailia database and app state | Mailia application support storage |
-| Attachment downloads | User-selected or configured download directory |
+| Mailia database | `~/Library/Application Support/Mailia/mailia.sqlite` |
+| Mailia preferences | macOS user defaults for `dev.rhinoc.mailia` |
+| Attachment downloads | Downloads, or the directory selected in Mailia settings |
 
 HTML email is treated as untrusted content. Mailia sanitizes message display,
 filters unsafe links and styles, and blocks remote images by default while
-preserving message layout.
+preserving message layout. Local images exported with a message may be inlined
+for display, but remote image URLs stay blocked unless the user enables remote
+images.
 
 ## Contributing
 
 For source builds, development setup, tests, release scripts, and contribution
-boundaries, read [CONTRIBUTING.md](./CONTRIBUTING.md).
+boundaries, read [CONTRIBUTING.md](./CONTRIBUTING.md). For module boundaries,
+read [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Third-Party Notices
 

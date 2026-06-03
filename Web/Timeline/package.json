@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -b && vite build",
     "build:app": "npm run build && npm run sync:app",
-    "sync:app": "rm -rf ../../Sources/MailiaApp/Resources/TimelineWeb && mkdir -p ../../Sources/MailiaApp/Resources/TimelineWeb && cp -R dist/. ../../Sources/MailiaApp/Resources/TimelineWeb/",
+    "sync:app": "mkdir -p ../../Sources/MailiaApp/Resources/TimelineWeb && find ../../Sources/MailiaApp/Resources/TimelineWeb -mindepth 1 ! -name .gitkeep -depth -exec rm -rf {} + && cp -R dist/. ../../Sources/MailiaApp/Resources/TimelineWeb/",
     "typecheck": "tsc -b"
   },
   "dependencies": {

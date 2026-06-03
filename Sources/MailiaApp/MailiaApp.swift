@@ -2455,7 +2455,6 @@ private struct AboutView: View {
         "React",
         "React DOM",
         "react-markdown",
-        "React Virtuoso",
         "Turndown",
         "TypeScript",
         "Vite"

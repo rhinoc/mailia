@@ -16,3 +16,7 @@ Web/Timeline/.tmp/
 Web/Timeline/dist/
 Web/Timeline/*.tsbuildinfo
 Web/Timeline/.DS_Store
+
+# Generated timeline bundle copied into the native app before Swift builds.
+Sources/MailiaApp/Resources/TimelineWeb/*
+!Sources/MailiaApp/Resources/TimelineWeb/.gitkeep

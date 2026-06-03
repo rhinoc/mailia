@@ -28,6 +28,11 @@ swift build
 swift test
 ```
 
+`build:app` compiles the React timeline and syncs the generated files into
+`Sources/MailiaApp/Resources/TimelineWeb`, which is the bundle SwiftPM packages
+with the native app. The generated bundle is ignored by Git and should be
+rebuilt from `Web/Timeline`.
+
 Run frontend type checking:
 
 ```bash
@@ -47,10 +52,11 @@ swift run Mailia
 - Keep pull requests focused on one behavior or one small set of related files.
 - Include tests when changing sync policy, repository behavior, grouping rules,
   HTML normalization, sanitizer behavior, reply/send flows, or release scripts.
-- Run `swift test` and `npm --prefix Web/Timeline run typecheck` before
-  submitting.
-- Update `README.md`, `CREDITS.md`, or `SPARKLE.md` when behavior,
-  dependencies, release artifacts, privacy boundaries, or user setup changes.
+- Run `npm --prefix Web/Timeline run build:app`, `swift test`, and
+  `npm --prefix Web/Timeline run typecheck` before submitting.
+- Update `README.md`, `ARCHITECTURE.md`, `CREDITS.md`, or `SPARKLE.md` when
+  behavior, dependencies, release artifacts, privacy boundaries, user setup, or
+  module ownership changes.
 
 ## Code Style
 

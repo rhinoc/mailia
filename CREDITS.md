@@ -27,7 +27,6 @@ into the native app resources.
   under MIT.
 - [react-markdown](https://github.com/remarkjs/react-markdown), licensed under
   MIT.
-- [React Virtuoso](https://virtuoso.dev/), licensed under MIT.
 - [Turndown](https://github.com/mixmark-io/turndown), licensed under MIT.
 - TypeScript, Vite, and type packages used during development keep their
   upstream licenses as recorded in `Web/Timeline/package-lock.json`.
@@ -45,10 +44,3 @@ respective owners.
 Mailia shells out to [Himalaya](https://github.com/pimalaya/himalaya) for mail
 account discovery and IMAP/SMTP operations. Himalaya is not vendored in this
 repository and must be installed and configured by the user.
-
-## Maintainer Notes
-
-- Add a new entry here when introducing a runtime dependency, generated data
-  source, bundled asset, icon source, or service integration.
-- Do not add real mailbox exports, private account configuration, OAuth tokens,
-  certificates, signing keys, or user mail content to the repository.
