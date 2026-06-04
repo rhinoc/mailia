@@ -1339,6 +1339,7 @@ public struct MailRepository {
             senderID: senderID,
             relationKind: relationKind
         ) {
+            try refreshServiceEntityDisplayName(db, entityID: existingEntityID)
             return existingEntityID
         }
 
@@ -1371,8 +1372,57 @@ public struct MailRepository {
                 """,
             arguments: [entityID, senderID, relationKind.rawValue]
         )
+        try refreshServiceEntityDisplayName(db, entityID: entityID)
 
         return entityID
+    }
+
+    private func refreshServiceEntityDisplayName(_ db: Database, entityID: Int64) throws {
+        guard let canonicalKey = try String.fetchOne(
+            db,
+            sql: "SELECT canonical_key FROM entities WHERE id = ?",
+            arguments: [entityID]
+        ), canonicalKey.hasPrefix("domain:") else {
+            return
+        }
+
+        let domain = String(canonicalKey.dropFirst("domain:".count))
+        let displayNameRows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT s.display_name
+                FROM entity_senders es
+                JOIN senders s ON s.id = es.sender_id
+                WHERE es.entity_id = ?
+                  AND es.relation_kind = ?
+                ORDER BY es.created_at ASC, s.created_at ASC, s.id ASC
+                """,
+            arguments: [entityID, RelationKind.from.rawValue]
+        )
+        let candidateDisplayNames: [String?] = displayNameRows.map { row in
+            let displayName: String? = row["display_name"]
+            return displayName
+        }
+        let displayName = groupingRules.displayName(
+            forDomain: domain,
+            candidateDisplayNames: candidateDisplayNames
+        )
+
+        try db.execute(
+            sql: """
+                UPDATE entities
+                SET display_name = ?, kind = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND (display_name <> ? OR kind <> ?)
+                """,
+            arguments: [
+                displayName,
+                EntityKind.service.rawValue,
+                entityID,
+                displayName,
+                EntityKind.service.rawValue
+            ]
+        )
     }
 
     private func existingEntityID(

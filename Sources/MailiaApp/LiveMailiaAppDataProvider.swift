@@ -89,6 +89,20 @@ private actor RefreshProgressAggregator {
     }
 }
 
+private enum MailiaSyncFailure: LocalizedError {
+    case mailboxSyncFailed
+    case mailboxDiscoveryFailed(Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .mailboxSyncFailed:
+            "One or more mailboxes failed to sync. Check that the Himalaya CLI is installed and reachable by Mailia."
+        case let .mailboxDiscoveryFailed(error):
+            "Unable to discover mailboxes: \(error.localizedDescription)"
+        }
+    }
+}
+
 @MainActor
 struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
     private let databaseQueue: DatabaseQueue
@@ -104,7 +118,9 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
     init() {
         do {
-            let environment = try MailiaEnvironment.live()
+            let environment = try MailiaEnvironment.live(
+                himalayaBridge: MailiaHimalayaExecutableSettings.bridge()
+            )
             let databaseQueue = try environment.openDatabase()
             self.init(
                 databaseQueue: databaseQueue,
@@ -116,7 +132,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             try! DatabaseMigratorFactory.makeMigrator().migrate(databaseQueue)
             self.init(
                 databaseQueue: databaseQueue,
-                bridge: ProcessHimalayaBridge(),
+                bridge: MailiaHimalayaExecutableSettings.bridge(),
                 downloadsDirectory: Self.defaultDownloadsDirectory()
             )
         }
@@ -323,11 +339,13 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             detail: nil,
             fraction: nil
         ))
+        var discoveryError: Error?
         do {
             _ = try await syncService.discoverFoldersForDiscoveredAccounts(timeout: 45)
         } catch let error as CancellationError {
             throw error
         } catch {
+            discoveryError = error
             NSLog("Unable to refresh mailbox list before sync: \(error.localizedDescription)")
         }
 
@@ -348,21 +366,28 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         )
         let syncTimeout: TimeInterval = options.fullHistory ? 300 : 45
 
-        async let mainSync: Int = syncService.syncWorkspace(
+        async let mainSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
             .main,
             accountPriorityScores: mainAccountPriorityScores,
             fullHistory: options.fullHistory,
             timeout: syncTimeout,
             onProgress: report
         )
-        async let junkSync: Int = syncService.syncWorkspace(
+        async let junkSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
             .junk,
             accountPriorityScores: junkAccountPriorityScores,
             fullHistory: options.fullHistory,
             timeout: syncTimeout,
             onProgress: report
         )
-        _ = try await (mainSync, junkSync)
+        let syncResults = try await (mainSync, junkSync)
+        if syncResults.0.hadFailure || syncResults.1.hadFailure {
+            throw MailiaSyncFailure.mailboxSyncFailed
+        }
+        if let discoveryError,
+           syncResults.0.attemptedFolderCount + syncResults.1.attemptedFolderCount == 0 {
+            throw MailiaSyncFailure.mailboxDiscoveryFailed(discoveryError)
+        }
 
         progress(MailiaRefreshProgress(
             phase: .finishing,
@@ -426,12 +451,15 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 }
             }
 
-            _ = try await syncService.syncWorkspace(
+            let result = try await syncService.syncWorkspaceResult(
                 .main,
                 accountKeys: normalizedAccountKeys,
                 folderRoles: [.normal, .sent],
                 timeout: 30
             )
+            if result.hadFailure {
+                throw MailiaSyncFailure.mailboxSyncFailed
+            }
         }
 
         return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
@@ -468,12 +496,15 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 folderRoles: folderRoles
             )
             if syncableFolderCount > 0 {
-                _ = try await syncService.syncWorkspace(
+                let result = try await syncService.syncWorkspaceResult(
                     workspace.coreWorkspace,
                     accountKeys: normalizedAccountKeys,
                     folderRoles: folderRoles,
                     timeout: 30
                 )
+                if result.hadFailure {
+                    throw MailiaSyncFailure.mailboxSyncFailed
+                }
             }
         }
 

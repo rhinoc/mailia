@@ -5,6 +5,27 @@ import Testing
 
 @MainActor
 @Test
+func himalayaExecutableSettingsUsesUserOverrideWhenPresent() throws {
+    let suiteName = "MailiaHimalayaExecutableSettingsTests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer {
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+    defaults.set("/tmp/custom-himalaya", forKey: MailiaPreferenceKeys.himalayaExecutablePath)
+
+    let url = MailiaHimalayaExecutableSettings.effectiveExecutableURL(
+        defaults: defaults,
+        environment: [
+            "HOME": "/tmp/ignored-home",
+            "PATH": "/usr/bin:/bin"
+        ]
+    )
+
+    #expect(url?.path == "/tmp/custom-himalaya")
+}
+
+@MainActor
+@Test
 func loadRefreshesWhenInitialSnapshotHasNoEntities() async {
     let refreshedSnapshot = MailiaSnapshot(
         entities: [mailiaEntitySummary(id: 1, displayName: "Alice")],

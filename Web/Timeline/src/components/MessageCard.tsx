@@ -69,6 +69,7 @@ export function MessageCard({
   const himalayaEnvelopeID = message.himalayaEnvelopeID;
   const bodyStatus = message.bodyStatus;
   const hasVisibleSubject = showSubject && Boolean(message.subject?.trim());
+  const hasMessageDate = Boolean(message.messageDate);
   const estimatedBodyHeight = estimateReservedBodyHeight(message, hasVisibleSubject);
   const [committedBodyHeight, setCommittedBodyHeight] = useState(
     clampPlaceholderHeight(reservedBodyHeight ?? estimatedBodyHeight)
@@ -76,6 +77,7 @@ export function MessageCard({
   const [revealedBodyMessageID, setRevealedBodyMessageID] = useState<
     TimelineMessage["messageID"] | null
   >(hasBody ? messageID : null);
+  const [showsDetailedDate, setShowsDetailedDate] = useState(false);
   const lastBodyDebugKeyRef = useRef<string | null>(null);
   const isBodyRevealed = hasBody && revealedBodyMessageID === messageID;
   const hasBodyFailed = bodyStatus === "failed";
@@ -235,6 +237,10 @@ export function MessageCard({
     });
   }, [bodyHeightCacheKey, onBodyHeightMeasured, shouldDeferBodyRequest]);
 
+  const handleDoubleClick = useCallback(() => {
+    setShowsDetailedDate((current) => !current);
+  }, []);
+
   return (
     <article
       className="message-row"
@@ -253,49 +259,58 @@ export function MessageCard({
           ) : null}
         </div>
       ) : null}
-      <div className="message-card">
-        {hasVisibleSubject ? (
-          <header className="message-card__header">
-            <h2 className="message-card__subject">{message.subject}</h2>
-            <div className="message-card__meta" aria-label="Message details">
-              <time dateTime={message.messageDate ?? undefined}>
-                {formatDate(message.messageDate)}
-              </time>
-            </div>
-          </header>
-        ) : null}
+      <div className="message-stack" onDoubleClick={handleDoubleClick}>
+        <div className="message-card">
+          {hasVisibleSubject ? (
+            <header className="message-card__header">
+              <h2 className="message-card__subject">{message.subject}</h2>
+            </header>
+          ) : null}
 
-        <div
-          className="mail-body-reserve"
-          style={!isBodyRevealed ? { minHeight: committedBodyHeight } : undefined}
-        >
-          {hasBodyFailed ? (
-            <MessageBodyFailure message={message.bodyErrorMessage} />
-          ) : !isBodyRevealed ? (
-            <div
-              className="mail-body-frame mail-body--placeholder"
-              aria-label="Loading message body"
-              role="status"
-            >
-              <span className="mail-body-loading-spinner" aria-hidden="true" />
-            </div>
-          ) : (
-            <MessageBody
-              html={message.sanitizedHTML}
-              htmlVariants={message.htmlVariants}
-              mode={bodyDisplayMode}
-              loadRemoteContent={loadRemoteContent}
-              hideQuotedReplyText={hideQuotedReplyText}
-              onMeasuredHeight={handleMeasuredBodyHeight}
+          <div
+            className="mail-body-reserve"
+            style={!isBodyRevealed ? { minHeight: committedBodyHeight } : undefined}
+          >
+            {hasBodyFailed ? (
+              <MessageBodyFailure message={message.bodyErrorMessage} />
+            ) : !isBodyRevealed ? (
+              <div
+                className="mail-body-frame mail-body--placeholder"
+                aria-label="Loading message body"
+                role="status"
+              >
+                <span className="mail-body-loading-spinner" aria-hidden="true" />
+              </div>
+            ) : (
+              <MessageBody
+                html={message.sanitizedHTML}
+                htmlVariants={message.htmlVariants}
+                mode={bodyDisplayMode}
+                loadRemoteContent={loadRemoteContent}
+                hideQuotedReplyText={hideQuotedReplyText}
+                onMeasuredHeight={handleMeasuredBodyHeight}
+              />
+            )}
+          </div>
+
+          {message.hasAttachments ? (
+            <AttachmentDownloadRow
+              state={attachmentState}
+              onDownload={() => onDownloadAttachments(message)}
             />
-          )}
+          ) : null}
         </div>
-
-        {message.hasAttachments ? (
-          <AttachmentDownloadRow
-            state={attachmentState}
-            onDownload={() => onDownloadAttachments(message)}
-          />
+        {hasMessageDate ? (
+          <div
+            className="message-card__meta message-card__meta--standalone"
+            aria-label="Message details"
+          >
+            <time dateTime={message.messageDate ?? undefined}>
+              {showsDetailedDate
+                ? formatDetailedDate(message.messageDate)
+                : formatDate(message.messageDate)}
+            </time>
+          </div>
         ) : null}
       </div>
     </article>
@@ -442,5 +457,21 @@ function formatDate(value?: string | null) {
   return new Intl.DateTimeFormat(undefined, {
     hour: "numeric",
     minute: "2-digit"
+  }).format(date);
+}
+
+function formatDetailedDate(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
   }).format(date);
 }

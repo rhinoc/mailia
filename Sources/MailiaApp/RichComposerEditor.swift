@@ -146,6 +146,7 @@ final class ComposerRichTextController: ObservableObject {
 struct RichComposerTextView: NSViewRepresentable {
     @Binding var attributedText: NSAttributedString
     @Binding var height: CGFloat
+    @Binding var hasMarkedText: Bool
     var isEnabled: Bool
     var minHeight: CGFloat
     var maxHeight: CGFloat
@@ -168,6 +169,9 @@ struct RichComposerTextView: NSViewRepresentable {
         }
         textView.onFilesDropped = { [weak controller] urls in
             controller?.addAttachments(urls)
+        }
+        textView.onMarkedTextChanged = { [weak coordinator = context.coordinator] hasMarkedText in
+            coordinator?.setMarkedTextState(hasMarkedText)
         }
         textView.sendShortcut = sendShortcut
         textView.font = ComposerTextDefaults.bodyFont
@@ -215,8 +219,11 @@ struct RichComposerTextView: NSViewRepresentable {
         textView.onFilesDropped = { [weak controller] urls in
             controller?.addAttachments(urls)
         }
+        textView.onMarkedTextChanged = { [weak coordinator = context.coordinator] hasMarkedText in
+            coordinator?.setMarkedTextState(hasMarkedText)
+        }
         textView.sendShortcut = sendShortcut
-        if !textView.attributedString().isEqual(to: attributedText) {
+        if !textView.hasMarkedText(), !textView.attributedString().isEqual(to: attributedText) {
             textView.textStorage?.setAttributedString(attributedText)
         }
         textView.isEditable = isEnabled
@@ -236,8 +243,15 @@ struct RichComposerTextView: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? ComposerRichTextView else { return }
-            parent.attributedText = textView.attributedString()
+            parent.attributedText = NSAttributedString(attributedString: textView.attributedString())
+            setMarkedTextState(textView.hasMarkedText())
             recomputeHeight(textView: textView)
+        }
+
+        func setMarkedTextState(_ value: Bool) {
+            if parent.hasMarkedText != value {
+                parent.hasMarkedText = value
+            }
         }
 
         func recomputeHeight(textView: NSTextView) {
@@ -258,6 +272,7 @@ final class ComposerRichTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onInlineImagesDropped: (([URL]) -> Void)?
     var onFilesDropped: (([URL]) -> Void)?
+    var onMarkedTextChanged: ((Bool) -> Void)?
     var sendShortcut: MailiaComposerShortcut = .enter
     private let insertionPointWidth: CGFloat = 2
     private let insertionPointBlinkAnimationKey = "mailiaInsertionPointBlink"
@@ -283,6 +298,16 @@ final class ComposerRichTextView: NSTextView {
         let attributed = NSMutableAttributedString(attributedString: NSAttributedString(attachment: textAttachment))
         attributed.append(NSAttributedString(string: "\n", attributes: ComposerTextDefaults.bodyAttributes))
         insertAttributedText(attributed)
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onMarkedTextChanged?(hasMarkedText())
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        onMarkedTextChanged?(hasMarkedText())
     }
 
     func toggleBoldStyle() {

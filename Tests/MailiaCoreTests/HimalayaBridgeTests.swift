@@ -186,6 +186,60 @@ func processBridgeCapturesOutputAndDuration() async throws {
 }
 
 @Test
+func processBridgeAddsCommonUserInstallDirectoriesToPath() async throws {
+    let home = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-path-home-\(UUID().uuidString)", isDirectory: true)
+    let bridge = ProcessHimalayaBridge(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        environment: [
+            "HOME": home.path,
+            "PATH": "/usr/bin:/bin"
+        ]
+    )
+
+    let result = try await bridge.run(
+        HimalayaCommand(arguments: ["-c", "printf '%s' \"$PATH\""]),
+        timeout: 2
+    )
+
+    let pathEntries = result.stdout.split(separator: ":").map(String.init)
+    #expect(pathEntries.contains("\(home.path)/.cargo/bin"))
+    #expect(pathEntries.contains("\(home.path)/.local/bin"))
+    #expect(pathEntries.contains("/opt/homebrew/bin"))
+    #expect(pathEntries.contains("/usr/local/bin"))
+    #expect(pathEntries.contains("/usr/bin"))
+    #expect(pathEntries.contains("/bin"))
+}
+
+@Test
+func executableResolverFindsHimalayaInUserInstallDirectories() throws {
+    let home = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-resolver-home-\(UUID().uuidString)", isDirectory: true)
+    let executableURL = home
+        .appendingPathComponent(".cargo", isDirectory: true)
+        .appendingPathComponent("bin", isDirectory: true)
+        .appendingPathComponent("himalaya")
+    try FileManager.default.createDirectory(
+        at: executableURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try "#!/bin/sh\nexit 0\n".write(to: executableURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executableURL.path)
+    defer {
+        try? FileManager.default.removeItem(at: home)
+    }
+
+    let resolved = HimalayaExecutableResolver.discoveredExecutableURL(
+        environment: [
+            "HOME": home.path,
+            "PATH": "/usr/bin:/bin"
+        ]
+    )
+
+    #expect(resolved?.path == executableURL.path)
+}
+
+@Test
 func processBridgeDrainsLargeStdoutAndStderrConcurrently() async throws {
     let bridge = ProcessHimalayaBridge(executableURL: URL(fileURLWithPath: "/bin/sh"))
     let chunk = String(repeating: "x", count: 1024)

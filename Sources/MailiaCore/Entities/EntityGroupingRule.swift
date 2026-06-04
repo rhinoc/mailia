@@ -38,6 +38,9 @@ public struct EntityGroupingRules: Sendable {
         "fastmail.com",
         "proton.me",
         "protonmail.com",
+        "example.com",
+        "example.net",
+        "example.org",
         "qq.com",
         "foxmail.com",
         "163.com",
@@ -85,7 +88,7 @@ public struct EntityGroupingRules: Sendable {
         if !consumerDomains.contains(rootDomain) {
             return EntityGroupingResult(
                 canonicalKey: "domain:\(rootDomain)",
-                displayName: sender.displayName?.nilIfBlank ?? displayName(forDomain: rootDomain),
+                displayName: displayName(forDomain: rootDomain, candidateDisplayNames: [sender.displayName]),
                 source: "organization-domain-rule"
             )
         }
@@ -101,12 +104,77 @@ public struct EntityGroupingRules: Sendable {
         localPart.split(separator: "+", maxSplits: 1).first.map(String.init) ?? localPart
     }
 
-    private func displayName(forDomain domain: String) -> String {
+    public func displayName(forDomain domain: String, candidateDisplayNames: [String?]) -> String {
+        let label = domainLabel(for: domain)
+
+        for candidate in candidateDisplayNames {
+            if let displayName = matchedDisplayNameFragment(in: candidate, domainLabel: label) {
+                return displayName
+            }
+        }
+
+        return fallbackDisplayName(forDomainLabel: label)
+    }
+
+    private func domainLabel(for domain: String) -> String {
         domain
             .split(separator: ".")
             .first
-            .map { String($0).capitalized }
-            ?? domain
+            .map(String.init) ?? domain
+    }
+
+    private func fallbackDisplayName(forDomainLabel label: String) -> String {
+        label
+            .split(separator: "-")
+            .map { $0.capitalized }
+            .joined(separator: " ")
+    }
+
+    private func matchedDisplayNameFragment(in displayName: String?, domainLabel: String) -> String? {
+        guard let displayName = displayName?.nilIfBlank else {
+            return nil
+        }
+
+        let labelKey = displayNameComparisonKey(domainLabel)
+        guard !labelKey.isEmpty else {
+            return nil
+        }
+
+        var candidateKey: [Character] = []
+        var sourceIndices: [String.Index] = []
+        var index = displayName.startIndex
+        while index < displayName.endIndex {
+            let character = displayName[index]
+            if character.isLetter || character.isNumber {
+                for lowercasedCharacter in character.lowercased() {
+                    candidateKey.append(lowercasedCharacter)
+                    sourceIndices.append(index)
+                }
+            }
+            index = displayName.index(after: index)
+        }
+
+        let labelCharacters = Array(labelKey)
+        guard !labelCharacters.isEmpty, labelCharacters.count <= candidateKey.count else {
+            return nil
+        }
+
+        for startIndex in 0...(candidateKey.count - labelCharacters.count) {
+            let endIndex = startIndex + labelCharacters.count
+            if Array(candidateKey[startIndex..<endIndex]) == labelCharacters {
+                let sourceStart = sourceIndices[startIndex]
+                let sourceEnd = displayName.index(after: sourceIndices[endIndex - 1])
+                return String(displayName[sourceStart..<sourceEnd]).nilIfBlank
+            }
+        }
+
+        return nil
+    }
+
+    private func displayNameComparisonKey(_ value: String) -> String {
+        value
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
     }
 
     private func registrableDomain(_ domain: String) -> String {

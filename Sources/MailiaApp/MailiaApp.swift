@@ -12,6 +12,7 @@ enum MailiaPreferenceKeys {
     static let hideReplySubjects = "MailiaHideReplySubjects"
     static let autoSyncEnabled = "MailiaAutoSyncEnabled"
     static let autoSyncIntervalMinutes = "MailiaAutoSyncIntervalMinutes"
+    static let himalayaExecutablePath = "MailiaHimalayaExecutablePath"
     static let downloadsDirectoryPath = "MailiaDownloadsDirectoryPath"
     static let composerSendShortcut = "MailiaComposerSendShortcut"
     static let composerAllowUndoAfterSend = "MailiaComposerAllowUndoAfterSend"
@@ -480,6 +481,8 @@ private struct ContentView: View {
     private var autoSyncIntervalMinutes = 10
     @State private var columnVisibility: NavigationSplitViewVisibility
     @State private var sidebarWasCollapsedByResize = false
+    @State private var newMessageDraft = MailiaNewMessageDraft()
+    @State private var replyDrafts: [TimelineReplyDraftKey: MailiaReplyComposerDraft] = [:]
 
     private let sidebarCollapseWidth: CGFloat = 900
     private let sidebarRestoreWidth: CGFloat = 980
@@ -490,6 +493,31 @@ private struct ContentView: View {
         guard let selectedEntity else { return [] }
         return viewModel.timeline.filter { $0.entityID == selectedEntity.id }
     }
+    private var selectedReplyDraft: Binding<MailiaReplyComposerDraft> {
+        guard let selectedEntity else {
+            return .constant(MailiaReplyComposerDraft())
+        }
+
+        let key = TimelineReplyDraftKey(workspace: selectedEntity.workspace, entityID: selectedEntity.id)
+        return Binding(
+            get: {
+                replyDrafts[key] ?? MailiaReplyComposerDraft()
+            },
+            set: { draft in
+                if draft.hasContent {
+                    replyDrafts[key] = draft
+                } else {
+                    replyDrafts.removeValue(forKey: key)
+                }
+            }
+        )
+    }
+
+    private func discardNewMessageDraft() {
+        newMessageDraft.clear()
+        viewModel.cancelComposingNewMessage()
+    }
+
     init(viewModel: AppViewModel) {
         self.viewModel = viewModel
         _columnVisibility = State(initialValue: Self.preferredSidebarVisibility())
@@ -497,7 +525,7 @@ private struct ContentView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: columnVisibilityBinding) {
-            EntityListPane(viewModel: viewModel)
+            EntityListPane(viewModel: viewModel, onDiscardComposeDraft: discardNewMessageDraft)
                 .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 430)
                 .toolbar {
                     RefreshToolbarContent(
@@ -520,6 +548,8 @@ private struct ContentView: View {
                 bodyStates: viewModel.timelineBodyStates,
                 attachmentDownloadStates: viewModel.attachmentDownloadStates,
                 replySendState: viewModel.replySendState,
+                newMessageDraft: $newMessageDraft,
+                replyDraft: selectedReplyDraft,
                 isComposingNewMessage: viewModel.isComposingNewMessage,
                 isLoadingEntityList: viewModel.isLoadingEntityList,
                 hasSelectableEntities: !viewModel.entities.isEmpty,
@@ -556,7 +586,7 @@ private struct ContentView: View {
             ComposeToolbarContent(
                 isComposingNewMessage: viewModel.isComposingNewMessage,
                 onStartComposing: viewModel.startComposingNewMessage,
-                onCancelComposing: viewModel.cancelComposingNewMessage
+                onCancelComposing: discardNewMessageDraft
             )
         }
         .task {
@@ -685,6 +715,11 @@ private enum SidebarListSelection: Hashable {
     case entity(Int64)
 }
 
+private struct TimelineReplyDraftKey: Hashable {
+    let workspace: MailiaWorkspace
+    let entityID: Int64
+}
+
 private struct EntityListPane: View {
     private static let searchOverlayTopPadding: CGFloat = MailiaTopChrome.controlTopPadding
     private static let searchOverlayBottomPadding: CGFloat = 6
@@ -692,6 +727,7 @@ private struct EntityListPane: View {
     private static let topScrollAnchorID = "sidebar-top-anchor"
 
     @ObservedObject var viewModel: AppViewModel
+    let onDiscardComposeDraft: () -> Void
     @AppStorage(MailiaPreferenceKeys.hideQuotedReplyText)
     private var hideQuotedReplyText = false
     @AppStorage(MailiaPreferenceKeys.hideReplySubjects)
@@ -824,7 +860,7 @@ private struct EntityListPane: View {
     }
 
     private func deleteComposeDraft() {
-        viewModel.cancelComposingNewMessage()
+        onDiscardComposeDraft()
     }
 
     private func resetScrollPosition(_ proxy: ScrollViewProxy) {
@@ -1761,6 +1797,8 @@ private struct TimelinePane: View {
     let bodyStates: [Int64: MailiaTimelineBodyState]
     let attachmentDownloadStates: [Int64: MailiaAttachmentDownloadState]
     let replySendState: MailiaReplySendState
+    @Binding var newMessageDraft: MailiaNewMessageDraft
+    @Binding var replyDraft: MailiaReplyComposerDraft
     let isComposingNewMessage: Bool
     let isLoadingEntityList: Bool
     let hasSelectableEntities: Bool
@@ -1783,6 +1821,7 @@ private struct TimelinePane: View {
         Group {
             if isComposingNewMessage {
                 NewMessageComposerView(
+                    draft: $newMessageDraft,
                     sendAccounts: sendAccounts,
                     selectedSendAccountKey: selectedSendAccountKey,
                     suggestions: composeSuggestions,
@@ -1805,6 +1844,7 @@ private struct TimelinePane: View {
                     bodyStates: bodyStates,
                     attachmentDownloadStates: attachmentDownloadStates,
                     replySendState: replySendState,
+                    draft: $replyDraft,
                     sendAccounts: sendAccounts,
                     selectedSendAccountKey: selectedSendAccountKey,
                     scrollAnchor: scrollAnchor,
@@ -2148,6 +2188,7 @@ private struct TimelineBody: View {
     let bodyStates: [Int64: MailiaTimelineBodyState]
     let attachmentDownloadStates: [Int64: MailiaAttachmentDownloadState]
     let replySendState: MailiaReplySendState
+    @Binding var draft: MailiaReplyComposerDraft
     let sendAccounts: [MailiaSendAccount]
     let selectedSendAccountKey: String?
     let scrollAnchor: MailiaTimelineScrollAnchor?
@@ -2282,6 +2323,7 @@ private struct TimelineBody: View {
     private var replyComposer: some View {
         ReplyComposerBar(
             target: items.last,
+            draft: $draft,
             sendAccounts: sendAccounts,
             selectedSendAccountKey: replySendAccountKey,
             sendState: replySendState,
@@ -2590,12 +2632,15 @@ private struct SettingsView: View {
     private var autoSyncEnabled = true
     @AppStorage(MailiaPreferenceKeys.autoSyncIntervalMinutes)
     private var autoSyncIntervalMinutes = 10
+    @AppStorage(MailiaPreferenceKeys.himalayaExecutablePath)
+    private var himalayaExecutablePath = ""
     @AppStorage(MailiaPreferenceKeys.downloadsDirectoryPath)
     private var downloadsDirectoryPath = ""
     @ComposerBehaviorSettingsStorage
     private var composerSettings
     @State private var appearanceDraft: TimelineDisplayOptions
     @State private var syncDraft: SyncSettingsDraft
+    @State private var himalayaDraft: HimalayaExecutableSettingsDraft
     @State private var downloadsDraft: DownloadsSettingsDraft
     @State private var composerDraft: MailiaComposerSettings
     @State private var accountDrafts: [String: AccountSettingsDraft] = [:]
@@ -2604,6 +2649,7 @@ private struct SettingsView: View {
         self.viewModel = viewModel
         _appearanceDraft = State(initialValue: TimelineDisplayOptions.saved())
         _syncDraft = State(initialValue: SyncSettingsDraft.saved())
+        _himalayaDraft = State(initialValue: HimalayaExecutableSettingsDraft.saved())
         _downloadsDraft = State(initialValue: DownloadsSettingsDraft.saved())
         _composerDraft = State(initialValue: MailiaComposerSettings.saved())
     }
@@ -2715,6 +2761,37 @@ private struct SettingsView: View {
                     .disabled(!syncDraft.autoSyncEnabled)
                 }
 
+                Section("Himalaya") {
+                    LabeledContent("Executable") {
+                        HStack(spacing: 8) {
+                            SettingsTextField(
+                                text: $himalayaDraft.path,
+                                placeholder: himalayaDraft.autoDetectedPath,
+                                alignment: .left,
+                                font: .systemFont(ofSize: 13),
+                                normalize: { MailiaHimalayaExecutableSettings.normalizedPath($0) }
+                            )
+                                .settingsFieldChrome()
+                                .frame(width: 380, height: 30)
+                                .help("Leave empty to use the automatically detected Himalaya executable.")
+
+                            Button("Choose...") {
+                                chooseHimalayaExecutable()
+                            }
+
+                            if himalayaDraft.isCustomPath {
+                                Button("Use Auto") {
+                                    himalayaDraft.path = ""
+                                }
+                            }
+                        }
+                    }
+
+                    Text(himalayaDraft.statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Files") {
                     LabeledContent("Attachment location") {
                         HStack {
@@ -2763,6 +2840,7 @@ private struct SettingsView: View {
         .task {
             syncSettingsDraft()
             syncAppearanceDraft()
+            syncHimalayaDraft()
             syncDownloadsDraft()
             syncComposerDraft()
             syncAccountDrafts(with: viewModel.sendAccounts)
@@ -2804,6 +2882,10 @@ private struct SettingsView: View {
         )
     }
 
+    private var savedHimalayaDraft: HimalayaExecutableSettingsDraft {
+        HimalayaExecutableSettingsDraft(path: himalayaExecutablePath)
+    }
+
     private var savedDownloadsDraft: DownloadsSettingsDraft {
         DownloadsSettingsDraft(path: downloadsDirectoryPath)
     }
@@ -2815,6 +2897,7 @@ private struct SettingsView: View {
     private var hasUnsavedSettingsChanges: Bool {
         hasUnsavedSyncChanges
             || hasUnsavedDownloadsChanges
+            || hasUnsavedHimalayaChanges
             || hasUnsavedComposerChanges
             || hasUnsavedAppearanceChanges
             || hasUnsavedAccountChanges
@@ -2826,6 +2909,10 @@ private struct SettingsView: View {
 
     private var hasUnsavedDownloadsChanges: Bool {
         downloadsDraft != savedDownloadsDraft
+    }
+
+    private var hasUnsavedHimalayaChanges: Bool {
+        himalayaDraft != savedHimalayaDraft
     }
 
     private var hasUnsavedComposerChanges: Bool {
@@ -2873,6 +2960,10 @@ private struct SettingsView: View {
         syncDraft = savedSyncDraft
     }
 
+    private func syncHimalayaDraft() {
+        himalayaDraft = savedHimalayaDraft
+    }
+
     private func syncDownloadsDraft() {
         downloadsDraft = savedDownloadsDraft
     }
@@ -2884,6 +2975,7 @@ private struct SettingsView: View {
     private func resetSettingsDrafts() {
         syncSettingsDraft()
         syncAppearanceDraft()
+        syncHimalayaDraft()
         syncDownloadsDraft()
         syncComposerDraft()
         syncAccountDrafts(with: viewModel.sendAccounts)
@@ -2893,6 +2985,7 @@ private struct SettingsView: View {
         guard hasUnsavedSettingsChanges else { return }
         saveSyncDraft()
         saveAppearanceDraft()
+        saveHimalayaDraft()
         saveDownloadsDraft()
         saveComposerDraft()
         saveAccountDrafts()
@@ -2905,6 +2998,10 @@ private struct SettingsView: View {
 
     private func saveAppearanceDraft() {
         displayOptions = appearanceDraft
+    }
+
+    private func saveHimalayaDraft() {
+        himalayaExecutablePath = himalayaDraft.normalizedPath
     }
 
     private func saveDownloadsDraft() {
@@ -2968,6 +3065,22 @@ private struct SettingsView: View {
         panel.directoryURL = URL(fileURLWithPath: downloadsDraft.effectivePath, isDirectory: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         downloadsDraft.path = url.path
+    }
+
+    private func chooseHimalayaExecutable() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        let currentPath = himalayaDraft.effectivePath
+        if !currentPath.isEmpty, currentPath != "himalaya" {
+            let currentURL = URL(fileURLWithPath: currentPath)
+            panel.directoryURL = currentURL.deletingLastPathComponent()
+            panel.nameFieldStringValue = currentURL.lastPathComponent
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        himalayaDraft.path = url.path
     }
 }
 
@@ -3077,6 +3190,39 @@ private struct SyncSettingsDraft: Equatable {
 
     static func intervalLabel(_ minutes: Int) -> String {
         minutes == 60 ? "1 hour" : "\(minutes) minutes"
+    }
+}
+
+private struct HimalayaExecutableSettingsDraft: Equatable {
+    var path: String
+
+    var normalizedPath: String {
+        MailiaHimalayaExecutableSettings.normalizedPath(path)
+    }
+
+    var isCustomPath: Bool {
+        normalizedPath.nilIfBlank != nil
+    }
+
+    var autoDetectedPath: String {
+        MailiaHimalayaExecutableSettings.autoDetectedDisplayPath()
+    }
+
+    var effectivePath: String {
+        normalizedPath.nilIfBlank ?? autoDetectedPath
+    }
+
+    var statusText: String {
+        if isCustomPath {
+            return "Using custom executable: \(effectivePath)"
+        }
+        return "Using automatically detected executable: \(effectivePath)"
+    }
+
+    static func saved(defaults: UserDefaults = .standard) -> HimalayaExecutableSettingsDraft {
+        HimalayaExecutableSettingsDraft(
+            path: defaults.string(forKey: MailiaPreferenceKeys.himalayaExecutablePath) ?? ""
+        )
     }
 }
 

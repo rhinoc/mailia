@@ -219,11 +219,18 @@ button {
   margin-bottom: 9px;
 }
 
+.message-stack {
+  position: relative;
+  width: clamp(420px, 70%, 760px);
+  min-width: 0;
+  max-width: 100%;
+}
+
 .message-card {
   position: relative;
   isolation: isolate;
   z-index: 1;
-  width: clamp(420px, 70%, 760px);
+  width: 100%;
   min-width: 0;
   max-width: 100%;
   border: 0;
@@ -342,7 +349,7 @@ button {
   color: #ffffff;
 }
 
-.message-card time {
+.message-stack time {
   color: var(--mailia-secondary-text);
   font-size: 11px;
   opacity: 0;
@@ -350,8 +357,8 @@ button {
   white-space: nowrap;
 }
 
-.message-card:hover time,
-.message-card:focus-within time {
+.message-stack:hover time,
+.message-stack:focus-within time {
   opacity: 1;
 }
 
@@ -371,6 +378,22 @@ button {
 }
 
 .message-row[data-direction="outgoing"] .message-card__meta {
+  justify-content: flex-end;
+}
+
+.message-card__meta--standalone {
+  position: absolute;
+  z-index: 3;
+  top: calc(100% + 2px);
+  left: 6px;
+  justify-content: flex-start;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.message-row[data-direction="outgoing"] .message-card__meta--standalone {
+  right: 6px;
+  left: auto;
   justify-content: flex-end;
 }
 
@@ -929,7 +952,7 @@ button {
 }
 
 @media (max-width: 760px) {
-  .message-card {
+  .message-stack {
     width: min(100%, max(320px, 70%));
   }
 

@@ -100,6 +100,26 @@ public struct SyncService {
         timeout: TimeInterval? = nil,
         onProgress: (@Sendable (SyncWorkspaceProgress) -> Void)? = nil
     ) async throws -> Int {
+        try await syncWorkspaceResult(
+            workspace,
+            accountKeys: accountKeys,
+            folderRoles: folderRoles,
+            accountPriorityScores: accountPriorityScores,
+            fullHistory: fullHistory,
+            timeout: timeout,
+            onProgress: onProgress
+        ).syncedCount
+    }
+
+    public func syncWorkspaceResult(
+        _ workspace: Workspace,
+        accountKeys: Set<String>? = nil,
+        folderRoles: Set<FolderRole>? = nil,
+        accountPriorityScores: [String: Int] = [:],
+        fullHistory: Bool = false,
+        timeout: TimeInterval? = nil,
+        onProgress: (@Sendable (SyncWorkspaceProgress) -> Void)? = nil
+    ) async throws -> SyncWorkspaceResult {
         var folders = try repository.folders(for: workspace)
         if let accountKeys {
             let normalizedAccountKeys = Set(
@@ -107,7 +127,9 @@ public struct SyncService {
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
             )
-            guard !normalizedAccountKeys.isEmpty else { return 0 }
+            guard !normalizedAccountKeys.isEmpty else {
+                return SyncWorkspaceResult(syncedCount: 0, attemptedFolderCount: 0, hadFailure: false)
+            }
             folders = folders.filter { normalizedAccountKeys.contains($0.accountKey) }
         }
         if let folderRoles {
@@ -147,7 +169,11 @@ public struct SyncService {
             return outcome
         }
         let totalSynced = outcomes.reduce(0) { $0 + $1.syncedCount }
-        return totalSynced
+        return SyncWorkspaceResult(
+            syncedCount: totalSynced,
+            attemptedFolderCount: totalFolders,
+            hadFailure: outcomes.contains { $0.hadFailure }
+        )
     }
 
     @discardableResult
@@ -631,6 +657,18 @@ private struct SyncFoldersOutcome: Sendable {
     mutating func merge(_ outcome: SyncFoldersOutcome) {
         syncedCount += outcome.syncedCount
         hadFailure = hadFailure || outcome.hadFailure
+    }
+}
+
+public struct SyncWorkspaceResult: Equatable, Sendable {
+    public let syncedCount: Int
+    public let attemptedFolderCount: Int
+    public let hadFailure: Bool
+
+    public init(syncedCount: Int, attemptedFolderCount: Int, hadFailure: Bool) {
+        self.syncedCount = syncedCount
+        self.attemptedFolderCount = attemptedFolderCount
+        self.hadFailure = hadFailure
     }
 }
 

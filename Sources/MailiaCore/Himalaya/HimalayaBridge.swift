@@ -175,6 +175,7 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
         var environment = ProcessInfo.processInfo.environment
         environment.merge(bridgeEnvironment) { _, new in new }
         environment.merge(command.environment) { _, new in new }
+        environment["PATH"] = himalayaSearchPath(environment: environment)
         process.environment = environment
 
         let stdoutPipe = Pipe()
@@ -249,6 +250,58 @@ public struct ProcessHimalayaBridge: HimalayaBridge {
             stderrData: stderrData,
             duration: Date().timeIntervalSince(startedAt)
         )
+    }
+
+    private static func himalayaSearchPath(environment: [String: String]) -> String {
+        HimalayaExecutableResolver.searchPath(environment: environment)
+    }
+}
+
+public enum HimalayaExecutableResolver {
+    public static func discoveredExecutableURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        for directory in searchPathEntries(environment: environment) {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent("himalaya")
+            if fileManager.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    public static func searchPath(environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
+        searchPathEntries(environment: environment).joined(separator: ":")
+    }
+
+    public static func searchPathEntries(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        let existingPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let userPaths = home.isEmpty ? [] : [
+            "\(home)/.cargo/bin",
+            "\(home)/.local/bin"
+        ]
+        let standardPaths = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+
+        var seen = Set<String>()
+        var paths: [String] = []
+        for path in userPaths + standardPaths + existingPath.split(separator: ":").map(String.init) {
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+            paths.append(trimmed)
+        }
+        return paths
     }
 }
 

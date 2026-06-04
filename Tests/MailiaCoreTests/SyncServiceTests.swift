@@ -670,9 +670,11 @@ func syncWorkspaceContinuesWhenOneFolderHimalayaCommandFails() async throws {
         now: { now }
     )
 
-    let count = try await service.syncWorkspace(.main)
+    let result = try await service.syncWorkspaceResult(.main)
 
-    #expect(count == 1)
+    #expect(result.syncedCount == 1)
+    #expect(result.attemptedFolderCount == 2)
+    #expect(result.hadFailure)
     let entities = try repository.entityList(workspace: .main)
     #expect(entities.map(\.displayName) == ["GitHub"])
     let folders = try repository.folders(for: .main)

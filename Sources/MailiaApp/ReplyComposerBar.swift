@@ -7,7 +7,7 @@ fileprivate enum NewMessageComposerFocusedField: Hashable {
     case subject
 }
 
-private enum ComposerControlMetrics {
+enum ComposerControlMetrics {
     static let singleLineHeight: CGFloat = 20
     static let maxInputHeight: CGFloat = 132
     static let controlSize: CGFloat = 36
@@ -19,6 +19,81 @@ private enum ComposerControlMetrics {
     static let composerHorizontalPadding: CGFloat = 14
     static let composerTopPadding: CGFloat = 20
     static let composerBottomPadding: CGFloat = 20
+}
+
+struct MailiaReplyComposerDraft {
+    var attributedBody: NSAttributedString
+    var attachments: [MailiaOutgoingAttachment]
+    var height: CGFloat
+
+    init(
+        attributedBody: NSAttributedString = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes),
+        attachments: [MailiaOutgoingAttachment] = [],
+        height: CGFloat = ComposerControlMetrics.singleLineHeight
+    ) {
+        self.attributedBody = attributedBody
+        self.attachments = attachments
+        self.height = height
+    }
+
+    var content: MailiaComposerContent {
+        MailiaComposerContent(attributedBody: attributedBody, attachments: attachments)
+    }
+
+    var hasContent: Bool {
+        content.hasRenderableContent
+    }
+
+    mutating func clear() {
+        attributedBody = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
+        attachments = []
+        height = ComposerControlMetrics.singleLineHeight
+    }
+}
+
+struct MailiaNewMessageDraft {
+    var recipients: [String]
+    var recipientDraft: String
+    var subject: String
+    var bodyText: NSAttributedString
+    var attachments: [MailiaOutgoingAttachment]
+    var bodyHeight: CGFloat
+
+    init(
+        recipients: [String] = [],
+        recipientDraft: String = "",
+        subject: String = "",
+        bodyText: NSAttributedString = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes),
+        attachments: [MailiaOutgoingAttachment] = [],
+        bodyHeight: CGFloat = ComposerControlMetrics.singleLineHeight
+    ) {
+        self.recipients = recipients
+        self.recipientDraft = recipientDraft
+        self.subject = subject
+        self.bodyText = bodyText
+        self.attachments = attachments
+        self.bodyHeight = bodyHeight
+    }
+
+    var content: MailiaComposerContent {
+        MailiaComposerContent(attributedBody: bodyText, attachments: attachments)
+    }
+
+    var hasContent: Bool {
+        !recipients.isEmpty
+            || !recipientDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || content.hasRenderableContent
+    }
+
+    mutating func clear() {
+        recipients = []
+        recipientDraft = ""
+        subject = ""
+        bodyText = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
+        attachments = []
+        bodyHeight = ComposerControlMetrics.singleLineHeight
+    }
 }
 
 enum MailiaComposerShortcut: String, CaseIterable, Identifiable, Sendable {
@@ -518,6 +593,7 @@ private struct ComposerStatusText: View {
 /// wraps onto multiple lines (Shift+Enter).
 struct ReplyComposerBar: View {
     let target: MailiaTimelineItem?
+    @Binding var draft: MailiaReplyComposerDraft
     let sendAccounts: [MailiaSendAccount]
     let selectedSendAccountKey: String?
     let sendState: MailiaReplySendState
@@ -525,12 +601,8 @@ struct ReplyComposerBar: View {
     let onSelectSendAccount: (String) -> Void
     let onEdited: () -> Void
 
-    private static let singleLineHeight = ComposerControlMetrics.singleLineHeight
     private static let maxInputHeight = ComposerControlMetrics.maxInputHeight
 
-    @State private var draft = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
-    @State private var attachments: [MailiaOutgoingAttachment] = []
-    @State private var textHeight: CGFloat = ReplyComposerBar.singleLineHeight
     @StateObject private var sendController = ComposerSendStateController<MailiaComposerContent>()
     @StateObject private var editorController = ComposerRichTextController()
     @State private var validationMessage: String?
@@ -552,7 +624,7 @@ struct ReplyComposerBar: View {
     private var hasTarget: Bool { target != nil }
     private var isInputDisabled: Bool { sendController.isQueued || isSending }
     private var content: MailiaComposerContent {
-        MailiaComposerContent(attributedBody: draft, attachments: attachments)
+        draft.content
     }
 
     private var canSend: Bool {
@@ -590,10 +662,10 @@ struct ReplyComposerBar: View {
         .onChange(of: sendState) { _, newValue in
             handleSendStateChange(newValue)
         }
-        .onChange(of: draft) { _, _ in
+        .onChange(of: draft.attributedBody) { _, _ in
             clearFailedSendStateAfterEdit()
         }
-        .onChange(of: attachments) { _, _ in
+        .onChange(of: draft.attachments) { _, _ in
             clearFailedSendStateAfterEdit()
         }
         .onAppear {
@@ -601,7 +673,7 @@ struct ReplyComposerBar: View {
                 validationMessage = message
             }
             editorController.onAddAttachments = { newAttachments in
-                attachments.append(contentsOf: newAttachments)
+                draft.attachments.append(contentsOf: newAttachments)
             }
         }
         .onDisappear {
@@ -611,9 +683,9 @@ struct ReplyComposerBar: View {
 
     private var inputField: some View {
         ComposerBodyInputField(
-            attributedText: $draft,
-            height: $textHeight,
-            attachments: attachments,
+            attributedText: $draft.attributedBody,
+            height: $draft.height,
+            attachments: draft.attachments,
             placeholder: "Reply…",
             isEnabled: !isInputDisabled,
             maxHeight: Self.maxInputHeight,
@@ -636,9 +708,7 @@ struct ReplyComposerBar: View {
 
     private func handleSendStateChange(_ state: MailiaReplySendState) {
         sendController.handleSendStateChange(state) {
-            draft = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
-            attachments = []
-            textHeight = Self.singleLineHeight
+            draft.clear()
             validationMessage = nil
         }
     }
@@ -652,7 +722,7 @@ struct ReplyComposerBar: View {
     }
 
     private func removeAttachment(_ attachment: MailiaOutgoingAttachment) {
-        attachments.removeAll { $0.id == attachment.id }
+        draft.attachments.removeAll { $0.id == attachment.id }
     }
 }
 
@@ -664,6 +734,7 @@ private struct NewMessageComposerPayload {
 }
 
 struct NewMessageComposerView: View {
+    @Binding var draft: MailiaNewMessageDraft
     let sendAccounts: [MailiaSendAccount]
     let selectedSendAccountKey: String?
     let suggestions: [MailiaRecipientSuggestion]
@@ -672,15 +743,8 @@ struct NewMessageComposerView: View {
     let onSelectSendAccount: (String) -> Void
     let onEdited: () -> Void
 
-    private static let singleLineHeight = ComposerControlMetrics.singleLineHeight
     private static let maxBodyHeight = ComposerControlMetrics.maxInputHeight
 
-    @State private var recipients: [String] = []
-    @State private var recipientDraft = ""
-    @State private var subject = ""
-    @State private var bodyText = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
-    @State private var attachments: [MailiaOutgoingAttachment] = []
-    @State private var bodyHeight = NewMessageComposerView.singleLineHeight
     @State private var validationMessage: String?
     @StateObject private var sendController = ComposerSendStateController<NewMessageComposerPayload>()
     @StateObject private var editorController = ComposerRichTextController()
@@ -704,11 +768,11 @@ struct NewMessageComposerView: View {
     }
 
     private var content: MailiaComposerContent {
-        MailiaComposerContent(attributedBody: bodyText, attachments: attachments)
+        draft.content
     }
 
     private var resolvedRecipients: [String] {
-        normalizedRecipients(recipients + Self.parseRecipients(recipientDraft))
+        normalizedRecipients(draft.recipients + Self.parseRecipients(draft.recipientDraft))
     }
 
     private var canSend: Bool {
@@ -726,7 +790,7 @@ struct NewMessageComposerView: View {
     }
 
     private var filteredSuggestions: [MailiaRecipientSuggestion] {
-        let query = recipientDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let query = draft.recipientDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard isRecipientFieldFocused, !query.isEmpty else { return [] }
 
         let selectedEmails = Set(resolvedRecipients.map { $0.lowercased() })
@@ -751,19 +815,19 @@ struct NewMessageComposerView: View {
         .onChange(of: sendState) { _, newValue in
             handleSendStateChange(newValue)
         }
-        .onChange(of: recipients) { _, _ in
+        .onChange(of: draft.recipients) { _, _ in
             clearErrorsAfterEdit()
         }
-        .onChange(of: recipientDraft) { _, _ in
+        .onChange(of: draft.recipientDraft) { _, _ in
             clearErrorsAfterEdit()
         }
-        .onChange(of: subject) { _, _ in
+        .onChange(of: draft.subject) { _, _ in
             clearErrorsAfterEdit()
         }
-        .onChange(of: bodyText) { _, _ in
+        .onChange(of: draft.bodyText) { _, _ in
             clearErrorsAfterEdit()
         }
-        .onChange(of: attachments) { _, _ in
+        .onChange(of: draft.attachments) { _, _ in
             clearErrorsAfterEdit()
         }
         .onAppear {
@@ -771,7 +835,7 @@ struct NewMessageComposerView: View {
                 validationMessage = message
             }
             editorController.onAddAttachments = { newAttachments in
-                attachments.append(contentsOf: newAttachments)
+                draft.attachments.append(contentsOf: newAttachments)
             }
         }
         .onDisappear {
@@ -799,8 +863,8 @@ struct NewMessageComposerView: View {
                 .frame(width: 58, alignment: .leading)
 
             FlowRecipientField(
-                recipients: recipients,
-                draft: $recipientDraft,
+                recipients: draft.recipients,
+                draft: $draft.recipientDraft,
                 selectedRecipient: $selectedRecipient,
                 isFocused: $isRecipientFieldFocused,
                 focusedField: $focusedField,
@@ -840,14 +904,14 @@ struct NewMessageComposerView: View {
                 .frame(width: 58, alignment: .leading)
 
             ZStack(alignment: .leading) {
-                if subject.isEmpty {
+                if draft.subject.isEmpty {
                     Text("Subject")
                         .font(.system(size: 15))
                         .foregroundStyle(Color(nsColor: .placeholderTextColor))
                         .allowsHitTesting(false)
                 }
 
-                TextField("", text: $subject)
+                TextField("", text: $draft.subject)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .focused($focusedField, equals: .subject)
@@ -934,9 +998,9 @@ struct NewMessageComposerView: View {
 
     private var bodyInput: some View {
         ComposerBodyInputField(
-            attributedText: $bodyText,
-            height: $bodyHeight,
-            attachments: attachments,
+            attributedText: $draft.bodyText,
+            height: $draft.bodyHeight,
+            attachments: draft.attachments,
             placeholder: "Message...",
             isEnabled: !sendController.isQueued && !isSending,
             maxHeight: Self.maxBodyHeight,
@@ -963,7 +1027,7 @@ struct NewMessageComposerView: View {
 
         commitRecipientDraft()
 
-        let trimmedSubject = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSubject = draft.subject.trimmingCharacters(in: .whitespacesAndNewlines)
         let subject = trimmedSubject.isEmpty ? nil : trimmedSubject
         let account = selectedAccountID
         let payload = NewMessageComposerPayload(
@@ -985,12 +1049,7 @@ struct NewMessageComposerView: View {
 
     private func handleSendStateChange(_ state: MailiaReplySendState) {
         sendController.handleSendStateChange(state) {
-            recipients = []
-            recipientDraft = ""
-            subject = ""
-            bodyText = NSAttributedString(string: "", attributes: ComposerTextDefaults.bodyAttributes)
-            attachments = []
-            bodyHeight = Self.singleLineHeight
+            draft.clear()
             validationMessage = nil
         }
     }
@@ -1004,34 +1063,31 @@ struct NewMessageComposerView: View {
     }
 
     private var hasDraftContent: Bool {
-        !recipients.isEmpty
-            || !recipientDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || content.hasRenderableContent
+        draft.hasContent
     }
 
     private func removeAttachment(_ attachment: MailiaOutgoingAttachment) {
-        attachments.removeAll { $0.id == attachment.id }
+        draft.attachments.removeAll { $0.id == attachment.id }
     }
 
     private func commitRecipientDraft() {
-        let parsed = Self.parseRecipients(recipientDraft)
+        let parsed = Self.parseRecipients(draft.recipientDraft)
         guard !parsed.isEmpty else { return }
-        recipients = normalizedRecipients(recipients + parsed)
-        recipientDraft = ""
+        draft.recipients = normalizedRecipients(draft.recipients + parsed)
+        draft.recipientDraft = ""
         selectedRecipient = nil
         highlightedSuggestionID = nil
         validationMessage = nil
     }
 
     private func addRecipient(_ address: String) {
-        recipients = normalizedRecipients(recipients + [address])
+        draft.recipients = normalizedRecipients(draft.recipients + [address])
         selectedRecipient = nil
         highlightedSuggestionID = nil
     }
 
     private func removeRecipient(_ recipient: String) {
-        recipients.removeAll { $0 == recipient }
+        draft.recipients.removeAll { $0 == recipient }
         if selectedRecipient == recipient {
             selectedRecipient = nil
         }
@@ -1063,7 +1119,7 @@ struct NewMessageComposerView: View {
             if key == .enter {
                 let trimmed = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
-                    recipientDraft = currentText
+                    draft.recipientDraft = currentText
                 }
                 commitRecipientDraft()
                 if !resolvedRecipients.isEmpty, content.hasRenderableContent {
@@ -1089,7 +1145,7 @@ struct NewMessageComposerView: View {
                 removeRecipient(selectedRecipient)
                 return true
             }
-            if key == .deleteBackward, let lastRecipient = recipients.last {
+            if key == .deleteBackward, let lastRecipient = draft.recipients.last {
                 selectedRecipient = lastRecipient
                 return true
             }
@@ -1119,7 +1175,7 @@ struct NewMessageComposerView: View {
 
     private func acceptSuggestion(_ suggestion: MailiaRecipientSuggestion) {
         addRecipient(suggestion.email)
-        recipientDraft = ""
+        draft.recipientDraft = ""
         validationMessage = nil
         focusedField = .recipients
     }
@@ -1532,6 +1588,7 @@ private struct AccountMenuEmojiLabel: View {
 private struct ComposerBodyInputField: View {
     @Binding var attributedText: NSAttributedString
     @Binding var height: CGFloat
+    @State private var hasMarkedText = false
     let attachments: [MailiaOutgoingAttachment]
     let placeholder: String
     let isEnabled: Bool
@@ -1556,6 +1613,7 @@ private struct ComposerBodyInputField: View {
                 RichComposerTextView(
                     attributedText: $attributedText,
                     height: $height,
+                    hasMarkedText: $hasMarkedText,
                     isEnabled: isEnabled,
                     minHeight: ComposerControlMetrics.singleLineHeight,
                     maxHeight: maxHeight,
@@ -1602,6 +1660,7 @@ private struct ComposerBodyInputField: View {
     private var isBodyEmpty: Bool {
         attributedText.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !ComposerMessageSerializer.containsInlineImage(attributedText)
+            && !hasMarkedText
     }
 }
 

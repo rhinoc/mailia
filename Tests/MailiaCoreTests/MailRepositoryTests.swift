@@ -153,7 +153,7 @@ func repositoryKeepsStableEntityWhenSenderDisplayNameChanges() throws {
     ])
 
     let senderWithoutName = MailAddress(emailAddress: "notifications@github.com")
-    let senderWithName = MailAddress(displayName: "wxtsky", emailAddress: "notifications@github.com")
+    let senderWithName = MailAddress(displayName: "nextop-os/vibe-design", emailAddress: "notifications@github.com")
     let messageDate = "2026-05-31T01:47:00Z"
 
     let firstIDs = try repository.upsertEnvelopes([
@@ -184,10 +184,54 @@ func repositoryKeepsStableEntityWhenSenderDisplayNameChanges() throws {
     let refreshedEntities = try repository.entityList(workspace: .main)
     #expect(refreshedEntities.count == 1)
     #expect(refreshedEntities[0].id == firstEntities[0].id)
+    #expect(refreshedEntities[0].displayName == "Github")
 
     let messages = try repository.messages(entityID: refreshedEntities[0].id, workspace: .main)
     #expect(messages.count == 1)
     #expect(messages[0].messageID == firstIDs[0])
+}
+
+@Test
+func repositoryUpdatesServiceEntityDisplayNameFromLaterMatchingSender() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Build passed",
+            from: MailAddress(displayName: "nextop-os/vibe-design", emailAddress: "notifications@github.com"),
+            messageDate: "2026-05-31T01:47:00Z"
+        )
+    ])
+
+    var entities = try repository.entityList(workspace: .main)
+    #expect(entities.count == 1)
+    #expect(entities[0].displayName == "Github")
+
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-2",
+            subject: "Security notice",
+            from: MailAddress(displayName: "GitHub", emailAddress: "noreply@github.com"),
+            messageDate: "2026-05-31T02:47:00Z"
+        )
+    ])
+
+    entities = try repository.entityList(workspace: .main)
+    #expect(entities.count == 1)
+    #expect(entities[0].displayName == "GitHub")
 }
 
 @Test

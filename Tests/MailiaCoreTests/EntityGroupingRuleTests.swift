@@ -28,17 +28,65 @@ func organizationSenderIgnoresLocalPart() {
 }
 
 @Test
+func organizationSenderUsesMatchingFromNameCasing() {
+    let rules = EntityGroupingRules()
+
+    let result = rules.group(
+        sender: SenderIdentity(displayName: "Type Stack", email: "hello@notifications.typestack.com")
+    )
+
+    #expect(result.canonicalKey == "domain:typestack.com")
+    #expect(result.displayName == "Type Stack")
+}
+
+@Test
+func organizationSenderExtractsMatchingFromNameFragment() {
+    let rules = EntityGroupingRules()
+
+    let result = rules.group(
+        sender: SenderIdentity(displayName: "Ryan at HELLO world", email: "bot@notifications.helloworld.dev")
+    )
+
+    #expect(result.canonicalKey == "domain:helloworld.dev")
+    #expect(result.displayName == "HELLO world")
+}
+
+@Test
+func organizationDisplayNameUsesFirstMatchingCandidate() {
+    let rules = EntityGroupingRules()
+
+    let displayName = rules.displayName(
+        forDomain: "github.com",
+        candidateDisplayNames: ["nextop-os/vibe-design", "GitHub"]
+    )
+
+    #expect(displayName == "GitHub")
+}
+
+@Test
+func organizationSenderIgnoresNonMatchingFromName() {
+    let rules = EntityGroupingRules()
+
+    let result = rules.group(
+        sender: SenderIdentity(displayName: "nextop-os/vibe-design", email: "notifications@github.com")
+    )
+
+    #expect(result.canonicalKey == "domain:github.com")
+    #expect(result.displayName == "Github")
+}
+
+@Test
 func organizationPersonalNameSenderGroupsByRootDomain() {
     let rules = EntityGroupingRules()
 
     let result = rules.group(sender: SenderIdentity(displayName: "Daniel", email: "daniel.z@posthog.com"))
 
     #expect(result.canonicalKey == "domain:posthog.com")
-    #expect(result.displayName == "Daniel")
+    #expect(result.displayName == "Posthog")
 }
 
 @Test
-func organizationSenderPrefersDisplayNameOverDomainLabel() {
+func organizationSenderUsesStableDomainDisplayName() {
     let rules = EntityGroupingRules()
 
     let result = rules.group(
@@ -46,7 +94,7 @@ func organizationSenderPrefersDisplayNameOverDomainLabel() {
     )
 
     #expect(result.canonicalKey == "domain:google.com")
-    #expect(result.displayName == "Google Accounts")
+    #expect(result.displayName == "Google")
     #expect(result.source == "organization-domain-rule")
 }
 

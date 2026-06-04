@@ -19,7 +19,10 @@ public struct MailiaEnvironment: Sendable {
         self.himalayaBridge = himalayaBridge
     }
 
-    public static func live(fileManager: FileManager = .default) throws -> MailiaEnvironment {
+    public static func live(
+        fileManager: FileManager = .default,
+        himalayaBridge: (any HimalayaBridge)? = nil
+    ) throws -> MailiaEnvironment {
         let supportRoot = try fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -40,7 +43,7 @@ public struct MailiaEnvironment: Sendable {
             applicationSupportDirectory: supportDirectory,
             databaseURL: supportDirectory.appendingPathComponent("mailia.sqlite"),
             downloadsDirectory: downloadsDirectory,
-            himalayaBridge: ProcessHimalayaBridge()
+            himalayaBridge: himalayaBridge ?? ProcessHimalayaBridge()
         )
     }
 
