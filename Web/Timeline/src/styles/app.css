@@ -517,7 +517,6 @@ button {
   line-height: 1.42;
 }
 
-.mail-body__content img,
 .mail-body__content table,
 .mail-body__content iframe,
 .mail-body__content video {
@@ -548,6 +547,12 @@ button {
 .mail-body__content table {
   width: auto;
   table-layout: auto;
+}
+
+.mail-body__content th,
+.mail-body__content td {
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 .mail-markdown {
