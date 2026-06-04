@@ -2762,34 +2762,32 @@ private struct SettingsView: View {
                 }
 
                 Section("Himalaya") {
-                    LabeledContent("Executable") {
-                        HStack(spacing: 8) {
-                            SettingsTextField(
-                                text: $himalayaDraft.path,
-                                placeholder: himalayaDraft.autoDetectedPath,
-                                alignment: .left,
-                                font: .systemFont(ofSize: 13),
-                                normalize: { MailiaHimalayaExecutableSettings.normalizedPath($0) }
-                            )
-                                .settingsFieldChrome()
-                                .frame(width: 380, height: 30)
-                                .help("Leave empty to use the automatically detected Himalaya executable.")
+                    HStack(alignment: .center, spacing: 8) {
+                        Text("Executable")
+                            .frame(width: 136, alignment: .trailing)
+                            .foregroundStyle(.primary)
 
-                            Button("Choose...") {
-                                chooseHimalayaExecutable()
-                            }
+                        SettingsTextField(
+                            text: $himalayaDraft.path,
+                            placeholder: himalayaDraft.autoDetectedPath,
+                            alignment: .left,
+                            font: .systemFont(ofSize: 13),
+                            normalize: { MailiaHimalayaExecutableSettings.normalizedPath($0) }
+                        )
+                            .settingsFieldChrome()
+                            .frame(width: 380, height: 30)
+                            .help("Leave empty to use the automatically detected Himalaya executable.")
 
-                            if himalayaDraft.isCustomPath {
-                                Button("Use Auto") {
-                                    himalayaDraft.path = ""
-                                }
+                        Button("Choose...") {
+                            chooseHimalayaExecutable()
+                        }
+
+                        if himalayaDraft.isCustomPath {
+                            Button("Use Auto") {
+                                himalayaDraft.path = ""
                             }
                         }
                     }
-
-                    Text(himalayaDraft.statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
 
                 Section("Files") {
@@ -3210,13 +3208,6 @@ private struct HimalayaExecutableSettingsDraft: Equatable {
 
     var effectivePath: String {
         normalizedPath.nilIfBlank ?? autoDetectedPath
-    }
-
-    var statusText: String {
-        if isCustomPath {
-            return "Using custom executable: \(effectivePath)"
-        }
-        return "Using automatically detected executable: \(effectivePath)"
     }
 
     static func saved(defaults: UserDefaults = .standard) -> HimalayaExecutableSettingsDraft {

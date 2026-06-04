@@ -112,6 +112,10 @@ final class BodyFetchQueue {
         case .notRequested:
             break
         case .loading:
+            guard pendingJobs[item.id] != nil || runningJobs[item.id] != nil else {
+                delegate.setBodyState(.notRequested, id: item.id)
+                break
+            }
             reprioritizeLoadIfNeeded(
                 for: item,
                 priority: priority,
