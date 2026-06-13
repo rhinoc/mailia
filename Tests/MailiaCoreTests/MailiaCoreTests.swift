@@ -41,7 +41,11 @@ func databaseMigrationCreatesKeyColumns() throws {
         "provider_hint",
         "display_name",
         "is_default",
-        "emoji"
+        "emoji",
+        "sort_order",
+        "last_sync_status",
+        "last_sync_error_message",
+        "last_sync_checked_at"
     ]))
 
     let messageColumns = try DatabaseSchemaInspector.columnNames(in: "messages", databaseQueue: databaseQueue)

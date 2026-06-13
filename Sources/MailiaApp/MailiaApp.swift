@@ -252,7 +252,7 @@ final class MailiaApplication: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshMailbox() {
-        Task { await viewModel.refresh() }
+        viewModel.startRefresh()
     }
 
     @objc private func confirmRefreshFullHistory() {
@@ -533,6 +533,7 @@ private struct ContentView: View {
                         refreshStatus: viewModel.refreshStatus,
                         refreshActivity: viewModel.refreshActivity,
                         avatarResolutionActivity: viewModel.avatarResolutionActivity,
+                        failedAccounts: viewModel.sendAccounts.filter(\.hasSyncFailure),
                         onRefresh: refresh
                     )
                 }
@@ -644,9 +645,7 @@ private struct ContentView: View {
     }
 
     private func refresh() {
-        Task {
-            await viewModel.refresh()
-        }
+        viewModel.startRefresh()
     }
 }
 
@@ -1122,6 +1121,7 @@ private struct RefreshToolbarContent: ToolbarContent {
     let refreshStatus: String
     let refreshActivity: MailiaRefreshProgress?
     let avatarResolutionActivity: MailiaRefreshProgress?
+    let failedAccounts: [MailiaSendAccount]
     let onRefresh: () -> Void
 
     var body: some ToolbarContent {
@@ -1131,6 +1131,7 @@ private struct RefreshToolbarContent: ToolbarContent {
                 refreshStatus: refreshStatus,
                 refreshActivity: refreshActivity,
                 avatarResolutionActivity: avatarResolutionActivity,
+                failedAccounts: failedAccounts,
                 action: onRefresh
             )
             .equatable()
@@ -1173,6 +1174,7 @@ private struct RefreshButton: View, Equatable {
     let refreshStatus: String
     let refreshActivity: MailiaRefreshProgress?
     let avatarResolutionActivity: MailiaRefreshProgress?
+    let failedAccounts: [MailiaSendAccount]
     let action: () -> Void
     @State private var isHovering = false
 
@@ -1205,7 +1207,8 @@ private struct RefreshButton: View, Equatable {
             RefreshStatusPopover(
                 refreshStatus: refreshStatus,
                 refreshActivity: refreshActivity,
-                avatarResolutionActivity: avatarResolutionActivity
+                avatarResolutionActivity: avatarResolutionActivity,
+                failedAccounts: failedAccounts
             )
         }
         .help("Refresh\n\(refreshStatus)")
@@ -1215,7 +1218,8 @@ private struct RefreshButton: View, Equatable {
         lhs.isRefreshing == rhs.isRefreshing &&
             lhs.refreshStatus == rhs.refreshStatus &&
             lhs.refreshActivity == rhs.refreshActivity &&
-            lhs.avatarResolutionActivity == rhs.avatarResolutionActivity
+            lhs.avatarResolutionActivity == rhs.avatarResolutionActivity &&
+            lhs.failedAccounts == rhs.failedAccounts
     }
 }
 
@@ -1223,6 +1227,7 @@ private struct RefreshStatusPopover: View {
     let refreshStatus: String
     let refreshActivity: MailiaRefreshProgress?
     let avatarResolutionActivity: MailiaRefreshProgress?
+    let failedAccounts: [MailiaSendAccount]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1236,10 +1241,15 @@ private struct RefreshStatusPopover: View {
                 Divider()
                 RefreshProgressSection(activity: avatarActivity)
             }
+
+            if !failedAccounts.isEmpty {
+                Divider()
+                RefreshAccountIssuesSection(accounts: failedAccounts)
+            }
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 11)
-        .frame(width: 286, alignment: .leading)
+        .frame(width: 320, alignment: .leading)
     }
 }
 
@@ -1257,6 +1267,33 @@ private struct RefreshStatusSection: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct RefreshAccountIssuesSection: View {
+    let accounts: [MailiaSendAccount]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text("Account issues")
+                    .font(.callout.weight(.semibold))
+            }
+
+            ForEach(accounts) { account in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(account.emailAddress ?? account.label)
+                        .font(.caption.weight(.semibold))
+                    Text(account.syncIssueMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 }
@@ -2644,6 +2681,8 @@ private struct SettingsView: View {
     @State private var downloadsDraft: DownloadsSettingsDraft
     @State private var composerDraft: MailiaComposerSettings
     @State private var accountDrafts: [String: AccountSettingsDraft] = [:]
+    @State private var draggingAccountID: String?
+    @State private var accountRowFrames: [String: CGRect] = [:]
 
     init(viewModel: AppViewModel) {
         self.viewModel = viewModel
@@ -2655,7 +2694,7 @@ private struct SettingsView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        VStack(spacing: 0) {
             Form {
                 Section("Accounts") {
                     if viewModel.sendAccounts.isEmpty {
@@ -2670,6 +2709,8 @@ private struct SettingsView: View {
                         }
                     } else {
                         HStack(spacing: 12) {
+                            Text("")
+                                .frame(width: 20)
                             Text("Account")
                                 .frame(minWidth: 260, maxWidth: .infinity, alignment: .leading)
                             Text("Alias")
@@ -2682,18 +2723,8 @@ private struct SettingsView: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
 
-                        ForEach(viewModel.sendAccounts) { account in
-                            AccountSettingsRow(
-                                account: account,
-                                draft: binding(for: account),
-                                fallbackEmoji: AccountEmojiFallback.emoji(
-                                    for: account.id,
-                                    in: viewModel.sendAccounts
-                                ),
-                                onDefaultChange: {
-                                    setDraftDefault(accountID: account.id)
-                                }
-                            )
+                        ForEach(settingsAccounts) { account in
+                            accountSettingsRow(for: account)
                         }
                     }
                 }
@@ -2821,18 +2852,19 @@ private struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .coordinateSpace(name: AccountSettingsDragCoordinateSpace.name)
+            .onPreferenceChange(AccountSettingsRowFramePreferenceKey.self) { frames in
+                accountRowFrames = frames
+            }
             .scrollContentBackground(.hidden)
             .background(MailiaSettingsChrome.backgroundColor)
-            .padding()
+            .padding(.top)
+            .padding(.horizontal)
 
-            if hasUnsavedSettingsChanges {
-                settingsSaveBar
-                    .padding(.trailing, 18)
-                    .padding(.bottom, 14)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
+            Divider()
+
+            settingsFooter
         }
-        .animation(.easeOut(duration: 0.16), value: hasUnsavedSettingsChanges)
         .frame(width: 700, height: 560)
         .background(MailiaSettingsChrome.backgroundColor)
         .task {
@@ -2850,23 +2882,24 @@ private struct SettingsView: View {
         }
     }
 
-    private var settingsSaveBar: some View {
+    private var settingsFooter: some View {
         HStack(spacing: 8) {
+            Spacer()
+
             Button("Reset") {
                 resetSettingsDrafts()
             }
+            .disabled(!hasUnsavedSettingsChanges)
+
             Button("Save") {
                 saveSettingsDrafts()
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!hasUnsavedSettingsChanges)
         }
-        .padding(8)
-        .background {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .windowBackgroundColor))
-                .shadow(color: Color.black.opacity(0.12), radius: 12, y: 4)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private var savedAppearanceDraft: TimelineDisplayOptions {
@@ -2926,6 +2959,44 @@ private struct SettingsView: View {
             let saved = AccountSettingsDraft(account: account)
             return (accountDrafts[account.id] ?? saved) != saved
         }
+    }
+
+    private var settingsAccounts: [MailiaSendAccount] {
+        AccountSettingsSort.sorted(viewModel.sendAccounts, drafts: accountDrafts)
+    }
+
+    @ViewBuilder
+    private func accountSettingsRow(for account: MailiaSendAccount) -> some View {
+        let draft = accountDrafts[account.id] ?? AccountSettingsDraft(account: account)
+        let isDefault = draft.isDefault
+        let row = AccountSettingsRow(
+            account: account,
+            draft: binding(for: account),
+            fallbackEmoji: AccountEmojiFallback.emoji(
+                for: account.id,
+                in: viewModel.sendAccounts
+            ),
+            showsDragHandle: !isDefault,
+            isDragging: draggingAccountID == account.id,
+            onDragChanged: { value in
+                updateDraggedAccount(account.id, locationY: value.location.y)
+            },
+            onDragEnded: {
+                draggingAccountID = nil
+            },
+            onDefaultChange: {
+                setDraftDefault(accountID: account.id)
+            }
+        )
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: AccountSettingsRowFramePreferenceKey.self,
+                        value: [account.id: proxy.frame(in: .named(AccountSettingsDragCoordinateSpace.name))]
+                    )
+                }
+            }
+        row
     }
 
     private func binding(for account: MailiaSendAccount) -> Binding<AccountSettingsDraft> {
@@ -3024,7 +3095,8 @@ private struct SettingsView: View {
                     accountKey: account.id,
                     displayName: draft.alias != saved.alias ? draft.alias : nil,
                     emoji: draft.emoji != saved.emoji ? draft.emoji : nil,
-                    isDefault: nil
+                    isDefault: nil,
+                    sortOrder: draft.sortOrder != saved.sortOrder ? draft.sortOrder : nil
                 ))
             }
 
@@ -3036,7 +3108,8 @@ private struct SettingsView: View {
                     accountKey: defaultAccountID,
                     displayName: nil,
                     emoji: nil,
-                    isDefault: true
+                    isDefault: true,
+                    sortOrder: nil
                 ))
             }
 
@@ -3051,6 +3124,56 @@ private struct SettingsView: View {
             var draft = accountDrafts[account.id] ?? AccountSettingsDraft(account: account)
             draft.isDefault = account.id == accountID
             accountDrafts[account.id] = draft
+        }
+    }
+
+    private func updateDraggedAccount(_ draggedAccountID: String, locationY: CGFloat) {
+        if draggingAccountID == nil {
+            draggingAccountID = draggedAccountID
+        }
+        guard viewModel.sendAccounts.contains(where: { $0.id == draggedAccountID })
+        else {
+            return
+        }
+
+        var orderedIDs = settingsAccounts.map(\.id).filter { $0 != draggedAccountID }
+        var insertionIndex = orderedIDs.firstIndex { accountID in
+            guard let frame = accountRowFrames[accountID] else { return false }
+            return locationY < frame.midY
+        } ?? orderedIDs.endIndex
+
+        if insertionIndex == 0,
+           let firstID = orderedIDs.first,
+           accountDrafts[firstID]?.isDefault
+            ?? viewModel.sendAccounts.first(where: { $0.id == firstID })?.isDefault
+            ?? false {
+            insertionIndex = orderedIDs.index(after: insertionIndex)
+        }
+
+        orderedIDs.insert(draggedAccountID, at: insertionIndex)
+        guard orderedIDs != settingsAccounts.map(\.id) else { return }
+
+        withAnimation(.easeOut(duration: 0.12)) {
+            applyAccountOrder(orderedIDs)
+        }
+    }
+
+    private func applyAccountOrder(_ accountIDs: [String]) {
+        var orderedIDs = accountIDs
+        if let defaultIndex = orderedIDs.firstIndex(where: { id in
+            accountDrafts[id]?.isDefault
+                ?? viewModel.sendAccounts.first(where: { $0.id == id })?.isDefault
+                ?? false
+        }) {
+            let defaultID = orderedIDs.remove(at: defaultIndex)
+            orderedIDs.insert(defaultID, at: 0)
+        }
+
+        for (index, id) in orderedIDs.enumerated() {
+            guard let account = viewModel.sendAccounts.first(where: { $0.id == id }) else { continue }
+            var draft = accountDrafts[id] ?? AccountSettingsDraft(account: account)
+            draft.sortOrder = index
+            accountDrafts[id] = draft
         }
     }
 
@@ -3086,26 +3209,67 @@ private struct AccountSettingsRow: View {
     let account: MailiaSendAccount
     @Binding var draft: AccountSettingsDraft
     let fallbackEmoji: String
+    let showsDragHandle: Bool
+    let isDragging: Bool
+    let onDragChanged: (DragGesture.Value) -> Void
+    let onDragEnded: () -> Void
     let onDefaultChange: () -> Void
 
     init(
         account: MailiaSendAccount,
         draft: Binding<AccountSettingsDraft>,
         fallbackEmoji: String,
+        showsDragHandle: Bool,
+        isDragging: Bool,
+        onDragChanged: @escaping (DragGesture.Value) -> Void,
+        onDragEnded: @escaping () -> Void,
         onDefaultChange: @escaping () -> Void
     ) {
         self.account = account
         _draft = draft
         self.fallbackEmoji = fallbackEmoji
+        self.showsDragHandle = showsDragHandle
+        self.isDragging = isDragging
+        self.onDragChanged = onDragChanged
+        self.onDragEnded = onDragEnded
         self.onDefaultChange = onDefaultChange
     }
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
+            if showsDragHandle {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 20, height: 30)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(
+                            minimumDistance: 1,
+                            coordinateSpace: .named(AccountSettingsDragCoordinateSpace.name)
+                        )
+                        .onChanged(onDragChanged)
+                        .onEnded { _ in onDragEnded() }
+                    )
+                    .help("Drag to reorder")
+            } else {
+                Color.clear
+                    .frame(width: 20, height: 30)
+            }
+
             VStack(alignment: .leading, spacing: 4) {
-                Text(primaryTitle)
-                    .font(.body.weight(.semibold))
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(primaryTitle)
+                        .font(.body.weight(.semibold))
+                        .lineLimit(1)
+
+                    if account.hasSyncFailure {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .help(account.syncIssueTooltip)
+                    }
+                }
             }
             .frame(minWidth: 260, maxWidth: .infinity, alignment: .leading)
 
@@ -3143,12 +3307,25 @@ private struct AccountSettingsRow: View {
                 .frame(width: 76, height: 30)
                 .help("Set an emoji to identify this mailbox in the timeline and composer.")
         }
+        .opacity(isDragging ? 0.78 : 1)
     }
 
     private var primaryTitle: String {
         account.emailAddress ?? account.id
     }
 
+}
+
+private enum AccountSettingsDragCoordinateSpace {
+    static let name = "MailiaAccountSettingsRows"
+}
+
+private struct AccountSettingsRowFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
 }
 
 private enum SettingsSyncMode: String, CaseIterable, Identifiable {
@@ -3358,17 +3535,49 @@ private struct AccountSettingsDraft: Equatable {
     var alias: String
     var emoji: String
     var isDefault: Bool
+    var sortOrder: Int?
 
-    init(alias: String, emoji: String, isDefault: Bool) {
+    init(alias: String, emoji: String, isDefault: Bool, sortOrder: Int?) {
         self.alias = alias
         self.emoji = emoji
         self.isDefault = isDefault
+        self.sortOrder = sortOrder
     }
 
     init(account: MailiaSendAccount) {
         self.alias = AccountAliasDisplay.effectiveAlias(for: account)
         self.emoji = account.emoji ?? ""
         self.isDefault = account.isDefault
+        self.sortOrder = account.sortOrder
+    }
+}
+
+private enum AccountSettingsSort {
+    static func sorted(
+        _ accounts: [MailiaSendAccount],
+        drafts: [String: AccountSettingsDraft]
+    ) -> [MailiaSendAccount] {
+        accounts.sorted { lhs, rhs in
+            let lhsDraft = drafts[lhs.id]
+            let rhsDraft = drafts[rhs.id]
+            let lhsIsDefault = lhsDraft?.isDefault ?? lhs.isDefault
+            let rhsIsDefault = rhsDraft?.isDefault ?? rhs.isDefault
+
+            if lhsIsDefault != rhsIsDefault {
+                return lhsIsDefault
+            }
+
+            switch (lhsDraft?.sortOrder ?? lhs.sortOrder, rhsDraft?.sortOrder ?? rhs.sortOrder) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            default:
+                return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+            }
+        }
     }
 }
 

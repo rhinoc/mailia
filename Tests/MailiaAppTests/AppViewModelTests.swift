@@ -221,6 +221,38 @@ func refreshFailureKeepsCurrentEntitiesAndReportsRefreshFailure() async {
 
 @MainActor
 @Test
+func startRefreshPublishesRefreshingStateImmediately() async {
+    let refreshedSnapshot = MailiaSnapshot(
+        entities: [mailiaEntitySummary(id: 1, displayName: "Alice")],
+        sendAccounts: [],
+        loadedAt: Date()
+    )
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [],
+        refreshSnapshots: [refreshedSnapshot],
+        refreshDelayNanoseconds: 100_000_000
+    )
+    let viewModel = AppViewModel(provider: provider)
+
+    viewModel.startRefresh()
+
+    #expect(viewModel.isRefreshing)
+    #expect(viewModel.refreshStatus == "Refreshing...")
+    #expect(viewModel.refreshActivity?.title == "Refreshing")
+
+    await waitUntil {
+        provider.refreshCallCount == 1
+    }
+
+    #expect(provider.refreshCallCount == 1)
+
+    await waitUntil {
+        !viewModel.isRefreshing
+    }
+}
+
+@MainActor
+@Test
 func newerTimelineRefreshDrivesGlobalRefreshState() async {
     let initialEntity = mailiaEntitySummary(id: 1, displayName: "Alice", accountKeys: ["gmail"])
     let initialSnapshot = MailiaSnapshot(
@@ -561,6 +593,10 @@ private func mailiaSendAccount(
         displayName: nil,
         isDefault: isDefault,
         emoji: nil,
+        sortOrder: nil,
+        syncStatus: nil,
+        syncErrorMessage: nil,
+        syncCheckedAt: nil,
         avatarImageDataURL: nil
     )
 }

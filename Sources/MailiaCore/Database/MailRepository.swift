@@ -23,14 +23,15 @@ public struct MailRepository {
                 try db.execute(
                     sql: """
                         INSERT INTO accounts (
-                            account_key, email_address, provider_hint, display_name, is_default, updated_at
+                            account_key, email_address, provider_hint, display_name, is_default, sort_order, updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(account_key) DO UPDATE SET
                             email_address = excluded.email_address,
                             provider_hint = excluded.provider_hint,
                             display_name = excluded.display_name,
                             is_default = excluded.is_default,
+                            sort_order = COALESCE(excluded.sort_order, accounts.sort_order),
                             updated_at = CURRENT_TIMESTAMP
                         """,
                     arguments: [
@@ -38,7 +39,8 @@ public struct MailRepository {
                         account.emailAddress?.nilIfBlank,
                         account.providerHint?.nilIfBlank,
                         account.displayName?.nilIfBlank,
-                        account.isDefault
+                        account.isDefault,
+                        account.sortOrder
                     ]
                 )
             }
@@ -50,9 +52,10 @@ public struct MailRepository {
             try Row.fetchAll(
                 db,
                 sql: """
-                    SELECT account_key, email_address, provider_hint, display_name, is_default, emoji
+                    SELECT account_key, email_address, provider_hint, display_name, is_default, emoji, sort_order,
+                           last_sync_status, last_sync_error_message, last_sync_checked_at
                     FROM accounts
-                    ORDER BY account_key
+                    ORDER BY is_default DESC, sort_order IS NULL, sort_order, account_key
                     """
             )
             .map { row in
@@ -62,7 +65,11 @@ public struct MailRepository {
                     providerHint: row["provider_hint"],
                     displayName: row["display_name"],
                     isDefault: row["is_default"],
-                    emoji: row["emoji"]
+                    emoji: row["emoji"],
+                    sortOrder: row["sort_order"],
+                    syncStatus: row["last_sync_status"],
+                    syncErrorMessage: row["last_sync_error_message"],
+                    syncCheckedAt: Self.parseCheckpointDate(row["last_sync_checked_at"] as String?)
                 )
             }
         }
@@ -80,6 +87,51 @@ public struct MailRepository {
                     WHERE account_key = ?
                     """,
                 arguments: [emoji?.nilIfBlank, trimmedKey]
+            )
+        }
+    }
+
+    public func updateAccountSortOrder(accountKey: String, sortOrder: Int?) throws {
+        let trimmedKey = accountKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else { return }
+
+        try databaseQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE accounts
+                    SET sort_order = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE account_key = ?
+                    """,
+                arguments: [sortOrder, trimmedKey]
+            )
+        }
+    }
+
+    public func markAccountSyncStatus(
+        accountKey: String,
+        status: String,
+        errorMessage: String? = nil,
+        at date: Date = Date()
+    ) throws {
+        let trimmedKey = accountKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else { return }
+
+        try databaseQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE accounts
+                    SET last_sync_status = ?,
+                        last_sync_error_message = ?,
+                        last_sync_checked_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE account_key = ?
+                    """,
+                arguments: [
+                    status.nilIfBlank,
+                    Self.normalizedSyncError(errorMessage),
+                    Self.formatCheckpointDate(date),
+                    trimmedKey
+                ]
             )
         }
     }
@@ -373,6 +425,7 @@ public struct MailRepository {
                         e.kind,
                         latest.id AS latest_message_id,
                         latest.subject AS latest_subject,
+                        GROUP_CONCAT(DISTINCT search_message.subject) AS searchable_text,
                         latest_body.text_fallback AS latest_body_preview,
                         COALESCE(latest.message_date, latest.created_at) AS latest_message_date,
                         \(latestMessageSortKey) AS latest_sort_key,
@@ -383,6 +436,7 @@ public struct MailRepository {
                     JOIN entities e ON e.id = wm.entity_id
                     JOIN latest_messages lm ON lm.entity_id = wm.entity_id
                     JOIN messages latest ON latest.id = lm.message_id
+                    LEFT JOIN messages search_message ON search_message.id = wm.message_id
                     LEFT JOIN message_bodies latest_body
                       ON latest_body.message_id = latest.id
                      AND latest_body.sanitizer_version = \(EmailHTMLDisplayPipeline.sanitizerVersion)
@@ -401,6 +455,7 @@ public struct MailRepository {
                     primaryEmailAddress: row["primary_email_address"],
                     emailAddresses: splitCommaSeparatedValues(row["email_addresses"]),
                     latestSubject: row["latest_subject"],
+                    searchableText: row["searchable_text"],
                     latestBodyPreview: row["latest_body_preview"],
                     latestMessageID: row["latest_message_id"],
                     latestDate: HimalayaDateParser.parse(row["latest_message_date"] as String?),
@@ -1583,6 +1638,18 @@ public struct MailRepository {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return formatter.date(from: value)
+    }
+
+    private static func normalizedSyncError(_ value: String?) -> String? {
+        guard let value = value?.nilIfBlank else { return nil }
+        let singleLine = value
+            .replacingOccurrences(of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !singleLine.isEmpty else { return nil }
+        return String(singleLine.prefix(800))
     }
 }
 

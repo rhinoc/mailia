@@ -124,7 +124,37 @@ struct MailiaSendAccount: Identifiable, Equatable, Sendable {
     let displayName: String?
     let isDefault: Bool
     let emoji: String?
+    let sortOrder: Int?
+    let syncStatus: String?
+    let syncErrorMessage: String?
+    let syncCheckedAt: Date?
     let avatarImageDataURL: String?
+
+    init(
+        id: String,
+        label: String,
+        emailAddress: String?,
+        displayName: String?,
+        isDefault: Bool,
+        emoji: String?,
+        sortOrder: Int? = nil,
+        syncStatus: String? = nil,
+        syncErrorMessage: String? = nil,
+        syncCheckedAt: Date? = nil,
+        avatarImageDataURL: String?
+    ) {
+        self.id = id
+        self.label = label
+        self.emailAddress = emailAddress
+        self.displayName = displayName
+        self.isDefault = isDefault
+        self.emoji = emoji
+        self.sortOrder = sortOrder
+        self.syncStatus = syncStatus
+        self.syncErrorMessage = syncErrorMessage
+        self.syncCheckedAt = syncCheckedAt
+        self.avatarImageDataURL = avatarImageDataURL
+    }
 }
 
 struct MailiaAccountSettingsUpdate: Equatable, Sendable {
@@ -132,6 +162,21 @@ struct MailiaAccountSettingsUpdate: Equatable, Sendable {
     var displayName: String?
     var emoji: String?
     var isDefault: Bool?
+    var sortOrder: Int?
+
+    init(
+        accountKey: String,
+        displayName: String?,
+        emoji: String?,
+        isDefault: Bool?,
+        sortOrder: Int? = nil
+    ) {
+        self.accountKey = accountKey
+        self.displayName = displayName
+        self.emoji = emoji
+        self.isDefault = isDefault
+        self.sortOrder = sortOrder
+    }
 }
 
 extension MailiaSendAccount {
@@ -148,6 +193,10 @@ extension MailiaSendAccount {
             displayName: displayName,
             isDefault: account.isDefault,
             emoji: account.emoji?.nilIfBlank,
+            sortOrder: account.sortOrder,
+            syncStatus: account.syncStatus?.nilIfBlank,
+            syncErrorMessage: account.syncErrorMessage?.nilIfBlank,
+            syncCheckedAt: account.syncCheckedAt,
             avatarImageDataURL: nil
         )
     }
@@ -155,6 +204,20 @@ extension MailiaSendAccount {
     var menuLabel: String {
         let base = emailAddress ?? label
         return Self.prefixed(base, emoji: emoji)
+    }
+
+    var hasSyncFailure: Bool {
+        syncStatus?.caseInsensitiveCompare("failed") == .orderedSame
+            || syncErrorMessage?.nilIfBlank != nil
+    }
+
+    var syncIssueMessage: String {
+        syncErrorMessage?.nilIfBlank ?? "Unable to sync this account."
+    }
+
+    var syncIssueTooltip: String {
+        let accountLabel = emailAddress ?? label
+        return "\(accountLabel)\n\(syncIssueMessage)"
     }
 
     static func prefixed(_ label: String, emoji: String?) -> String {
@@ -479,6 +542,14 @@ final class AppViewModel: ObservableObject {
     func refresh() async {
         guard !isRefreshing else { return }
         await loadSnapshot(statusPrefix: "Refreshed", refresh: true)
+    }
+
+    func startRefresh() {
+        guard !isRefreshing else { return }
+        beginRefreshPresentation(title: "Refreshing")
+        Task { [weak self] in
+            await self?.loadSnapshot(statusPrefix: "Refreshed", refresh: true)
+        }
     }
 
     func refreshFullHistory() async {
@@ -1229,15 +1300,7 @@ final class AppViewModel: ObservableObject {
         let workspaceSnapshot = workspace
         let searchQuerySnapshot = searchQuery
         let refreshOptions = refresh ? (explicitRefreshOptions ?? currentRefreshOptions()) : MailiaRefreshOptions()
-        isRefreshing = true
-        isLoadingEntityList = true
-        refreshStatus = refresh ? "Refreshing..." : "Loading..."
-        refreshActivity = MailiaRefreshProgress(
-            phase: .discovering,
-            title: refresh ? "Refreshing" : "Loading",
-            detail: nil,
-            fraction: nil
-        )
+        beginRefreshPresentation(title: refresh ? "Refreshing" : "Loading")
         defer {
             if generation == requestGeneration {
                 partialRefreshSnapshotTask?.cancel()
@@ -1300,6 +1363,7 @@ final class AppViewModel: ObservableObject {
             guard generation == requestGeneration else { return }
 
             applySnapshot(snapshot, reloadTimelineIfSelectionKept: refresh || publishedSnapshotBeforeRefresh)
+            await refreshSendAccounts()
             refreshStatus = "\(finalStatusPrefix) \(Self.statusFormatter.string(from: snapshot.loadedAt))"
         } catch is CancellationError {
             return
@@ -1326,6 +1390,7 @@ final class AppViewModel: ObservableObject {
                 timelineBodyStates = [:]
                 resetTimelineWindowState()
             }
+            await refreshSendAccounts()
             refreshStatus = failureStatus
         }
     }
@@ -1344,6 +1409,18 @@ final class AppViewModel: ObservableObject {
         return now().timeIntervalSince(lastRefreshFinishedAt) > stalenessThreshold
     }
 
+    private func beginRefreshPresentation(title: String) {
+        isRefreshing = true
+        isLoadingEntityList = true
+        refreshStatus = "\(title)..."
+        refreshActivity = MailiaRefreshProgress(
+            phase: .discovering,
+            title: title,
+            detail: nil,
+            fraction: nil
+        )
+    }
+
     private func refreshSendAccountsInBackground() {
         sendAccountsRefreshTask?.cancel()
         sendAccountsRefreshTask = Task { [weak self] in
@@ -1358,6 +1435,14 @@ final class AppViewModel: ObservableObject {
                 NSLog("Unable to refresh send accounts: \(error.localizedDescription)")
             }
             sendAccountsRefreshTask = nil
+        }
+    }
+
+    private func refreshSendAccounts() async {
+        do {
+            applySendAccounts(try await provider.loadSendAccounts())
+        } catch {
+            NSLog("Unable to refresh send accounts: \(error.localizedDescription)")
         }
     }
 
@@ -2008,6 +2093,10 @@ final class AppViewModel: ObservableObject {
             displayName: account.displayName,
             isDefault: account.isDefault,
             emoji: account.emoji,
+            sortOrder: account.sortOrder,
+            syncStatus: account.syncStatus,
+            syncErrorMessage: account.syncErrorMessage,
+            syncCheckedAt: account.syncCheckedAt,
             avatarImageDataURL: avatarImageDataURL?.nilIfBlank
         )
     }

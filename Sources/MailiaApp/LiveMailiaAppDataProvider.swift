@@ -272,20 +272,29 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             NSLog("Unable to refresh configured accounts: \(error.localizedDescription)")
         }
         let storedAccounts = try repository.accounts()
-        return storedAccounts.map(MailiaSendAccount.init).sorted { lhs, rhs in
-            if lhs.isDefault != rhs.isDefault {
-                return lhs.isDefault
-            }
-            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
-        }
+        return Self.sortedSendAccounts(storedAccounts.map(MailiaSendAccount.init))
     }
 
     private func localSendAccounts() throws -> [MailiaSendAccount] {
-        try repository.accounts().map(MailiaSendAccount.init).sorted { lhs, rhs in
+        try Self.sortedSendAccounts(repository.accounts().map(MailiaSendAccount.init))
+    }
+
+    private static func sortedSendAccounts(_ accounts: [MailiaSendAccount]) -> [MailiaSendAccount] {
+        accounts.sorted { lhs, rhs in
             if lhs.isDefault != rhs.isDefault {
                 return lhs.isDefault
             }
-            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+
+            switch (lhs.sortOrder, rhs.sortOrder) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            default:
+                return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+            }
         }
     }
 
@@ -308,6 +317,13 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 try repository.updateAccountEmoji(
                     accountKey: update.accountKey,
                     emoji: MailiaSendAccount.normalizedEmoji(emoji)
+                )
+            }
+
+            if let sortOrder = update.sortOrder {
+                try repository.updateAccountSortOrder(
+                    accountKey: update.accountKey,
+                    sortOrder: sortOrder
                 )
             }
         }
@@ -1376,6 +1392,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                     || (item.primaryEmailAddress?.localizedCaseInsensitiveContains(query) ?? false)
                     || item.emailAddresses.joined(separator: " ").localizedCaseInsensitiveContains(query)
                     || (item.latestSubject?.localizedCaseInsensitiveContains(query) ?? false)
+                    || (item.searchableText?.localizedCaseInsensitiveContains(query) ?? false)
                     || item.accountKeys.joined(separator: " ").localizedCaseInsensitiveContains(query)
             }
             .map { item in

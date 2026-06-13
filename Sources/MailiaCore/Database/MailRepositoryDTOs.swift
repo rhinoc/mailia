@@ -7,6 +7,10 @@ public struct DiscoveredAccount: Equatable, Sendable {
     public var displayName: String?
     public var isDefault: Bool
     public var emoji: String?
+    public var sortOrder: Int?
+    public var syncStatus: String?
+    public var syncErrorMessage: String?
+    public var syncCheckedAt: Date?
 
     public init(
         accountKey: String,
@@ -14,7 +18,11 @@ public struct DiscoveredAccount: Equatable, Sendable {
         providerHint: String? = nil,
         displayName: String? = nil,
         isDefault: Bool = false,
-        emoji: String? = nil
+        emoji: String? = nil,
+        sortOrder: Int? = nil,
+        syncStatus: String? = nil,
+        syncErrorMessage: String? = nil,
+        syncCheckedAt: Date? = nil
     ) {
         self.accountKey = accountKey
         self.emailAddress = emailAddress
@@ -22,6 +30,10 @@ public struct DiscoveredAccount: Equatable, Sendable {
         self.displayName = displayName
         self.isDefault = isDefault
         self.emoji = emoji
+        self.sortOrder = sortOrder
+        self.syncStatus = syncStatus
+        self.syncErrorMessage = syncErrorMessage
+        self.syncCheckedAt = syncCheckedAt
     }
 }
 

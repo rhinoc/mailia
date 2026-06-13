@@ -362,6 +362,44 @@ func repositoryOrdersEntityMessagesByParsedDateAcrossTimeZones() throws {
 }
 
 @Test
+func repositoryExposesHistoricalSubjectsForEntitySearch() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "outlook", emailAddress: "ryan@example.com")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "outlook", providerName: "INBOX", role: .normal)
+    ])
+
+    let paddle = MailAddress(displayName: "Paddle", emailAddress: "help@paddle.com")
+    try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "outlook",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "order",
+            subject: "Your order: Swish",
+            from: paddle,
+            messageDate: "2019-06-30T02:41:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "outlook",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "receipt",
+            subject: "Your Highly Opinionated Purchases",
+            from: paddle,
+            messageDate: "2019-06-30T02:43:00Z"
+        )
+    ])
+
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+    #expect(entity.displayName == "Paddle")
+    #expect(entity.latestSubject == "Your Highly Opinionated Purchases")
+    #expect(entity.searchableText?.contains("Your order: Swish") == true)
+}
+
+@Test
 func repositoryComputesDirectionPerEntityWhenSelfOwnedAccountsExchangeMail() throws {
     let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
@@ -629,6 +667,36 @@ func accountDefaultPersistsAsStructuredState() throws {
     accounts = try repository.accounts()
     #expect(accounts.first { $0.accountKey == "work" }?.isDefault == false)
     #expect(accounts.first { $0.accountKey == "personal" }?.isDefault == true)
+}
+
+@Test
+func accountSortOrderPersistsAndSurvivesDiscoveryRefresh() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", isDefault: true),
+        DiscoveredAccount(accountKey: "personal"),
+        DiscoveredAccount(accountKey: "billing")
+    ])
+
+    try repository.updateAccountSortOrder(accountKey: "work", sortOrder: 0)
+    try repository.updateAccountSortOrder(accountKey: "billing", sortOrder: 1)
+    try repository.updateAccountSortOrder(accountKey: "personal", sortOrder: 2)
+
+    var accounts = try repository.accounts()
+    #expect(accounts.map(\.accountKey) == ["work", "billing", "personal"])
+    #expect(accounts.map(\.sortOrder) == [0, 1, 2])
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "work@example.com", isDefault: true),
+        DiscoveredAccount(accountKey: "personal", emailAddress: "personal@example.com"),
+        DiscoveredAccount(accountKey: "billing", emailAddress: "billing@example.com")
+    ])
+
+    accounts = try repository.accounts()
+    #expect(accounts.map(\.accountKey) == ["work", "billing", "personal"])
+    #expect(accounts.map(\.sortOrder) == [0, 1, 2])
 }
 
 @Test

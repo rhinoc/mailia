@@ -58,6 +58,7 @@ public struct SyncService {
                 $0.discoveredFolder(accountKey: accountKey)
             }
         try repository.upsertFolders(folders)
+        try repository.markAccountSyncStatus(accountKey: accountKey, status: "ok")
         return folders
     }
 
@@ -76,6 +77,11 @@ public struct SyncService {
                             throw error
                         } catch let error as HimalayaError {
                             NSLog("Unable to discover folders for account \(account.accountKey): \(error.localizedDescription)")
+                            try? repository.markAccountSyncStatus(
+                                accountKey: account.accountKey,
+                                status: "failed",
+                                errorMessage: error.localizedDescription
+                            )
                             return []
                         }
                     }
@@ -165,6 +171,9 @@ public struct SyncService {
                     startedAt: accountSyncStartedAt,
                     finishedAt: nowProvider()
                 )
+            }
+            if !accountFolders.isEmpty, !outcome.hadFailure {
+                try repository.markAccountSyncStatus(accountKey: accountKey, status: "ok")
             }
             return outcome
         }
@@ -404,6 +413,11 @@ public struct SyncService {
         } catch let error as HimalayaError {
             NSLog(
                 "Unable to sync folder \(folder.providerName) for account \(folder.accountKey) in \(workspace.rawValue): \(error.localizedDescription)"
+            )
+            try? repository.markAccountSyncStatus(
+                accountKey: folder.accountKey,
+                status: "failed",
+                errorMessage: error.localizedDescription
             )
             onFolderSynced?(0)
             return SyncFoldersOutcome(syncedCount: 0, hadFailure: true)

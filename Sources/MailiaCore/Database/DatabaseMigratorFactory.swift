@@ -216,6 +216,23 @@ public enum DatabaseMigratorFactory {
             }
         }
 
+        migrator.registerMigration("v6_account_sort_order") { db in
+            let columns = Set(try db.columns(in: "accounts").map(\.name))
+            if !columns.contains("sort_order") {
+                try db.execute(sql: "ALTER TABLE accounts ADD COLUMN sort_order INTEGER")
+            }
+        }
+
+        migrator.registerMigration("v7_account_sync_status") { db in
+            let columns = Set(try db.columns(in: "accounts").map(\.name))
+            if !columns.contains("last_sync_error_message") {
+                try db.execute(sql: "ALTER TABLE accounts ADD COLUMN last_sync_error_message TEXT")
+            }
+            if !columns.contains("last_sync_checked_at") {
+                try db.execute(sql: "ALTER TABLE accounts ADD COLUMN last_sync_checked_at TEXT")
+            }
+        }
+
         return migrator
     }
 }
