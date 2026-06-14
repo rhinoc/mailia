@@ -48,6 +48,9 @@ protocol BodyFetchQueueDelegate: AnyObject {
 
 @MainActor
 final class BodyFetchQueue {
+    nonisolated private static let selectedPageStartDelayNanoseconds: UInt64 = 150_000_000
+    nonisolated private static let previewStartDelayNanoseconds: UInt64 = 350_000_000
+
     private struct PendingJob {
         var item: MailiaTimelineItem
         var priority: BodyFetchPriority
@@ -65,24 +68,31 @@ final class BodyFetchQueue {
 
     private let provider: any MailiaAppDataProviding
     private let maxConcurrentBodyLoads: Int
+    private let startDelayNanoseconds: (BodyFetchPriority) -> UInt64
 
     weak var delegate: (any BodyFetchQueueDelegate)?
 
     private var pendingJobs: [Int64: PendingJob] = [:]
     private var runningJobs: [Int64: RunningJob] = [:]
     private var loadTasks: [Int64: Task<Void, Never>] = [:]
+    private var delayedStartTask: Task<Void, Never>?
     private var nextSequence = 0
     private var nextLoadToken = 0
 
     init(
         provider: any MailiaAppDataProviding,
-        maxConcurrentBodyLoads: Int = 3
+        maxConcurrentBodyLoads: Int = 3,
+        startDelayNanoseconds: ((BodyFetchPriority) -> UInt64)? = nil
     ) {
         self.provider = provider
         self.maxConcurrentBodyLoads = maxConcurrentBodyLoads
+        self.startDelayNanoseconds = startDelayNanoseconds ?? { priority in
+            BodyFetchQueue.defaultStartDelayNanoseconds(for: priority)
+        }
     }
 
     deinit {
+        delayedStartTask?.cancel()
         for task in loadTasks.values {
             task.cancel()
         }
@@ -149,6 +159,8 @@ final class BodyFetchQueue {
     }
 
     func cancelAll() {
+        delayedStartTask?.cancel()
+        delayedStartTask = nil
         let cancelledIDs = Set(pendingJobs.keys)
             .union(runningJobs.keys)
             .union(loadTasks.keys)
@@ -174,16 +186,29 @@ final class BodyFetchQueue {
                 delegate?.setBodyState(.notRequested, id: id)
             }
         }
+        if pendingJobs.isEmpty {
+            delayedStartTask?.cancel()
+            delayedStartTask = nil
+        }
     }
 
     private func startPendingLoads() {
+        delayedStartTask?.cancel()
+        delayedStartTask = nil
+
         while runningJobs.count < maxConcurrentBodyLoads {
             guard let nextID = nextPendingLoadID(),
-                  let job = pendingJobs.removeValue(forKey: nextID),
+                  let job = pendingJobs[nextID],
                   let delegate
             else {
                 return
             }
+            let delayNanoseconds = startDelayNanoseconds(job.priority)
+            if delayNanoseconds > 0 {
+                scheduleDelayedStart(after: delayNanoseconds)
+                return
+            }
+            pendingJobs.removeValue(forKey: nextID)
             guard !job.requiresTimelineMembership || delegate.timelineContainsItem(id: job.item.id) else {
                 delegate.setBodyState(nil, id: job.item.id)
                 continue
@@ -283,6 +308,39 @@ final class BodyFetchQueue {
         }
     }
 
+    private func scheduleDelayedStart(after delayNanoseconds: UInt64) {
+        guard delayedStartTask == nil else { return }
+        delayedStartTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.delayedStartTask != nil else { return }
+                self.delayedStartTask = nil
+                self.startPendingLoadsIgnoringDelay()
+            }
+        }
+    }
+
+    private func startPendingLoadsIgnoringDelay() {
+        while runningJobs.count < maxConcurrentBodyLoads {
+            guard let nextID = nextPendingLoadID(),
+                  let job = pendingJobs.removeValue(forKey: nextID),
+                  let delegate
+            else {
+                return
+            }
+            guard !job.requiresTimelineMembership || delegate.timelineContainsItem(id: job.item.id) else {
+                delegate.setBodyState(nil, id: job.item.id)
+                continue
+            }
+            startLoad(job)
+        }
+    }
+
     private func startLoad(_ job: PendingJob) {
         let generation = job.requiresTimelineMembership ? delegate?.currentTimelineGeneration : nil
         nextLoadToken += 1
@@ -350,4 +408,14 @@ final class BodyFetchQueue {
         return true
     }
 
+    nonisolated private static func defaultStartDelayNanoseconds(for priority: BodyFetchPriority) -> UInt64 {
+        switch priority {
+        case .visible:
+            0
+        case .nearby, .selectedPage:
+            selectedPageStartDelayNanoseconds
+        case .entityPreview, .background:
+            previewStartDelayNanoseconds
+        }
+    }
 }

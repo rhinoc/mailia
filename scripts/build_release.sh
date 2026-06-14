@@ -17,15 +17,21 @@ if [[ ! -f "$DMG_BACKGROUND" ]]; then
 fi
 
 npm --prefix Web/Timeline run build:app
+cargo build --release --manifest-path "$ROOT/mailia-mail/Cargo.toml" --bin mailia-mail
 swift build -c release --product "$PRODUCT"
 
 BIN_DIR="$(swift build -c release --show-bin-path)"
 BIN="$BIN_DIR/$PRODUCT"
+APP_SERVER_BIN="$ROOT/mailia-mail/target/release/mailia-mail"
 SPARKLE_FW="$BIN_DIR/Sparkle.framework"
 SPM_RESOURCE_BUNDLE="$BIN_DIR/$RESOURCE_BUNDLE"
 
 if [[ ! -x "$BIN" ]]; then
   echo "error: missing release binary at $BIN" >&2
+  exit 1
+fi
+if [[ ! -x "$APP_SERVER_BIN" ]]; then
+  echo "error: missing app-server binary at $APP_SERVER_BIN" >&2
   exit 1
 fi
 if [[ ! -d "$SPARKLE_FW" ]]; then
@@ -44,6 +50,7 @@ APP="$STAGE/$PRODUCT.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 cp "$PLIST_SRC" "$APP/Contents/Info.plist"
 cp "$BIN" "$APP/Contents/MacOS/$PRODUCT"
+cp "$APP_SERVER_BIN" "$APP/Contents/MacOS/mailia-mail"
 cp -R "$SPARKLE_FW" "$APP/Contents/Frameworks/"
 cp -R "$SPM_RESOURCE_BUNDLE" "$APP/Contents/Resources/"
 cp "$ICON_SRC" "$APP/Contents/Resources/AppIcon.icns"

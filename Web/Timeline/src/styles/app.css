@@ -568,7 +568,7 @@ button {
 }
 
 .mail-body__content table {
-  width: auto;
+  /* width: auto; */
   table-layout: auto;
 }
 

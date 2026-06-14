@@ -7,8 +7,8 @@ func exposesVersion() {
 }
 
 @Test
-func databaseMigrationCreatesCoreTables() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func databaseSchemaCreatesCoreTables() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let tableNames = try DatabaseSchemaInspector.tableNames(in: databaseQueue)
 
     let expectedTables: Set<String> = [
@@ -31,8 +31,8 @@ func databaseMigrationCreatesCoreTables() throws {
 }
 
 @Test
-func databaseMigrationCreatesKeyColumns() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func databaseSchemaCreatesKeyColumns() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
 
     let accountColumns = try DatabaseSchemaInspector.columnNames(in: "accounts", databaseQueue: databaseQueue)
     #expect(accountColumns.isSuperset(of: [

@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import GRDB
 import MailiaCore
 import Testing
 @testable import MailiaApp
@@ -13,15 +15,69 @@ func himalayaExecutableSettingsUsesUserOverrideWhenPresent() throws {
     }
     defaults.set("/tmp/custom-himalaya", forKey: MailiaPreferenceKeys.himalayaExecutablePath)
 
-    let url = MailiaHimalayaExecutableSettings.effectiveExecutableURL(
-        defaults: defaults,
+    let displayPath = MailiaHimalayaExecutableSettings.effectiveDisplayPath(defaults: defaults)
+
+    #expect(displayPath == "/tmp/custom-himalaya")
+}
+
+@MainActor
+@Test
+func himalayaExecutableSettingsUsesConfiguredAppServerPath() {
+    let launch = MailiaHimalayaExecutableSettings.appServerLaunch(
         environment: [
-            "HOME": "/tmp/ignored-home",
-            "PATH": "/usr/bin:/bin"
+            "MAILIA_APP_SERVER_PATH": "/tmp/mailia-mail"
         ]
     )
 
-    #expect(url?.path == "/tmp/custom-himalaya")
+    #expect(launch.executableURL.path == "/tmp/mailia-mail")
+    #expect(launch.arguments == ["app-server", "--listen", "stdio://"])
+}
+
+@MainActor
+@Test
+func himalayaExecutableSettingsUsesBundledAppServer() throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-bundled-app-server-\(UUID().uuidString)", isDirectory: true)
+    let macOSDirectory = temporaryDirectory.appendingPathComponent("Mailia.app/Contents/MacOS", isDirectory: true)
+    try FileManager.default.createDirectory(at: macOSDirectory, withIntermediateDirectories: true)
+    let mailiaExecutable = macOSDirectory.appendingPathComponent("Mailia")
+    let appServerExecutable = macOSDirectory.appendingPathComponent("mailia-mail")
+    try Data().write(to: mailiaExecutable)
+    try Data().write(to: appServerExecutable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: appServerExecutable.path)
+    defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+    let launch = MailiaHimalayaExecutableSettings.appServerLaunch(
+        environment: [:],
+        executableURL: mailiaExecutable,
+        bundleURL: temporaryDirectory.appendingPathComponent("Mailia.app"),
+        fileManager: .default
+    )
+
+    #expect(launch.executableURL.path == appServerExecutable.path)
+    #expect(launch.arguments == ["app-server", "--listen", "stdio://"])
+}
+
+@MainActor
+@Test
+func himalayaExecutableSettingsUsesBundleAppServerPathWhenExecutableIsMissing() throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-missing-app-server-\(UUID().uuidString)", isDirectory: true)
+    let macOSDirectory = temporaryDirectory.appendingPathComponent("Mailia.app/Contents/MacOS", isDirectory: true)
+    try FileManager.default.createDirectory(at: macOSDirectory, withIntermediateDirectories: true)
+    let mailiaExecutable = macOSDirectory.appendingPathComponent("Mailia")
+    try Data().write(to: mailiaExecutable)
+    defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+    let launch = MailiaHimalayaExecutableSettings.appServerLaunch(
+        environment: [:],
+        executableURL: mailiaExecutable,
+        bundleURL: temporaryDirectory.appendingPathComponent("Mailia.app"),
+        fileManager: .default
+    )
+
+    #expect(launch.executableURL.path == temporaryDirectory.appendingPathComponent("Mailia.app/Contents/MacOS/mailia-mail").path)
+    #expect(launch.arguments == ["app-server", "--listen", "stdio://"])
 }
 
 @MainActor
@@ -173,6 +229,41 @@ func startupRefreshReloadsTimelineWhenStaleSelectionIsKept() async {
 
 @MainActor
 @Test
+func selectedEntityAutoMarkReadMarksOnlyLatestTimelineMessage() async {
+    let entity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        unreadCount: 10,
+        latestMessageID: 101
+    )
+    let olderItem = mailiaTimelineItem(id: 100, entityID: entity.id)
+    let latestItem = mailiaTimelineItem(id: 101, entityID: entity.id)
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [
+            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date())
+        ],
+        refreshSnapshots: [],
+        timelinePages: [
+            MailiaTimelinePage(items: [olderItem, latestItem], hasMore: false)
+        ]
+    )
+    let viewModel = AppViewModel(
+        provider: provider,
+        selectedMarkReadDelayNanoseconds: 50_000_000
+    )
+
+    await viewModel.load()
+    await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+        provider.markMessageReadItems.count == 1
+    }
+
+    #expect(provider.markMessageReadItems.map(\.id) == [latestItem.id])
+    #expect(provider.markEntityReadEntityIDs.isEmpty)
+    #expect(viewModel.entities.first?.unreadCount == 9)
+}
+
+@MainActor
+@Test
 func loadDoesNotRefreshWhenLastRefreshIsWithinStartupThreshold() async {
     let now = Date(timeIntervalSince1970: 1_800_100_000)
     let localSnapshot = MailiaSnapshot(
@@ -217,6 +308,48 @@ func refreshFailureKeepsCurrentEntitiesAndReportsRefreshFailure() async {
     #expect(provider.refreshCallCount == 1)
     #expect(viewModel.entities == localSnapshot.entities)
     #expect(viewModel.refreshStatus.contains("Unable to refresh mail"))
+}
+
+@MainActor
+@Test
+func refreshKeepsResolvedAvatarWhenEntityEmailAddressesChangeOrder() async {
+    let avatarImageDataURL = "data:image/png;base64,avatar"
+    let localEntity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Google",
+        primaryEmailAddress: "no-reply@google.com",
+        emailAddresses: ["no-reply@google.com", "accounts.google.com@google.com"],
+        avatarImageDataURL: avatarImageDataURL
+    )
+    let refreshedEntity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Google",
+        primaryEmailAddress: "accounts.google.com@google.com",
+        emailAddresses: ["accounts.google.com@google.com", "no-reply@google.com"]
+    )
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [
+            MailiaSnapshot(entities: [localEntity], sendAccounts: [], loadedAt: Date())
+        ],
+        refreshSnapshots: [
+            MailiaSnapshot(entities: [refreshedEntity], sendAccounts: [], loadedAt: Date())
+        ]
+    )
+    let viewModel = AppViewModel(provider: provider)
+
+    await viewModel.load()
+    await viewModel.refresh()
+
+    #expect(viewModel.entities.first?.avatarImageDataURL == avatarImageDataURL)
+}
+
+@MainActor
+@Test
+func mailboxSyncFailureMessagePointsAtAppServer() {
+    let message = MailiaSyncFailure.mailboxSyncFailed.localizedDescription
+
+    #expect(message.contains("Mailia app-server"))
+    #expect(!message.contains("Himalaya CLI"))
 }
 
 @MainActor
@@ -416,6 +549,967 @@ func sendNewMessageRunsDelayedFollowUpRefreshForRecipientAccountCopies() async {
 
 @MainActor
 @Test
+func liveProviderCoalescesBackgroundFolderRefreshes() async throws {
+    let requestLog = temporaryAppServerRequestLog()
+    let script = try makeFolderRefreshAppServerScript(requestLog: requestLog)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", isDefault: true)
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "Spam", role: .junk)
+    ])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        _ = try await provider.refresh(
+            workspace: .main,
+            searchQuery: "",
+            options: MailiaRefreshOptions(),
+            progress: { _ in }
+        )
+        _ = try await provider.refresh(
+            workspace: .main,
+            searchQuery: "",
+            options: MailiaRefreshOptions(),
+            progress: { _ in }
+        )
+
+        await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+            ((try? loggedAppServerMethods(from: requestLog)) ?? [])
+                .filter { $0 == "folder/list" }
+                .count == 1
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let methods = try loggedAppServerMethods(from: requestLog)
+        #expect(methods.filter { $0 == "folder/list" }.count == 1)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderSendsPlainNewMessageAsRawMimeWithoutTemplateWrite() async throws {
+    let requestLog = temporaryAppServerRequestLog()
+    let script = try makeSuccessfulSendAppServerScript(requestLog: requestLog)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([
+        DiscoveredAccount(
+            accountKey: "work",
+            emailAddress: "sender@example.com",
+            displayName: "Sender",
+            isDefault: true
+        )
+    ])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.sendNewMessage(
+            to: ["recipient@example.net"],
+            subject: "Hello",
+            content: MailiaComposerContent(plainText: "Hello"),
+            accountKey: "work"
+        )
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+
+    let raw = try #require(try sentRawMessages(from: requestLog).first)
+    #expect(raw.contains("From: Sender <sender@example.com>"))
+    #expect(raw.contains("To: recipient@example.net"))
+    #expect(raw.contains("Subject: Hello"))
+    #expect(raw.contains("Content-Type: text/plain; charset=utf-8"))
+    #expect(raw.contains("SGVsbG8="))
+}
+
+@MainActor
+@Test
+func liveProviderSendsRichNewMessageAsRawMimeWithoutTemplateWrite() async throws {
+    let requestLog = temporaryAppServerRequestLog()
+    let script = try makeSuccessfulSendAppServerScript(requestLog: requestLog)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([
+        DiscoveredAccount(
+            accountKey: "work",
+            emailAddress: "sender@example.com",
+            displayName: "Sender",
+            isDefault: true
+        )
+    ])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    let body = NSMutableAttributedString(
+        string: "Hello",
+        attributes: ComposerTextDefaults.bodyAttributes
+    )
+    let boldFont = NSFontManager.shared.convert(
+        ComposerTextDefaults.bodyFont,
+        toHaveTrait: .boldFontMask
+    )
+    body.addAttribute(.font, value: boldFont, range: NSRange(location: 0, length: 5))
+
+    do {
+        try await provider.sendNewMessage(
+            to: ["recipient@example.net"],
+            subject: "Hello",
+            content: MailiaComposerContent(attributedBody: body, attachments: []),
+            accountKey: "work"
+        )
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+
+    let raw = try #require(try sentRawMessages(from: requestLog).first)
+    #expect(raw.contains("From: Sender <sender@example.com>"))
+    #expect(raw.contains("To: recipient@example.net"))
+    #expect(raw.contains("Subject: Hello"))
+    #expect(raw.contains("Content-Type: multipart/alternative; boundary="))
+    #expect(raw.contains("PGRpdj48c3Ryb25nPkhlbGxvPC9zdHJvbmc+PC9kaXY+"))
+}
+
+@MainActor
+@Test
+func liveProviderSendsNewMessageThroughAppServer() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*send*)
+          printf '{"id":%s,"result":{"sent":true}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([
+        DiscoveredAccount(
+            accountKey: "work",
+            emailAddress: "sender@example.com",
+            displayName: "Sender",
+            isDefault: true
+        )
+    ])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.sendNewMessage(
+            to: ["recipient@example.net"],
+            subject: "Hello",
+            content: MailiaComposerContent(plainText: "Hello"),
+            accountKey: "work"
+        )
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderSetsMessageFlagThroughAppServer() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          printf '{"id":%s,"result":{"id":"inbox-1","folder":"INBOX"}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Flag me",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let item = mailiaTimelineItem(
+        id: try #require(messageIDs.first),
+        entityID: 1,
+        accountLabel: "work",
+        folderLabel: "INBOX",
+        envelopeID: "inbox-1",
+        isFlagged: false
+    )
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.setMessageFlag(item: item, isFlagged: true)
+        let locations = try repository.messageLocations(messageID: item.id)
+        #expect(locations.count == 1)
+        let messages = try repository.messages(entityID: item.entityID, workspace: .flagged)
+        #expect(messages.map(\.himalayaEnvelopeID) == ["inbox-1"])
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderMarksEntityReadOnlyAfterAppServerSuccess() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          printf '{"id":%s,"result":{"id":"inbox-1","folder":"INBOX"}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Unread",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.markEntityRead(entityID: entity.id, workspace: .main)
+        let unreadLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            onlyUnread: true
+        )
+        #expect(unreadLocations.isEmpty)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderMarksSingleMessageReadWithoutMarkingWholeEntity() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          printf '{"id":%s,"result":{"id":"inbox-1","folder":"INBOX"}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Unread 1",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-2",
+            subject: "Unread 2",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-02T10:00:00Z"
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+    let message = try #require(
+        try repository.messages(entityID: entity.id, workspace: .main)
+            .first { $0.subject == "Unread 1" }
+    )
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.markMessageRead(
+            item: mailiaTimelineItem(id: message.messageID, entityID: entity.id),
+            workspace: .main
+        )
+        let unreadLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            onlyUnread: true
+        )
+        #expect(unreadLocations.count == 1)
+        #expect(unreadLocations.first?.himalayaEnvelopeID == "inbox-2")
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderDoesNotMarkEntityReadLocallyWhenAppServerFails() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          printf '{"id":%s,"error":{"code":"imap","message":"store failed"}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Unread",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.markEntityRead(entityID: entity.id, workspace: .main)
+        Issue.record("Expected markEntityRead to throw when app-server message/modify fails.")
+    } catch {
+        let unreadLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            onlyUnread: true
+        )
+        #expect(unreadLocations.count == 1)
+    }
+
+    try? await client.shutdown()
+}
+
+@MainActor
+@Test
+func liveProviderMovesEntityThroughAppServer() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *account*list*)
+          printf '{"id":%s,"result":{"accounts":[{"name":"work","backend":"imap","default":true,"emailAddress":"sender@example.com","displayName":"Sender"}]}}\\n' "$id"
+          ;;
+        *folder*list*)
+          printf '{"id":%s,"result":{"folders":[{"name":"INBOX","desc":"\\\\\\\\Inbox"},{"name":"Trash","desc":"\\\\\\\\Trash"}]}}\\n' "$id"
+          ;;
+        *message*modify*)
+          printf '{"id":%s,"result":{"id":"inbox-1","folder":"Trash"}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "Trash", role: .trash)
+    ])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Move me",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.performEntityAction(.moveToTrash, entityID: entity.id, workspace: .main) { _ in }
+        let remainingLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            sourceRoles: [.normal]
+        )
+        #expect(remainingLocations.isEmpty)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderLoadsBodyThroughAppServer() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*get*)
+          printf '{"id":%s,"result":{"id":"inbox-1","html":"<p>Hello from app-server</p>","text":"Hello from app-server","has_attachment":false}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Body",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let item = mailiaTimelineItem(
+        id: try #require(messageIDs.first),
+        entityID: 1,
+        accountLabel: "work",
+        folderLabel: "INBOX",
+        envelopeID: "inbox-1"
+    )
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        let body = try await provider.loadBody(for: item)
+        #expect(body.html?.contains("Hello from app-server") == true)
+        let cachedBody = try #require(try repository.messageBody(messageID: item.id))
+        #expect(cachedBody.sanitizedHTML?.contains("Hello from app-server") == true)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderMarksMissingBodyLocationAndFallsThroughToNextLocation() async throws {
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*get*)
+          case "$line" in
+            *stale-1*)
+              printf '{"id":%s,"error":{"code":"invalid_request","message":"Message `stale-1` was not found in folder `INBOX` for account `work`"}}\\n' "$id"
+              ;;
+            *)
+              printf '{"id":%s,"result":{"id":"live-1","html":"<p>Hello from archive</p>","text":"Hello from archive","has_attachment":false}}\\n' "$id"
+              ;;
+          esac
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "Archive", role: .normal)
+    ])
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "stale-1",
+            rfcMessageID: "<body-location@example.com>",
+            subject: "Body",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "Archive",
+            himalayaEnvelopeID: "live-1",
+            rfcMessageID: "<body-location@example.com>",
+            subject: "Body",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let messageID = try #require(messageIDs.first)
+    let item = mailiaTimelineItem(
+        id: messageID,
+        entityID: 1,
+        accountLabel: "work",
+        folderLabel: "INBOX",
+        envelopeID: "stale-1"
+    )
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        let body = try await provider.loadBody(for: item)
+        #expect(body.html?.contains("Hello from archive") == true)
+        let remainingLocations = try repository.messageLocations(messageID: messageID)
+        #expect(remainingLocations.map(\.himalayaEnvelopeID) == ["live-1"])
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderDownloadsAttachmentsThroughAppServer() async throws {
+    let downloadsDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-download-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: downloadsDirectory) }
+
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *attachment*download*)
+          downloads_dir='\(downloadsDirectory.path)'
+          /bin/mkdir -p "$downloads_dir"
+          /bin/printf 'file' > "$downloads_dir/report.txt"
+          printf '{"id":%s,"result":{"attachments":[{"id":"1","filename":"report.txt","path":"%s/report.txt","size":4}]}}\\n' "$id" "$downloads_dir"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    var revealedFiles: [URL] = []
+    var revealedDirectory: URL?
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: try DatabaseQueue(),
+        appServerClient: client,
+        downloadsDirectory: downloadsDirectory,
+        revealDownloadedFiles: { files, directory in
+            revealedFiles = files
+            revealedDirectory = directory
+        }
+    )
+    let item = mailiaTimelineItem(
+        id: 1,
+        entityID: 1,
+        accountLabel: "work",
+        folderLabel: "INBOX",
+        envelopeID: "inbox-1",
+        hasAttachments: true
+    )
+
+    do {
+        let result = try await provider.downloadAttachments(for: item)
+        #expect(result.directoryPath == downloadsDirectory.path)
+        #expect(result.fileNames == ["report.txt"])
+        #expect(revealedFiles.map(\.lastPathComponent) == ["report.txt"])
+        #expect(revealedDirectory == downloadsDirectory)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderSendsReplyAsRawMimeWithoutTemplateReply() async throws {
+    let requestLog = temporaryAppServerRequestLog()
+    let script = try makeSuccessfulSendAppServerScript(requestLog: requestLog)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([
+        DiscoveredAccount(
+            accountKey: "work",
+            emailAddress: "sender@example.com",
+            displayName: "Sender",
+            isDefault: true
+        )
+    ])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+    let item = MailiaTimelineItem(
+        id: 1,
+        entityID: 2,
+        direction: .incoming,
+        rfcMessageID: "<original@example.net>",
+        subject: "Project update",
+        preview: "Hello",
+        html: nil,
+        htmlVariants: nil,
+        date: nil,
+        accountLabel: "work",
+        accountEmoji: nil,
+        accountAvatarImageDataURL: nil,
+        folderLabel: "Inbox",
+        envelopeID: "42",
+        isFlagged: false,
+        from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+        to: [MailAddress(displayName: "Sender", emailAddress: "sender@example.com")],
+        cc: [MailAddress(displayName: "Bob", emailAddress: "bob@example.net")],
+        fromLabel: "Alice <alice@example.net>",
+        toLabel: "Sender <sender@example.com>",
+        hasAttachments: false
+    )
+
+    do {
+        try await provider.sendReply(
+            to: item,
+            content: MailiaComposerContent(plainText: "Thanks"),
+            replyAll: true,
+            accountKey: nil
+        )
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+
+    let raw = try #require(try sentRawMessages(from: requestLog).first)
+    #expect(raw.contains("From: Sender <sender@example.com>"))
+    #expect(raw.contains("To: Alice <alice@example.net>"))
+    #expect(raw.contains("Cc: Bob <bob@example.net>"))
+    #expect(!raw.contains("Cc: Sender <sender@example.com>"))
+    #expect(raw.contains("Subject: Re: Project update"))
+    #expect(raw.contains("In-Reply-To: <original@example.net>"))
+    #expect(raw.contains("References: <original@example.net>"))
+    #expect(raw.contains("VGhhbmtz"))
+}
+
+@MainActor
+@Test
 func loadSkipsAvatarProgressForCachedMissingAvatar() async throws {
     let cacheDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent("MailiaAppAvatarCacheTest-\(UUID().uuidString)", isDirectory: true)
@@ -470,48 +1564,6 @@ func loadSkipsAvatarProgressForCachedMissingAvatar() async throws {
 
 @MainActor
 @Test
-func replyTemplateWithoutQuotedOriginalRemovesHimalayaReplyQuote() {
-    let template = """
-    From: Ryan <ryan@example.com>
-    To: Alice <alice@example.com>
-    In-Reply-To: <original@example.com>
-    Subject: Re: Hello
-
-    hello back
-
-    On 31/05/2026 16:36, Alice wrote:
-    > Full-header test from Himalaya CLI via Gmail SMTP.
-    """
-
-    let cleaned = LiveMailiaAppDataProvider.replyTemplateWithoutQuotedOriginal(template)
-
-    #expect(cleaned == """
-    From: Ryan <ryan@example.com>
-    To: Alice <alice@example.com>
-    In-Reply-To: <original@example.com>
-    Subject: Re: Hello
-
-    hello back
-    """)
-}
-
-@MainActor
-@Test
-func replyTemplateWithoutQuotedOriginalKeepsTemplatesWithoutHimalayaQuote() {
-    let template = """
-    From: Ryan <ryan@example.com>
-    To: Alice <alice@example.com>
-    Subject: Re: Hello
-
-    On call today, I wrote:
-    please check the draft
-    """
-
-    #expect(LiveMailiaAppDataProvider.replyTemplateWithoutQuotedOriginal(template) == template)
-}
-
-@MainActor
-@Test
 func sidebarPreviewUsesCleanedBodyForHiddenReplySubjects() {
     let entity = mailiaEntitySummary(
         id: 1,
@@ -559,25 +1611,29 @@ private func mailiaEntitySummary(
     id: Int64,
     displayName: String,
     primaryEmailAddress: String? = nil,
+    emailAddresses: [String]? = nil,
+    unreadCount: Int = 0,
     latestSubject: String = "(No subject)",
     latestBodyPreview: String? = nil,
-    accountKeys: [String] = []
+    latestMessageID: Int64? = nil,
+    accountKeys: [String] = [],
+    avatarImageDataURL: String? = nil
 ) -> MailiaEntitySummary {
     MailiaEntitySummary(
         id: id,
         displayName: displayName,
         primaryEmailAddress: primaryEmailAddress,
-        emailAddresses: primaryEmailAddress.map { [$0] } ?? [],
+        emailAddresses: emailAddresses ?? (primaryEmailAddress.map { [$0] } ?? []),
         kind: .unknown,
-        unreadCount: 0,
+        unreadCount: unreadCount,
         latestSubject: latestSubject,
         latestBodyPreview: latestBodyPreview,
-        latestMessageID: nil,
+        latestMessageID: latestMessageID,
         latestDate: nil,
         accountKeys: accountKeys,
         accountLabel: "",
         workspace: .main,
-        avatarImageDataURL: nil
+        avatarImageDataURL: avatarImageDataURL
     )
 }
 
@@ -601,26 +1657,146 @@ private func mailiaSendAccount(
     )
 }
 
-private func mailiaTimelineItem(id: Int64, entityID: Int64) -> MailiaTimelineItem {
+private func mailiaTimelineItem(
+    id: Int64,
+    entityID: Int64,
+    accountLabel: String = "gmail",
+    folderLabel: String = "Inbox",
+    envelopeID: String? = nil,
+    isFlagged: Bool = false,
+    hasAttachments: Bool = false
+) -> MailiaTimelineItem {
     MailiaTimelineItem(
         id: id,
         entityID: entityID,
         direction: .incoming,
+        rfcMessageID: "<message-\(id)@example.com>",
         subject: "Hello",
         preview: "Hello",
         html: nil,
         htmlVariants: nil,
         date: nil,
-        accountLabel: "gmail",
+        accountLabel: accountLabel,
         accountEmoji: nil,
         accountAvatarImageDataURL: nil,
-        folderLabel: "Inbox",
-        envelopeID: "envelope-\(id)",
-        isFlagged: false,
+        folderLabel: folderLabel,
+        envelopeID: envelopeID ?? "envelope-\(id)",
+        isFlagged: isFlagged,
+        from: MailAddress(displayName: "Alice", emailAddress: "alice@example.com"),
+        to: [MailAddress(displayName: "Ryan", emailAddress: "ryan@example.com")],
+        cc: [],
         fromLabel: "Alice <alice@example.com>",
         toLabel: "Ryan <ryan@example.com>",
-        hasAttachments: false
+        hasAttachments: hasAttachments
     )
+}
+
+private func makeAppServerScript(body: String) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-app-server-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let script = directory.appendingPathComponent("server.sh")
+    try body.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    return script
+}
+
+private func makeSuccessfulSendAppServerScript(requestLog: URL) throws -> URL {
+    try makeAppServerScript(body: """
+    #!/bin/sh
+    while IFS= read -r line; do
+      printf '%s\\n' "$line" >> '\(requestLog.path)'
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        initialize)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*send*)
+          printf '{"id":%s,"result":{"sent":true}}\\n' "$id"
+          ;;
+        shutdown)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+}
+
+private func makeFolderRefreshAppServerScript(requestLog: URL) throws -> URL {
+    try makeAppServerScript(body: """
+    #!/bin/sh
+    while IFS= read -r line; do
+      printf '%s\\n' "$line" >> '\(requestLog.path)'
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        initialize)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *account*list*)
+          printf '{"id":%s,"result":{"accounts":[{"name":"work","backend":"imap","default":true,"emailAddress":"sender@example.com","displayName":"Sender"}]}}\\n' "$id"
+          ;;
+        *folder*list*)
+          printf '{"id":%s,"result":{"folders":[{"name":"INBOX","desc":"\\\\\\\\Inbox"},{"name":"Spam","desc":"\\\\\\\\Junk"}]}}\\n' "$id"
+          ;;
+        *message*list*)
+          printf '{"id":%s,"result":{"envelopes":[]}}\\n' "$id"
+          ;;
+        shutdown)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+}
+
+private func temporaryAppServerRequestLog() -> URL {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-app-server-requests-\(UUID().uuidString).jsonl")
+}
+
+private func loggedAppServerMethods(from requestLog: URL) throws -> [String] {
+    guard FileManager.default.fileExists(atPath: requestLog.path) else {
+        return []
+    }
+    let data = try Data(contentsOf: requestLog)
+    return try data.split(separator: UInt8(ascii: "\n")).compactMap { line in
+        guard let object = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+            return nil
+        }
+        return object["method"] as? String
+    }
+}
+
+private func sentRawMessages(from requestLog: URL) throws -> [String] {
+    guard FileManager.default.fileExists(atPath: requestLog.path) else {
+        return []
+    }
+    let data = try Data(contentsOf: requestLog)
+    return try data.split(separator: UInt8(ascii: "\n")).compactMap { line in
+        guard let object = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              object["method"] as? String == "message/send",
+              let params = object["params"] as? [String: Any]
+        else {
+            return nil
+        }
+        return params["raw"] as? String
+    }
 }
 
 @MainActor
@@ -659,6 +1835,8 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     private(set) var refreshNewerTimelineAccountKeys: [Set<String>] = []
     private(set) var sendNewMessageCallCount = 0
     private(set) var sentNewMessageAccountKey: String?
+    private(set) var markEntityReadEntityIDs: [Int64] = []
+    private(set) var markMessageReadItems: [MailiaTimelineItem] = []
 
     init(
         loadSnapshots: [MailiaSnapshot],
@@ -804,7 +1982,11 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     }
 
     func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws {
-        fatalError("markEntityRead is not used in these tests")
+        markEntityReadEntityIDs.append(entityID)
+    }
+
+    func markMessageRead(item: MailiaTimelineItem, workspace: MailiaWorkspace) async throws {
+        markMessageReadItems.append(item)
     }
 
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws {

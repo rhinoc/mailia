@@ -42,6 +42,7 @@ struct MailiaTimelineItem: Identifiable, Equatable, Sendable {
     let id: Int64
     let entityID: Int64
     let direction: MessageDirection
+    let rfcMessageID: String?
     let subject: String
     let preview: String
     let html: String?
@@ -53,6 +54,9 @@ struct MailiaTimelineItem: Identifiable, Equatable, Sendable {
     let folderLabel: String
     let envelopeID: String
     let isFlagged: Bool
+    let from: MailAddress?
+    let to: [MailAddress]
+    let cc: [MailAddress]
     let fromLabel: String
     let toLabel: String
     let hasAttachments: Bool
@@ -472,21 +476,22 @@ final class AppViewModel: ObservableObject {
     private var sendAccountsRefreshTask: Task<Void, Never>?
     private var entityPreviewBodyPrefetchTask: Task<Void, Never>?
     private var optimisticHiddenEntityIDs: Set<Int64> = []
-    private var optimisticReadEntityIDs: Set<Int64> = []
     private var pendingMarkReadTask: Task<Void, Never>?
     private var markReadTasks: [Int64: Task<Void, Never>] = [:]
     private let avatarResolver: EntityBrandAvatarResolver
     private let timelinePageSize = 80
     private let selectedTimelineBodyPrefetchLimit = 4
-    private let entityPreviewBodyPrefetchLimit = 50
+    private let entityPreviewBodyPrefetchLimit = 12
     private let maxConcurrentAvatarResolutions = 4
     private let partialRefreshSnapshotDelayNanoseconds: UInt64 = 350_000_000
+    private let selectedMarkReadDelayNanoseconds: UInt64
     private let postSendFollowUpRefreshDelaysNanoseconds: [UInt64]
     private let avatarResolutionTimeoutNanoseconds: UInt64 = 12_000_000_000
 
     init(
         provider: any MailiaAppDataProviding = LiveMailiaAppDataProvider(),
         avatarResolver: EntityBrandAvatarResolver = EntityBrandAvatarResolver(),
+        selectedMarkReadDelayNanoseconds: UInt64 = 1_500_000_000,
         postSendFollowUpRefreshDelaysNanoseconds: [UInt64] = [3_000_000_000, 8_000_000_000],
         startupRefreshStalenessThreshold: TimeInterval = 600,
         now: @escaping @Sendable () -> Date = Date.init
@@ -494,6 +499,7 @@ final class AppViewModel: ObservableObject {
         self.provider = provider
         self.bodyLoadQueue = BodyFetchQueue(provider: provider)
         self.avatarResolver = avatarResolver
+        self.selectedMarkReadDelayNanoseconds = selectedMarkReadDelayNanoseconds
         self.postSendFollowUpRefreshDelaysNanoseconds = postSendFollowUpRefreshDelaysNanoseconds
         self.startupRefreshStalenessThreshold = startupRefreshStalenessThreshold
         self.now = now
@@ -704,7 +710,7 @@ final class AppViewModel: ObservableObject {
         let workspaceSnapshot = workspace
         pendingMarkReadTask = Task { [weak self] in
             do {
-                try await Task.sleep(for: .milliseconds(1_500))
+                try await Task.sleep(nanoseconds: self?.selectedMarkReadDelayNanoseconds ?? 1_500_000_000)
             } catch {
                 return
             }
@@ -722,27 +728,46 @@ final class AppViewModel: ObservableObject {
 
         guard selectedEntityID == entityID,
               workspace == workspaceSnapshot,
-              entities.first(where: { $0.id == entityID })?.unreadCount ?? 0 > 0
+              let entity = entities.first(where: { $0.id == entityID }),
+              entity.unreadCount > 0,
+              let item = selectedMarkReadTargetItem(for: entity)
         else {
             return
         }
 
-        optimisticReadEntityIDs.insert(entityID)
-        setUnreadCount(0, for: entityID)
+        let messageID = item.id
+        guard markReadTasks[messageID] == nil else { return }
 
-        guard markReadTasks[entityID] == nil else { return }
-
-        markReadTasks[entityID] = Task { [weak self] in
+        markReadTasks[messageID] = Task { [weak self] in
             guard let self else { return }
             do {
-                try await provider.markEntityRead(entityID: entityID, workspace: workspaceSnapshot)
-                markReadTasks[entityID] = nil
-                optimisticReadEntityIDs.remove(entityID)
+                try await provider.markMessageRead(item: item, workspace: workspaceSnapshot)
+                markReadTasks[messageID] = nil
+                decrementUnreadCount(for: entityID)
             } catch {
-                markReadTasks[entityID] = nil
-                NSLog("Unable to mark entity read: \(error.localizedDescription)")
+                markReadTasks[messageID] = nil
+                refreshStatus = "Unable to mark mail read: \(error.localizedDescription)"
+                NSLog("Unable to mark message read: \(error.localizedDescription)")
+                do {
+                    let snapshot = try await provider.loadSnapshot(workspace: workspaceSnapshot, searchQuery: searchQuery)
+                    applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+                } catch {
+                    NSLog("Unable to reload mail after mark-read failure: \(error.localizedDescription)")
+                }
             }
         }
+    }
+
+    private func selectedMarkReadTargetItem(for entity: MailiaEntitySummary) -> MailiaTimelineItem? {
+        guard let latestMessageID = entity.latestMessageID else {
+            return timeline.last { $0.entityID == entity.id }
+        }
+        return timeline.first { $0.entityID == entity.id && $0.id == latestMessageID }
+    }
+
+    private func decrementUnreadCount(for entityID: Int64) {
+        guard let index = entities.firstIndex(where: { $0.id == entityID }) else { return }
+        entities[index].unreadCount = max(0, entities[index].unreadCount - 1)
     }
 
     private func setUnreadCount(_ unreadCount: Int, for entityID: Int64) {
@@ -1942,6 +1967,7 @@ final class AppViewModel: ObservableObject {
                 id: item.id,
                 entityID: item.entityID,
                 direction: item.direction,
+                rfcMessageID: item.rfcMessageID,
                 subject: item.subject,
                 preview: item.preview,
                 html: item.html,
@@ -1953,6 +1979,9 @@ final class AppViewModel: ObservableObject {
                 folderLabel: item.folderLabel,
                 envelopeID: item.envelopeID,
                 isFlagged: item.isFlagged,
+                from: item.from,
+                to: item.to,
+                cc: item.cc,
                 fromLabel: item.fromLabel,
                 toLabel: item.toLabel,
                 hasAttachments: item.hasAttachments
@@ -1968,12 +1997,6 @@ final class AppViewModel: ObservableObject {
         }
         let visibleEntities = snapshot.entities
             .filter { !optimisticHiddenEntityIDs.contains($0.id) }
-            .map { entity in
-                guard optimisticReadEntityIDs.contains(entity.id) else { return entity }
-                var readEntity = entity
-                readEntity.unreadCount = 0
-                return readEntity
-            }
         entities = mergeExistingAvatarImages(into: visibleEntities)
         if let currentSelection = selectedEntityID, visibleEntities.contains(where: { $0.id == currentSelection }) {
             if reloadTimelineIfSelectionKept {
@@ -2128,9 +2151,8 @@ final class AppViewModel: ObservableObject {
         let existingByID = Dictionary(uniqueKeysWithValues: entities.map { ($0.id, $0) })
         return nextEntities.map { entity in
             guard let existing = existingByID[entity.id],
-                  existing.primaryEmailAddress == entity.primaryEmailAddress,
-                  existing.emailAddresses == entity.emailAddresses,
-                  let avatarImageDataURL = existing.avatarImageDataURL
+                  avatarIdentityMatches(existing, entity),
+                  let avatarImageDataURL = existing.avatarImageDataURL?.nilIfBlank
             else {
                 return entity
             }
@@ -2139,6 +2161,22 @@ final class AppViewModel: ObservableObject {
             merged.avatarImageDataURL = avatarImageDataURL
             return merged
         }
+    }
+
+    private func avatarIdentityMatches(_ existing: MailiaEntitySummary, _ next: MailiaEntitySummary) -> Bool {
+        let existingEmails = normalizedAvatarEmails(for: existing)
+        let nextEmails = normalizedAvatarEmails(for: next)
+        guard !existingEmails.isEmpty, !nextEmails.isEmpty else {
+            return false
+        }
+        return !existingEmails.isDisjoint(with: nextEmails)
+    }
+
+    private func normalizedAvatarEmails(for entity: MailiaEntitySummary) -> Set<String> {
+        Set(
+            ([entity.primaryEmailAddress].compactMap { $0 } + entity.emailAddresses)
+                .compactMap { $0.nilIfBlank?.lowercased() }
+        )
     }
 
     private func hydrateCachedAvatarImagesThenResolve() {
@@ -2865,6 +2903,7 @@ extension AppViewModel: BodyFetchQueueDelegate {
             id: item.id,
             entityID: item.entityID,
             direction: item.direction,
+            rfcMessageID: item.rfcMessageID,
             subject: item.subject,
             preview: item.preview,
             html: item.html,
@@ -2876,6 +2915,9 @@ extension AppViewModel: BodyFetchQueueDelegate {
             folderLabel: item.folderLabel,
             envelopeID: item.envelopeID,
             isFlagged: item.isFlagged,
+            from: item.from,
+            to: item.to,
+            cc: item.cc,
             fromLabel: item.fromLabel,
             toLabel: item.toLabel,
             hasAttachments: true

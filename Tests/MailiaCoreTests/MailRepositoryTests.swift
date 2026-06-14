@@ -4,7 +4,7 @@ import Testing
 
 @Test
 func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -69,8 +69,7 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
             quotedReplyHiddenHTML: "<p>Build passed</p>",
             quotedReplyHiddenRemoteContentBlockedHTML: "<p>Build passed</p>"
         ),
-        textFallback: "Build passed",
-        sanitizerVersion: EmailHTMLDisplayPipeline.sanitizerVersion
+        textFallback: "Build passed"
     )
     let entitiesWithCachedPreview = try repository.entityList(workspace: .main)
     #expect(entitiesWithCachedPreview.first?.latestBodyPreview == "Build passed")
@@ -88,7 +87,6 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
     #expect(cachedBody.htmlVariants?.quotedReplyHiddenHTML == "<p>Build passed</p>")
     #expect(cachedBody.htmlVariants?.quotedReplyHiddenRemoteContentBlockedHTML == "<p>Build passed</p>")
     #expect(cachedBody.textFallback == "Build passed")
-    #expect(cachedBody.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion)
     let bodyCacheStats = try repository.messageBodyCacheStats()
     #expect(bodyCacheStats.itemCount == 1)
     #expect(bodyCacheStats.byteSize > 0)
@@ -141,8 +139,30 @@ func repositoryDedupesFallbackMessagesAndQueriesWorkspaces() throws {
 }
 
 @Test
+func replaceDiscoveredFoldersDisablesFoldersMissingFromLatestDiscovery() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "gmail", emailAddress: "ryan@example.com")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "gmail", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "gmail", providerName: "[Gmail]", role: .normal)
+    ])
+
+    try repository.replaceDiscoveredFolders(accountKey: "gmail", folders: [
+        DiscoveredFolder(accountKey: "gmail", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "gmail", providerName: "[Gmail]/Sent Mail", role: .sent)
+    ])
+
+    let folders = try repository.folders(for: .main)
+    #expect(folders.map(\.providerName).sorted() == ["INBOX", "[Gmail]/Sent Mail"])
+}
+
+@Test
 func repositoryKeepsStableEntityWhenSenderDisplayNameChanges() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -193,7 +213,7 @@ func repositoryKeepsStableEntityWhenSenderDisplayNameChanges() throws {
 
 @Test
 func repositoryUpdatesServiceEntityDisplayNameFromLaterMatchingSender() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -236,7 +256,7 @@ func repositoryUpdatesServiceEntityDisplayNameFromLaterMatchingSender() throws {
 
 @Test
 func repositoryPersistsExpandedSyncCheckpointMetadata() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
     try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
     try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
@@ -271,7 +291,7 @@ func repositoryPersistsExpandedSyncCheckpointMetadata() throws {
 
 @Test
 func repositoryRelatesOutgoingMessagesToRecipients() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -308,7 +328,7 @@ func repositoryRelatesOutgoingMessagesToRecipients() throws {
 
 @Test
 func repositoryOrdersEntityMessagesByParsedDateAcrossTimeZones() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -362,8 +382,47 @@ func repositoryOrdersEntityMessagesByParsedDateAcrossTimeZones() throws {
 }
 
 @Test
+func repositorySelectsHighestMessageIDWhenEntityLatestSortKeysTie() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work", emailAddress: "ryan@example.com")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    let sender = MailAddress(displayName: "Alice", emailAddress: "alice@example.com")
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "tie-1",
+            rfcMessageID: "<tie-1@example.com>",
+            subject: "First tied message",
+            from: sender,
+            messageDate: "2026-05-31T09:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "tie-2",
+            rfcMessageID: "<tie-2@example.com>",
+            subject: "Second tied message",
+            from: sender,
+            messageDate: "2026-05-31T09:00:00Z"
+        )
+    ])
+
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+    #expect(entity.latestMessageID == messageIDs[1])
+    #expect(entity.latestSubject == "Second tied message")
+}
+
+@Test
 func repositoryExposesHistoricalSubjectsForEntitySearch() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -401,7 +460,7 @@ func repositoryExposesHistoricalSubjectsForEntitySearch() throws {
 
 @Test
 func repositoryComputesDirectionPerEntityWhenSelfOwnedAccountsExchangeMail() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -487,7 +546,7 @@ func repositoryComputesDirectionPerEntityWhenSelfOwnedAccountsExchangeMail() thr
 
 @Test
 func repositoryComputesDirectionPerEntityForGmailSentAndAllMailLocations() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -540,8 +599,48 @@ func repositoryComputesDirectionPerEntityForGmailSentAndAllMailLocations() throw
 }
 
 @Test
+func repositoryTreatsOutgoingSentAliasAsRecipientConversation() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "gmail", emailAddress: "primary@example.com", providerHint: "gmail")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "gmail", providerName: "[Gmail]/Sent Mail", role: .sent)
+    ])
+
+    let alias = MailAddress(displayName: "Primary Alias", emailAddress: "alias@example.net")
+    let recipient = MailAddress(displayName: "Alice", emailAddress: "alice@example.com")
+
+    let messageIDs = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "gmail",
+            folderName: "[Gmail]/Sent Mail",
+            himalayaEnvelopeID: "sent-alias-1",
+            rfcMessageID: "<sent-alias-1@example.com>",
+            subject: "Alias sent message",
+            from: alias,
+            to: [recipient],
+            messageDate: "2026-05-05T09:00:00Z",
+            direction: .outgoing
+        )
+    ])
+
+    let entities = try repository.entityList(workspace: .main)
+    let recipientEntity = try #require(entities.first { $0.primaryEmailAddress == "alice@example.com" })
+    #expect(!(entities.contains { $0.primaryEmailAddress == "alias@example.net" }))
+
+    let recipientMessages = try repository.messages(entityID: recipientEntity.id, workspace: .main)
+    #expect(recipientMessages.count == 1)
+    #expect(recipientMessages[0].messageID == messageIDs[0])
+    #expect(recipientMessages[0].direction == .outgoing)
+    #expect(recipientMessages[0].folderName == "[Gmail]/Sent Mail")
+}
+
+@Test
 func repositoryReturnsOneTimelineRowWhenSameEntityIsSenderAndRecipient() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -574,7 +673,7 @@ func repositoryReturnsOneTimelineRowWhenSameEntityIsSenderAndRecipient() throws 
 
 @Test
 func repositoryPagesTimelineWithKeysetAnchors() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -626,8 +725,67 @@ func repositoryPagesTimelineWithKeysetAnchors() throws {
 }
 
 @Test
+func repositoryLoadsLatestTimelineMessagesForEntitiesInOneQuery() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
+    let repository = MailRepository(databaseQueue: databaseQueue)
+
+    try repository.upsertAccounts([
+        DiscoveredAccount(accountKey: "work")
+    ])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
+    ])
+
+    let alice = MailAddress(displayName: "Alice", emailAddress: "alice@example.com")
+    let bob = MailAddress(displayName: "Bob", emailAddress: "bob@example.com")
+    try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "alice-older",
+            rfcMessageID: "<alice-older@example.com>",
+            subject: "Alice older",
+            from: alice,
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "bob-only",
+            rfcMessageID: "<bob-only@example.com>",
+            subject: "Bob only",
+            from: bob,
+            messageDate: "2026-05-02T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "alice-newer",
+            rfcMessageID: "<alice-newer@example.com>",
+            subject: "Alice newer",
+            from: alice,
+            messageDate: "2026-05-03T10:00:00Z"
+        )
+    ])
+
+    let entities = try repository.entityList(workspace: .main)
+    let aliceEntity = try #require(entities.first { $0.primaryEmailAddress == "alice@example.com" })
+    let bobEntity = try #require(entities.first { $0.primaryEmailAddress == "bob@example.com" })
+
+    let latestMessages = try repository.latestMessages(
+        entityIDs: [aliceEntity.id, bobEntity.id, aliceEntity.id, 999_999],
+        workspace: .main
+    )
+
+    #expect(latestMessages.count == 2)
+    #expect(latestMessages[aliceEntity.id]?.subject == "Alice newer")
+    #expect(latestMessages[bobEntity.id]?.subject == "Bob only")
+    #expect(latestMessages[999_999] == nil)
+}
+
+@Test
 func accountEmojiPersistsAcrossUpsert() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -647,7 +805,7 @@ func accountEmojiPersistsAcrossUpsert() throws {
 
 @Test
 func accountDefaultPersistsAsStructuredState() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -671,7 +829,7 @@ func accountDefaultPersistsAsStructuredState() throws {
 
 @Test
 func accountSortOrderPersistsAndSurvivesDiscoveryRefresh() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -700,8 +858,8 @@ func accountSortOrderPersistsAndSurvivesDiscoveryRefresh() throws {
 }
 
 @Test
-func migrationCreatesSyncCheckpointMetadataColumns() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func schemaCreatesSyncCheckpointMetadataColumns() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let checkpointColumns = try DatabaseSchemaInspector.columnNames(in: "sync_checkpoints", databaseQueue: databaseQueue)
 
     #expect(checkpointColumns.isSuperset(of: [
@@ -713,8 +871,8 @@ func migrationCreatesSyncCheckpointMetadataColumns() throws {
 }
 
 @Test
-func migrationCreatesMessageBodyDisplayVariantColumns() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func schemaCreatesMessageBodyDisplayVariantColumns() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let bodyColumns = try DatabaseSchemaInspector.columnNames(in: "message_bodies", databaseQueue: databaseQueue)
 
     #expect(bodyColumns.isSuperset(of: [
@@ -725,8 +883,18 @@ func migrationCreatesMessageBodyDisplayVariantColumns() throws {
 }
 
 @Test
+func schemaCreatesTimelineQueryIndexes() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
+    let locationIndexes = try DatabaseSchemaInspector.indexNames(in: "message_locations", databaseQueue: databaseQueue)
+    let entityIndexes = try DatabaseSchemaInspector.indexNames(in: "message_entities", databaseQueue: databaseQueue)
+
+    #expect(locationIndexes.contains("idx_message_locations_message_visible"))
+    #expect(entityIndexes.contains("idx_message_entities_entity_message"))
+}
+
+@Test
 func repositoryPersistsFolderSyncCheckpointMetadata() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -766,8 +934,8 @@ func repositoryPersistsFolderSyncCheckpointMetadata() throws {
 }
 
 @Test
-func repositoryKeepsCheckpointCompatibilityForAccountFallbackAndOldMarkAPI() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func repositoryStoresAccountCheckpointWhenFolderIsMissing() throws {
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([
@@ -792,7 +960,7 @@ func repositoryKeepsCheckpointCompatibilityForAccountFallbackAndOldMarkAPI() thr
 
 @Test
 func repositoryReturnsMostRecentAccountRefreshFinishedAt() throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
 
     try repository.upsertAccounts([

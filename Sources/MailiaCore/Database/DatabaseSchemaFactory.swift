@@ -1,22 +1,36 @@
 import GRDB
 
-public enum DatabaseMigratorFactory {
-    public static func makeMigrator() -> DatabaseMigrator {
-        var migrator = DatabaseMigrator()
+public enum DatabaseSchemaFactory {
+    public static func initialize(_ databaseQueue: DatabaseQueue) throws {
+        try databaseQueue.write { db in
+            let tableCount = try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*)
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name NOT LIKE 'sqlite_%'
+                    """
+            ) ?? 0
+            guard tableCount == 0 else { return }
+            try createSchema(in: db)
+        }
+    }
 
-        #if DEBUG
-        migrator.eraseDatabaseOnSchemaChange = true
-        #endif
-
-        migrator.registerMigration("v1_schema") { db in
-            try db.execute(sql: """
+    private static func createSchema(in db: Database) throws {
+        try db.execute(sql: """
                 CREATE TABLE accounts (
                     account_key TEXT PRIMARY KEY NOT NULL,
                     email_address TEXT,
                     provider_hint TEXT,
                     display_name TEXT,
+                    emoji TEXT,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    sort_order INTEGER,
                     is_sync_enabled INTEGER NOT NULL DEFAULT 1,
                     last_sync_status TEXT,
+                    last_sync_error_message TEXT,
+                    last_sync_checked_at TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -96,8 +110,10 @@ public enum DatabaseMigratorFactory {
                 CREATE TABLE message_bodies (
                     message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
                     sanitized_html TEXT,
+                    remote_blocked_html TEXT,
+                    quoted_reply_hidden_html TEXT,
+                    quoted_reply_hidden_remote_blocked_html TEXT,
                     text_fallback TEXT,
-                    sanitizer_version INTEGER NOT NULL,
                     fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -162,8 +178,12 @@ public enum DatabaseMigratorFactory {
                 CREATE INDEX idx_folders_account_role ON folders(account_key, role);
                 CREATE INDEX idx_messages_account_date ON messages(account_key, message_date);
                 CREATE INDEX idx_message_locations_message ON message_locations(message_id);
+                CREATE INDEX idx_message_locations_message_visible
+                    ON message_locations(message_id, missing_since_at, folder_id, is_primary, id);
                 CREATE INDEX idx_message_locations_folder ON message_locations(folder_id);
                 CREATE INDEX idx_message_entities_entity ON message_entities(entity_id);
+                CREATE INDEX idx_message_entities_entity_message
+                    ON message_entities(entity_id, message_id, relation_kind, timeline_direction);
                 CREATE INDEX idx_sync_runs_started ON sync_runs(started_at);
                 CREATE UNIQUE INDEX idx_sync_checkpoints_account
                     ON sync_checkpoints(account_key, workspace)
@@ -173,74 +193,13 @@ public enum DatabaseMigratorFactory {
                     WHERE folder_id IS NOT NULL;
                 CREATE INDEX idx_action_log_created ON action_log(created_at);
                 """)
-        }
-
-        migrator.registerMigration("v2_account_emoji") { db in
-            try db.execute(sql: """
-                ALTER TABLE accounts ADD COLUMN emoji TEXT;
-                """)
-        }
-
-        migrator.registerMigration("v3_account_default") { db in
-            try db.execute(sql: """
-                ALTER TABLE accounts ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0;
-                """)
-        }
-
-        migrator.registerMigration("v4_sync_checkpoint_metadata") { db in
-            let columns = Set(try db.columns(in: "sync_checkpoints").map(\.name))
-            if !columns.contains("last_successful_sync_started_at") {
-                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN last_successful_sync_started_at TEXT")
-            }
-            if !columns.contains("last_successful_sync_finished_at") {
-                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN last_successful_sync_finished_at TEXT")
-            }
-            if !columns.contains("last_successful_query_start_at") {
-                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN last_successful_query_start_at TEXT")
-            }
-            if !columns.contains("oldest_synced_message_date") {
-                try db.execute(sql: "ALTER TABLE sync_checkpoints ADD COLUMN oldest_synced_message_date TEXT")
-            }
-        }
-
-        migrator.registerMigration("v5_message_body_display_variants") { db in
-            let columns = Set(try db.columns(in: "message_bodies").map(\.name))
-            if !columns.contains("remote_blocked_html") {
-                try db.execute(sql: "ALTER TABLE message_bodies ADD COLUMN remote_blocked_html TEXT")
-            }
-            if !columns.contains("quoted_reply_hidden_html") {
-                try db.execute(sql: "ALTER TABLE message_bodies ADD COLUMN quoted_reply_hidden_html TEXT")
-            }
-            if !columns.contains("quoted_reply_hidden_remote_blocked_html") {
-                try db.execute(sql: "ALTER TABLE message_bodies ADD COLUMN quoted_reply_hidden_remote_blocked_html TEXT")
-            }
-        }
-
-        migrator.registerMigration("v6_account_sort_order") { db in
-            let columns = Set(try db.columns(in: "accounts").map(\.name))
-            if !columns.contains("sort_order") {
-                try db.execute(sql: "ALTER TABLE accounts ADD COLUMN sort_order INTEGER")
-            }
-        }
-
-        migrator.registerMigration("v7_account_sync_status") { db in
-            let columns = Set(try db.columns(in: "accounts").map(\.name))
-            if !columns.contains("last_sync_error_message") {
-                try db.execute(sql: "ALTER TABLE accounts ADD COLUMN last_sync_error_message TEXT")
-            }
-            if !columns.contains("last_sync_checked_at") {
-                try db.execute(sql: "ALTER TABLE accounts ADD COLUMN last_sync_checked_at TEXT")
-            }
-        }
-
-        return migrator
     }
 }
 
 public enum DatabaseSchemaInspector {
-    public static func makeMigratedInMemoryDatabase() throws -> DatabaseQueue {
+    public static func makeInMemoryDatabase() throws -> DatabaseQueue {
         let databaseQueue = try DatabaseQueue()
-        try DatabaseMigratorFactory.makeMigrator().migrate(databaseQueue)
+        try DatabaseSchemaFactory.initialize(databaseQueue)
         return databaseQueue
     }
 
@@ -264,6 +223,17 @@ public enum DatabaseSchemaInspector {
         try databaseQueue.read { db in
             let columns = try db.columns(in: tableName)
             return Set(columns.map(\.name))
+        }
+    }
+
+    public static func indexNames(in tableName: String, databaseQueue: DatabaseQueue) throws -> Set<String> {
+        try databaseQueue.read { db in
+            let escapedTableName = tableName.replacingOccurrences(of: "'", with: "''")
+            let rows = try Row.fetchAll(
+                db,
+                sql: "PRAGMA index_list('\(escapedTableName)')"
+            )
+            return Set(rows.compactMap { row in row["name"] as String? })
         }
     }
 }

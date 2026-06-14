@@ -61,9 +61,11 @@ final class TimelineWebBridgeCoordinator: NSObject {
     private let assetLocator: TimelineWebAssetLocating
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
-    private var pendingDelivery: TimelineWebStateDelivery?
     private var lastDeliveredState: TimelineWebState?
+    private var scheduledState: TimelineWebState?
+    private var scheduledDeliveryTask: Task<Void, Never>?
     private var hasFinishedInitialLoad = false
+    private let stateCoalescingDelayNanoseconds: UInt64 = 35_000_000
 
     init(
         webView: WKWebView? = nil,
@@ -100,8 +102,10 @@ final class TimelineWebBridgeCoordinator: NSObject {
 
     func load() {
         hasFinishedInitialLoad = false
-        pendingDelivery = nil
         lastDeliveredState = nil
+        scheduledState = nil
+        scheduledDeliveryTask?.cancel()
+        scheduledDeliveryTask = nil
 
         if let indexURL = assetLocator.timelineIndexURL() {
             webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
@@ -112,10 +116,12 @@ final class TimelineWebBridgeCoordinator: NSObject {
     }
 
     func pushState(_ state: TimelineWebState) throws {
-        guard let delivery = try makeDelivery(for: state) else { return }
-        lastDeliveredState = state
-        logPushedState(state, delivery: delivery)
-        pushDelivery(delivery)
+        let comparisonState = scheduledState ?? lastDeliveredState
+        guard comparisonState != state else { return }
+
+        scheduledState = state
+        guard hasFinishedInitialLoad else { return }
+        scheduleStateDelivery()
     }
 
     private func makeDelivery(for state: TimelineWebState) throws -> TimelineWebStateDelivery? {
@@ -130,16 +136,42 @@ final class TimelineWebBridgeCoordinator: NSObject {
         return try .state(state, encoder: encoder)
     }
 
-    private func pushDelivery(_ delivery: TimelineWebStateDelivery) {
-        guard hasFinishedInitialLoad else {
-            pendingDelivery = delivery
+    private func scheduleStateDelivery() {
+        scheduledDeliveryTask?.cancel()
+        scheduledDeliveryTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: self?.stateCoalescingDelayNanoseconds ?? 35_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.flushScheduledState()
+        }
+    }
+
+    private func flushScheduledState() {
+        scheduledDeliveryTask?.cancel()
+        scheduledDeliveryTask = nil
+        guard hasFinishedInitialLoad,
+              let state = scheduledState
+        else {
             return
         }
 
-        evaluateReceiveDelivery(delivery)
+        scheduledState = nil
+        do {
+            guard let delivery = try makeDelivery(for: state) else { return }
+            lastDeliveredState = state
+            logPushedState(state, delivery: delivery)
+            evaluateReceiveDelivery(delivery)
+        } catch {
+            onEventDecodingError?(error)
+        }
     }
 
     func dismantle() {
+        scheduledDeliveryTask?.cancel()
+        scheduledDeliveryTask = nil
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
@@ -440,12 +472,9 @@ final class TimelineWebDebugMenuController: NSObject {
 extension TimelineWebBridgeCoordinator: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         configureScrollView()
-        MailiaScrollDebugLog("[MailiaScrollDebug] timelineWeb didFinish pendingState=\(pendingDelivery != nil)")
+        MailiaScrollDebugLog("[MailiaScrollDebug] timelineWeb didFinish pendingState=\(scheduledState != nil)")
         hasFinishedInitialLoad = true
-        if let pendingDelivery {
-            self.pendingDelivery = nil
-            evaluateReceiveDelivery(pendingDelivery)
-        }
+        flushScheduledState()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

@@ -402,14 +402,14 @@ extension TimelineWebState {
     ) {
         self.init(
             entity: entity.map(Entity.init),
-            items: items.map(Item.init),
+            items: items.map { Item($0, displayOptions: displayOptions) },
             isLoadingTimeline: isLoadingTimeline,
             isLoadingOlderTimeline: isLoadingOlderTimeline,
             isLoadingNewerTimeline: isLoadingNewerTimeline,
             hasOlderTimeline: hasOlderTimeline,
             hasNewerTimeline: hasNewerTimeline,
             bodyStates: bodyStates.reduce(into: [:]) { result, entry in
-                result[String(entry.key)] = BodyState(entry.value)
+                result[String(entry.key)] = BodyState(entry.value, displayOptions: displayOptions)
             },
             attachmentDownloadStates: attachmentDownloadStates.reduce(into: [:]) { result, entry in
                 result[String(entry.key)] = AttachmentDownloadState(entry.value)
@@ -459,15 +459,19 @@ extension TimelineWebState.Entity {
 }
 
 extension TimelineWebState.Item {
-    init(_ item: MailiaTimelineItem) {
+    init(_ item: MailiaTimelineItem, displayOptions: TimelineDisplayOptions) {
         self.init(
             id: item.id,
             entityID: item.entityID,
             direction: item.direction.rawValue,
             subject: item.subject,
             preview: item.preview,
-            html: item.html,
-            htmlVariants: item.htmlVariants.map(TimelineWebState.HTMLVariants.init),
+            html: TimelineWebState.displayHTML(
+                html: item.html,
+                variants: item.htmlVariants,
+                displayOptions: displayOptions
+            ),
+            htmlVariants: nil,
             date: item.date,
             accountLabel: item.accountLabel,
             accountEmoji: item.accountEmoji,
@@ -483,14 +487,14 @@ extension TimelineWebState.Item {
 }
 
 extension TimelineWebState.BodyState {
-    init(_ state: MailiaTimelineBodyState) {
+    init(_ state: MailiaTimelineBodyState, displayOptions: TimelineDisplayOptions) {
         switch state {
         case .notRequested:
             self = .notRequested
         case .loading:
             self = .loading
         case .loaded(let body):
-            self = .loaded(TimelineWebState.Body(body))
+            self = .loaded(TimelineWebState.Body(body, displayOptions: displayOptions))
         case .failed(let message):
             self = .failed(message)
         }
@@ -498,11 +502,39 @@ extension TimelineWebState.BodyState {
 }
 
 extension TimelineWebState.Body {
-    init(_ body: MailiaTimelineBody) {
+    init(_ body: MailiaTimelineBody, displayOptions: TimelineDisplayOptions) {
         self.init(
-            html: body.html,
-            htmlVariants: body.htmlVariants.map(TimelineWebState.HTMLVariants.init)
+            html: TimelineWebState.displayHTML(
+                html: body.html,
+                variants: body.htmlVariants,
+                displayOptions: displayOptions
+            ),
+            htmlVariants: nil
         )
+    }
+}
+
+private extension TimelineWebState {
+    static func displayHTML(
+        html: String?,
+        variants: MailiaTimelineHTMLVariants?,
+        displayOptions: TimelineDisplayOptions
+    ) -> String? {
+        if displayOptions.hideQuotedReplyText && !displayOptions.loadRemoteContent {
+            return nonBlank(variants?.quotedReplyHiddenRemoteContentBlockedHTML)
+        }
+        if displayOptions.hideQuotedReplyText {
+            return nonBlank(variants?.quotedReplyHiddenHTML)
+        }
+        if !displayOptions.loadRemoteContent {
+            return nonBlank(variants?.remoteContentBlockedHTML)
+        }
+        return nonBlank(html)
+    }
+
+    static func nonBlank(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? value : nil
     }
 }
 

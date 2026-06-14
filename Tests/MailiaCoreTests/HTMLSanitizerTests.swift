@@ -125,7 +125,6 @@ func displayPipelinePreservesAuthorColorsOnLightEmailSurface() throws {
     )
 
     let output = try #require(document.html)
-    #expect(document.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion)
     #expect(output.contains("background:#ffffff"))
     #expect(output.contains("color:#333"))
     #expect(output.contains("font-size:40px"))

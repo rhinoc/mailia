@@ -6,28 +6,23 @@ public struct SanitizedEmailDocument: Equatable, Sendable {
     public let textFallback: String?
     public let hasRemoteImages: Bool
     public let hasAttachments: Bool
-    public let sanitizerVersion: Int
 
     public init(
         html: String?,
         htmlVariants: EmailHTMLDisplayVariants? = nil,
         textFallback: String?,
         hasRemoteImages: Bool,
-        hasAttachments: Bool,
-        sanitizerVersion: Int = EmailHTMLDisplayPipeline.sanitizerVersion
+        hasAttachments: Bool
     ) {
         self.html = html
         self.htmlVariants = htmlVariants
         self.textFallback = textFallback
         self.hasRemoteImages = hasRemoteImages
         self.hasAttachments = hasAttachments
-        self.sanitizerVersion = sanitizerVersion
     }
 }
 
 public struct EmailHTMLDisplayPipeline: Sendable {
-    public static let sanitizerVersion = 5
-
     private let sanitizer = HTMLSanitizer()
     private let htmlDisplayNormalizer = HTMLDisplayNormalizer()
     private let htmlDisplayVariantBuilder = HTMLDisplayVariantBuilder()

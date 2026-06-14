@@ -175,6 +175,7 @@ public struct MessageLocationTarget: Equatable, Sendable {
 public struct TimelineMessage: Equatable, Sendable {
     public var messageID: Int64
     public var accountKey: String
+    public var rfcMessageID: String?
     public var folderName: String?
     public var himalayaEnvelopeID: String?
     public var flags: [String]
@@ -188,11 +189,11 @@ public struct TimelineMessage: Equatable, Sendable {
     public var sanitizedHTML: String?
     public var htmlVariants: EmailHTMLDisplayVariants?
     public var textFallback: String?
-    public var sanitizerVersion: Int?
 
     public init(
         messageID: Int64,
         accountKey: String,
+        rfcMessageID: String? = nil,
         folderName: String? = nil,
         himalayaEnvelopeID: String? = nil,
         flags: [String] = [],
@@ -205,11 +206,11 @@ public struct TimelineMessage: Equatable, Sendable {
         hasAttachments: Bool,
         sanitizedHTML: String? = nil,
         htmlVariants: EmailHTMLDisplayVariants? = nil,
-        textFallback: String? = nil,
-        sanitizerVersion: Int? = nil
+        textFallback: String? = nil
     ) {
         self.messageID = messageID
         self.accountKey = accountKey
+        self.rfcMessageID = rfcMessageID
         self.folderName = folderName
         self.himalayaEnvelopeID = himalayaEnvelopeID
         self.flags = flags
@@ -223,7 +224,6 @@ public struct TimelineMessage: Equatable, Sendable {
         self.sanitizedHTML = sanitizedHTML
         self.htmlVariants = htmlVariants
         self.textFallback = textFallback
-        self.sanitizerVersion = sanitizerVersion
     }
 }
 
@@ -231,17 +231,14 @@ public struct TimelineMessageBody: Equatable, Sendable {
     public var sanitizedHTML: String?
     public var htmlVariants: EmailHTMLDisplayVariants?
     public var textFallback: String?
-    public var sanitizerVersion: Int
 
     public init(
         sanitizedHTML: String? = nil,
         htmlVariants: EmailHTMLDisplayVariants? = nil,
-        textFallback: String? = nil,
-        sanitizerVersion: Int = 0
+        textFallback: String? = nil
     ) {
         self.sanitizedHTML = sanitizedHTML
         self.htmlVariants = htmlVariants
         self.textFallback = textFallback
-        self.sanitizerVersion = sanitizerVersion
     }
 }

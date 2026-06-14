@@ -2,8 +2,8 @@
   <br />
   <img src="./assets/app-icon-transparent.png" alt="Mailia app icon" width="112" height="112" />
   <h1>Mailia</h1>
-  <p>All your mailboxes, organized around people instead of folders.<br />
-  Mailia gives your email a lightweight, timeline-style home on macOS, so you can follow conversations across accounts without living inside a traditional inbox.</p>
+  <p><strong>All your mailboxes, organized around people instead of folders.</strong></p>
+  <p>Mailia is a lightweight, timeline-style email home for macOS. It helps you follow conversations across accounts without living inside a traditional inbox.</p>
   <p>
     <a href="https://github.com/rhinoc/mailia/releases">Releases</a>
     &nbsp;·&nbsp;
@@ -18,10 +18,15 @@
   <br />
 </div>
 
-Mailia is a native macOS email companion for people who use multiple mailboxes
-but want one clear place to read, review, and reply. It groups mail by senders,
-organizations, newsletters, and services, then shows the history as a durable
-conversation timeline.
+Mailia is a native macOS mail app for people who use multiple accounts but want
+one clear place to read, review, and reply. It groups mail by people,
+organizations, newsletters, and services, then shows each sender's history as a
+durable conversation timeline.
+
+Mailia uses your existing Himalaya-compatible account configuration for mail
+access. The release app includes its own `mailia-mail` app-server, so normal
+account discovery, sync, message reading, sending, and attachment downloads do
+not depend on shelling out to the Himalaya CLI.
 
 ## Screenshots
 
@@ -43,11 +48,25 @@ conversation timeline.
 - 🔒 **Local, safer mail reading** — Keep credentials in Himalaya, store Mailia
   data locally, and read sanitized HTML with remote images blocked by default.
 
+## How Mailia Reads Mail
+
+Mailia separates account configuration from the app experience:
+
+- Account credentials, OAuth tokens, and provider settings stay in your local
+  Himalaya-compatible configuration and credential storage.
+- Mailia starts its bundled `mailia-mail` app-server to talk to IMAP, SMTP, and
+  Maildir accounts through that configuration.
+- Mailia stores its own database locally for synced metadata, sender grouping,
+  timeline state, and review status.
+
+This keeps provider secrets outside Mailia while still giving the app a native,
+low-latency mail engine.
+
 ## Requirements
 
 - **macOS** 26.0 or newer.
-- A configured [Himalaya](https://github.com/pimalaya/himalaya) mail setup for
-  account access.
+- A configured [Himalaya](https://github.com/pimalaya/himalaya)-compatible mail
+  setup for account access.
 
 Mailia does not manage provider OAuth, app passwords, or IMAP/SMTP credentials.
 Those credentials remain in the user's Himalaya configuration.
@@ -74,24 +93,22 @@ You can also remove quarantine from the installed app:
 xattr -dr com.apple.quarantine /Applications/Mailia.app
 ```
 
-## Himalaya Setup
+## Account Setup
 
-Mailia uses [Himalaya](https://github.com/pimalaya/himalaya) as its mail
-engine. Install Himalaya and configure your email accounts there first, then
-open Mailia.
+Mailia uses the same account configuration and credential storage as
+[Himalaya](https://github.com/pimalaya/himalaya). Runtime mail operations go
+through Mailia's bundled `mailia-mail` app-server; Mailia does not shell out to
+the Himalaya CLI for normal account discovery, sync, message reading, sending,
+or attachment downloads.
 
-Start with the official Himalaya project:
+To create or update account configuration, start with the official Himalaya
+project:
 
 - [Himalaya on GitHub](https://github.com/pimalaya/himalaya)
 - [Pimalaya project](https://github.com/pimalaya)
 
-After Himalaya can list and read your accounts from the command line, Mailia
-can discover the same accounts automatically:
-
-```bash
-himalaya account list
-himalaya folder list -a <account>
-```
+After the shared configuration is in place, Mailia discovers accounts directly
+from the same configuration files.
 
 Mailia looks for Himalaya configuration in this order:
 
@@ -99,7 +116,6 @@ Mailia looks for Himalaya configuration in this order:
 2. `~/Library/Application Support/himalaya/config.toml`.
 3. `$XDG_CONFIG_HOME/himalaya/config.toml`.
 4. `~/.config/himalaya/config.toml`.
-5. `~/.himalayarc`.
 
 ## Local Data and Privacy
 

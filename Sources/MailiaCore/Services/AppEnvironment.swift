@@ -5,33 +5,25 @@ public struct MailiaEnvironment: Sendable {
     public var applicationSupportDirectory: URL
     public var databaseURL: URL
     public var downloadsDirectory: URL
-    public var himalayaBridge: any HimalayaBridge
+    public var appServerClient: MailAppServerClient
 
     public init(
         applicationSupportDirectory: URL,
         databaseURL: URL,
         downloadsDirectory: URL,
-        himalayaBridge: any HimalayaBridge
+        appServerClient: MailAppServerClient
     ) {
         self.applicationSupportDirectory = applicationSupportDirectory
         self.databaseURL = databaseURL
         self.downloadsDirectory = downloadsDirectory
-        self.himalayaBridge = himalayaBridge
+        self.appServerClient = appServerClient
     }
 
     public static func live(
         fileManager: FileManager = .default,
-        himalayaBridge: (any HimalayaBridge)? = nil
+        appServerClient: MailAppServerClient
     ) throws -> MailiaEnvironment {
-        let supportRoot = try fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let supportDirectory = supportRoot.appendingPathComponent("Mailia", isDirectory: true)
-        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-
+        let supportDirectory = try applicationSupportDirectory(fileManager: fileManager)
         let downloadsDirectory = try fileManager.url(
             for: .downloadsDirectory,
             in: .userDomainMask,
@@ -43,13 +35,27 @@ public struct MailiaEnvironment: Sendable {
             applicationSupportDirectory: supportDirectory,
             databaseURL: supportDirectory.appendingPathComponent("mailia.sqlite"),
             downloadsDirectory: downloadsDirectory,
-            himalayaBridge: himalayaBridge ?? ProcessHimalayaBridge()
+            appServerClient: appServerClient
         )
+    }
+
+    public static func applicationSupportDirectory(
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        let supportRoot = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let supportDirectory = supportRoot.appendingPathComponent("Mailia", isDirectory: true)
+        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        return supportDirectory
     }
 
     public func openDatabase() throws -> DatabaseQueue {
         let queue = try DatabaseQueue(path: databaseURL.path)
-        try DatabaseMigratorFactory.makeMigrator().migrate(queue)
+        try DatabaseSchemaFactory.initialize(queue)
         return queue
     }
 }

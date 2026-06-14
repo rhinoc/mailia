@@ -4,6 +4,7 @@
 DerivedData/
 dist/
 docs/
+mailia-mail/target/
 xcuserdata/
 *.xcuserstate
 *.xcodeproj/project.xcworkspace/xcuserdata/

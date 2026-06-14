@@ -136,8 +136,12 @@ public struct TimelineMessageItem: Identifiable, Equatable, Sendable {
 
 public enum FolderClassifier {
     public static func role(for folder: HimalayaFolderDTO) -> FolderRole {
-        let name = folder.name.lowercased()
-        let desc = folder.desc?.lowercased() ?? ""
+        role(forName: folder.name, desc: folder.desc)
+    }
+
+    public static func role(forName folderName: String, desc folderDescription: String?) -> FolderRole {
+        let name = folderName.lowercased()
+        let desc = folderDescription?.lowercased() ?? ""
 
         if desc.contains("\\junk") || name.contains("junk") || name.contains("spam") || name.contains("垃圾") {
             return .junk

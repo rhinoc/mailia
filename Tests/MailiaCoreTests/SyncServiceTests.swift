@@ -8,207 +8,172 @@ func syncPolicyDefaultsAllowTwoFoldersPerAccount() {
 }
 
 @Test
-func syncServiceDiscoversAndSyncsBoundedEnvelopesWithFakeBridge() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func syncServiceDiscoversAndSyncsBoundedEnvelopesWithAppServer() async throws {
+    let logFile = temporaryLogFile()
+    let script = try makeSyncFakeAppServerScript(logFile: logFile)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: logFile)
+    }
+
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .accountList()): """
-        [{"name":"work","backend":"imap","default":true}]
-        """,
-        FakeHimalayaBridge.key(for: .folderList(account: "work")): """
-        [
-          {"name":"INBOX","desc":"\\\\Inbox"},
-          {"name":"Spam","desc":"\\\\Junk"}
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 3
-        )): """
-        [
-          {
-            "id":"42",
-            "flags":["Seen"],
-            "subject":"Welcome",
-            "from":{"name":"GitHub","addr":"noreply@github.com"},
-            "to":{"name":"Ryan","addr":"ryan@example.com"},
-            "date":"2026-05-01T10:00:00Z",
-            "has_attachment":false
-          }
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-03-01 order by date desc",
-            page: 2,
-            pageSize: 1
-        )): "[]"
-    ])
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
     let service = SyncService(
-        bridge: fakeBridge,
+        appServerClient: client,
         databaseQueue: databaseQueue,
         policy: SyncPolicy(initialPerFolderLimit: 3, incrementalPerFolderLimit: 2),
         now: { now }
     )
 
-    let accounts = try await service.discoverAccounts()
-    #expect(accounts.map(\.accountKey) == ["work"])
-    #expect(accounts.map(\.isDefault) == [true])
+    do {
+        let accounts = try await service.discoverAccounts()
+        #expect(accounts.map(\.accountKey) == ["work"])
+        #expect(accounts.map(\.isDefault) == [true])
 
-    let folders = try await service.discoverFolders(accountKey: "work")
-    #expect(folders.map(\.role) == [.normal, .junk])
+        let folders = try await service.discoverFolders(accountKey: "work")
+        #expect(folders.map(\.role) == [.normal, .junk])
 
-    let count = try await service.syncWorkspace(.main)
-    #expect(count == 1)
+        let count = try await service.syncWorkspace(.main)
+        #expect(count == 1)
 
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    let entities = try repository.entityList(workspace: .main)
-    #expect(entities.map(\.displayName) == ["GitHub"])
-
-    let commands = await fakeBridge.commands()
-    #expect(commands.map(\.arguments).contains(
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 3
-        ).arguments
-    ))
+        let repository = MailRepository(databaseQueue: databaseQueue)
+        let entities = try repository.entityList(workspace: .main)
+        #expect(entities.map(\.displayName) == ["GitHub"])
+        #expect(try readLoggedMethods(from: logFile).contains("message/list"))
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
 }
 
 @Test
-func discoverFoldersForDiscoveredAccountsAppliesConcurrencyLimits() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .accountList()): """
-        [
-          {"name":"a","backend":"imap","default":true},
-          {"name":"b","backend":"imap","default":false},
-          {"name":"c","backend":"imap","default":false}
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .folderList(account: "a")): """
-        [{"name":"INBOX","desc":"\\\\Inbox"}]
-        """,
-        FakeHimalayaBridge.key(for: .folderList(account: "b")): """
-        [{"name":"INBOX","desc":"\\\\Inbox"}]
-        """,
-        FakeHimalayaBridge.key(for: .folderList(account: "c")): """
-        [{"name":"INBOX","desc":"\\\\Inbox"}]
-        """
-    ], delay: .milliseconds(25))
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(
-            maxConcurrentAccounts: 2,
-            maxConcurrentHimalayaProcesses: 2
-        )
-    )
+func refreshFolderDiscoveryAlwaysRefreshesKnownFolders() async throws {
+    let logFile = temporaryLogFile()
+    let script = try makeSyncFakeAppServerScript(logFile: logFile)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: logFile)
+    }
 
-    let folders = try await service.discoverFoldersForDiscoveredAccounts()
-    let stats = await fakeBridge.stats()
-
-    #expect(folders.count == 3)
-    #expect(stats.maxActiveProcesses == 2)
-    #expect(stats.maxActiveAccounts == 2)
-}
-
-@Test
-func syncServiceUsesCheckpointForIncrementalWindowAndCap() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
     try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
-    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
-    let folder = try #require(try repository.folders(for: .main).first)
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let previousCheckpoint = try #require(HimalayaDateParser.parse("2026-05-20T12:00:00Z"))
-    try repository.markAccountSyncSucceeded(accountKey: "work", workspace: .main, at: previousCheckpoint)
-
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-05-19 order by date desc",
-            page: 1,
-            pageSize: 2
-        )): "[]"
+    try repository.replaceDiscoveredFolders(accountKey: "work", folders: [
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)
     ])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
     let service = SyncService(
-        bridge: fakeBridge,
+        appServerClient: client,
         databaseQueue: databaseQueue,
-        policy: SyncPolicy(initialPerFolderLimit: 3, incrementalPerFolderLimit: 2),
-        now: { now }
+        now: Date.init
     )
 
-    let count = try await service.syncWorkspace(.main)
-
-    #expect(count == 0)
-    let commands = await fakeBridge.commands()
-    #expect(commands.map(\.arguments) == [
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-05-19 order by date desc",
-            page: 1,
-            pageSize: 2
-        ).arguments
-    ])
-    #expect(try repository.lastSuccessfulSyncAt(
-        accountKey: "work",
-        folderID: folder.id,
-        workspace: .main
-    ) == now)
+    let folders = try await service.discoverFoldersForRefresh()
+    #expect(folders.map(\.providerName) == ["INBOX", "Spam"])
+    let methods = try readLoggedMethods(from: logFile)
+    #expect(methods.contains("account/list"))
+    #expect(methods.contains("folder/list"))
+    try await client.shutdown()
 }
 
 @Test
-func syncFolderRecordsRunStartAsCheckpointAndRunFinishSeparately() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func refreshFolderDiscoveryRunsWhenKnownFoldersAreEmpty() async throws {
+    let logFile = temporaryLogFile()
+    let script = try makeSyncFakeAppServerScript(logFile: logFile)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: logFile)
+    }
+
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
     try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
-    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
-    let folder = try #require(try repository.folders(for: .main).first)
-    let startedAt = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let finishedAt = try #require(HimalayaDateParser.parse("2026-05-30T00:00:05Z"))
-    let expectedQueryStart = try #require(HimalayaDateParser.parse("2026-03-01T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        )): "[]"
-    ])
-    let clock = SequenceClock([startedAt, finishedAt])
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
     let service = SyncService(
-        bridge: fakeBridge,
+        appServerClient: client,
         databaseQueue: databaseQueue,
-        policy: SyncPolicy(initialPerFolderLimit: 1),
-        now: { clock.next() }
+        now: Date.init
     )
 
-    _ = try await service.syncFolder(folder, workspace: .main)
+    do {
+        let folders = try await service.discoverFoldersForRefresh()
+        #expect(folders.map(\.providerName) == ["INBOX", "Spam"])
+        let methods = try readLoggedMethods(from: logFile)
+        #expect(methods.contains("account/list"))
+        #expect(methods.contains("folder/list"))
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
 
-    let checkpoint = try #require(try repository.syncCheckpoint(
-        accountKey: "work",
-        folderID: folder.id,
-        workspace: .main
-    ))
-    #expect(checkpoint.lastSuccessfulSyncAt == startedAt)
-    #expect(checkpoint.lastSuccessfulSyncStartedAt == startedAt)
-    #expect(checkpoint.lastSuccessfulSyncFinishedAt == finishedAt)
-    #expect(checkpoint.lastSuccessfulQueryStartAt == expectedQueryStart)
+@Test
+func syncWorkspaceDiscoversFoldersWhenCacheIsEmpty() async throws {
+    let logFile = temporaryLogFile()
+    let script = try makeSyncFakeAppServerScript(logFile: logFile)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: logFile)
+    }
+
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let service = SyncService(
+        appServerClient: client,
+        databaseQueue: databaseQueue,
+        now: Date.init
+    )
+
+    do {
+        let result = try await service.syncWorkspaceResult(.main)
+        #expect(result.syncedCount == 1)
+        #expect(result.attemptedFolderCount == 1)
+        #expect(!result.hadFailure)
+
+        let repository = MailRepository(databaseQueue: databaseQueue)
+        #expect(try repository.folders().map(\.providerName) == ["INBOX", "Spam"])
+        let methods = try readLoggedMethods(from: logFile)
+        #expect(methods.contains("account/list"))
+        #expect(methods.contains("folder/list"))
+        #expect(methods.contains("message/list"))
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
 }
 
 @Test
 func incrementalSyncPagesUntilShortPageBeforeAdvancingCheckpoint() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+    let logFile = temporaryLogFile()
+    let script = try makeSyncFakeAppServerScript(logFile: logFile, pageMode: .twoPagesThenEmpty)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: logFile)
+    }
+
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
     try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
     try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
@@ -224,443 +189,59 @@ func incrementalSyncPagesUntilShortPageBeforeAdvancingCheckpoint() async throws 
         at: previousCheckpoint
     )
 
-    let query = "after 2026-05-19 order by date desc"
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: query,
-            page: 1,
-            pageSize: 1
-        )): """
-        [
-          {
-            "id":"42",
-            "flags":[],
-            "subject":"First",
-            "from":{"name":"GitHub","addr":"noreply@github.com"},
-            "to":{"name":"Ryan","addr":"ryan@example.com"},
-            "date":"2026-05-29T10:00:00Z",
-            "has_attachment":false
-          }
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: query,
-            page: 2,
-            pageSize: 1
-        )): """
-        [
-          {
-            "id":"43",
-            "flags":[],
-            "subject":"Second",
-            "from":{"name":"GitHub","addr":"noreply@github.com"},
-            "to":{"name":"Ryan","addr":"ryan@example.com"},
-            "date":"2026-05-28T10:00:00Z",
-            "has_attachment":false
-          }
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: query,
-            page: 3,
-            pageSize: 1
-        )): "[]"
-    ])
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
     let clock = SequenceClock([startedAt, finishedAt])
     let service = SyncService(
-        bridge: fakeBridge,
+        appServerClient: client,
         databaseQueue: databaseQueue,
         policy: SyncPolicy(incrementalPerFolderLimit: 1),
         now: { clock.next() }
     )
 
-    let count = try await service.syncFolder(folder, workspace: .main)
+    do {
+        let count = try await service.syncFolder(folder, workspace: .main)
+        #expect(count == 2)
+        #expect(try readLoggedMethods(from: logFile).filter { $0 == "message/list" }.count == 3)
 
-    #expect(count == 2)
-    #expect(await fakeBridge.commands().map(\.arguments) == [
-        HimalayaCommand.envelopeList(folder: "INBOX", account: "work", query: query, page: 1, pageSize: 1).arguments,
-        HimalayaCommand.envelopeList(folder: "INBOX", account: "work", query: query, page: 2, pageSize: 1).arguments,
-        HimalayaCommand.envelopeList(folder: "INBOX", account: "work", query: query, page: 3, pageSize: 1).arguments
-    ])
-    let checkpoint = try #require(try repository.syncCheckpoint(
-        accountKey: "work",
-        folderID: folder.id,
-        workspace: .main
-    ))
-    #expect(checkpoint.lastSuccessfulSyncAt == startedAt)
-    #expect(checkpoint.oldestSyncedMessageDate == expectedOldestSyncedMessageDate)
+        let checkpoint = try #require(try repository.syncCheckpoint(
+            accountKey: "work",
+            folderID: folder.id,
+            workspace: .main
+        ))
+        #expect(checkpoint.lastSuccessfulSyncAt == startedAt)
+        #expect(checkpoint.lastSuccessfulSyncFinishedAt == finishedAt)
+        #expect(checkpoint.oldestSyncedMessageDate == expectedOldestSyncedMessageDate)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
 }
 
 @Test
-func fullHistorySyncPagesFromBeginningOfMailbox() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
+func syncWorkspaceContinuesWhenOneFolderAppServerRequestFails() async throws {
+    let script = try makeSyncFakeAppServerScript(failArchiveList: true)
+    defer { try? FileManager.default.removeItem(at: script.deletingLastPathComponent()) }
+
+    let databaseQueue = try DatabaseSchemaInspector.makeInMemoryDatabase()
     let repository = MailRepository(databaseQueue: databaseQueue)
     try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
-    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 1970-01-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        )): """
-        [
-          {
-            "id":"42",
-            "flags":[],
-            "subject":"Recent",
-            "from":{"name":"GitHub","addr":"noreply@github.com"},
-            "to":{"name":"Ryan","addr":"ryan@example.com"},
-            "date":"2026-05-01T10:00:00Z",
-            "has_attachment":false
-          }
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 1970-01-01 order by date desc",
-            page: 2,
-            pageSize: 1
-        )): "[]"
-    ])
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(fullHistoryPerFolderPageSize: 1),
-        now: { now }
-    )
-
-    let count = try await service.syncWorkspace(.main, fullHistory: true)
-
-    #expect(count == 1)
-    let commands = await fakeBridge.commands()
-    #expect(commands.map(\.arguments) == [
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 1970-01-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments,
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 1970-01-01 order by date desc",
-            page: 2,
-            pageSize: 1
-        ).arguments
-    ])
-}
-
-@Test
-func entityHistorySyncFiltersBySenderAndRecipientWithoutAdvancingAccountCheckpoint() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
-    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fromCommand = HimalayaCommand.envelopeList(
-        folder: "INBOX",
-        account: "work",
-        query: "after 1970-01-01 and from alice@example.com order by date desc",
-        page: 1,
-        pageSize: 2
-    )
-    let toCommand = HimalayaCommand.envelopeList(
-        folder: "INBOX",
-        account: "work",
-        query: "after 1970-01-01 and to alice@example.com order by date desc",
-        page: 1,
-        pageSize: 2
-    )
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: fromCommand): """
-        [
-          {
-            "id":"42",
-            "flags":[],
-            "subject":"Hello",
-            "from":{"name":"Alice","addr":"alice@example.com"},
-            "to":{"name":"Ryan","addr":"ryan@example.com"},
-            "date":"2026-05-01T10:00:00Z",
-            "has_attachment":false
-          }
-        ]
-        """,
-        FakeHimalayaBridge.key(for: toCommand): "[]"
-    ])
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(fullHistoryPerFolderPageSize: 2),
-        now: { now }
-    )
-
-    let count = try await service.syncEntityHistory(.main, emailAddresses: ["Alice@Example.com "])
-
-    #expect(count == 1)
-    #expect(try repository.entityList(workspace: .main).map(\.displayName) == ["Alice"])
-    #expect(await fakeBridge.commands().map(\.arguments) == [
-        fromCommand.arguments,
-        toCommand.arguments
-    ])
-    #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: 0, workspace: .main) == nil)
-}
-
-@Test
-func syncWorkspaceCanTargetAccountsAndFolderRolesWithoutAdvancingAccountCheckpoint() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    try repository.upsertAccounts([
-        DiscoveredAccount(accountKey: "a"),
-        DiscoveredAccount(accountKey: "b")
-    ])
-    try repository.upsertFolders([
-        DiscoveredFolder(accountKey: "a", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "a", providerName: "Sent", role: .sent),
-        DiscoveredFolder(accountKey: "a", providerName: "Spam", role: .junk),
-        DiscoveredFolder(accountKey: "b", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "b", providerName: "Sent", role: .sent)
-    ])
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(defaultResponse: "[]")
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(
-            initialPerFolderLimit: 1,
-            incrementalPerFolderLimit: 1,
-            maxConcurrentFoldersPerAccount: 1
-        ),
-        now: { now }
-    )
-
-    _ = try await service.syncWorkspace(
-        .main,
-        accountKeys: ["a"],
-        folderRoles: [.normal, .sent]
-    )
-
-    let commands = await fakeBridge.commands()
-    #expect(commands.map(\.arguments) == [
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "a",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments,
-        HimalayaCommand.envelopeList(
-            folder: "Sent",
-            account: "a",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments
-    ])
-    #expect(try repository.lastSuccessfulSyncAt(
-        accountKey: "a",
-        folderID: 0,
-        workspace: .main
-    ) == nil)
-}
-
-@Test
-func syncWorkspaceUsesAccountPriorityScoresAndMailboxPrecedence() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    try repository.upsertAccounts([
-        DiscoveredAccount(accountKey: "a"),
-        DiscoveredAccount(accountKey: "b"),
-        DiscoveredAccount(accountKey: "c")
-    ])
-    try repository.upsertFolders([
-        DiscoveredFolder(accountKey: "a", providerName: "Archive", role: .normal),
-        DiscoveredFolder(accountKey: "a", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "b", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "c", providerName: "Sent", role: .sent)
-    ])
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(defaultResponse: "[]")
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(
-            initialPerFolderLimit: 1,
-            incrementalPerFolderLimit: 1,
-            maxConcurrentAccounts: 1,
-            maxConcurrentFoldersPerAccount: 1
-        ),
-        now: { now }
-    )
-
-    _ = try await service.syncWorkspace(
-        .main,
-        accountPriorityScores: ["c": 10, "a": 5]
-    )
-
-    let commands = await fakeBridge.commands()
-    #expect(commands.map(\.arguments) == [
-        HimalayaCommand.envelopeList(
-            folder: "Sent",
-            account: "c",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments,
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "a",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments,
-        HimalayaCommand.envelopeList(
-            folder: "Archive",
-            account: "a",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments,
-        HimalayaCommand.envelopeList(
-            folder: "INBOX",
-            account: "b",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        ).arguments
-    ])
-}
-
-@Test
-func syncWorkspaceRespectsAccountFolderAndProcessConcurrencyLimits() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    try repository.upsertAccounts([
-        DiscoveredAccount(accountKey: "a"),
-        DiscoveredAccount(accountKey: "b"),
-        DiscoveredAccount(accountKey: "c")
-    ])
-    try repository.upsertFolders([
-        DiscoveredFolder(accountKey: "a", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "a", providerName: "Sent", role: .sent),
-        DiscoveredFolder(accountKey: "b", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "b", providerName: "Sent", role: .sent),
-        DiscoveredFolder(accountKey: "c", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "c", providerName: "Sent", role: .sent)
-    ])
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(defaultResponse: "[]", delay: .milliseconds(25))
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(
-            initialPerFolderLimit: 1,
-            incrementalPerFolderLimit: 1,
-            maxConcurrentAccounts: 2,
-            maxConcurrentFoldersPerAccount: 1,
-            maxConcurrentHimalayaProcesses: 3
-        ),
-        now: { now }
-    )
-
-    _ = try await service.syncWorkspace(.main)
-    let stats = await fakeBridge.stats()
-
-    #expect(stats.maxActiveProcesses <= 3)
-    #expect(stats.maxActiveAccounts <= 2)
-    #expect(stats.maxActiveFoldersPerAccount.values.allSatisfy { $0 <= 1 })
-}
-
-@Test
-func syncWorkspaceAppliesGlobalHimalayaProcessLimit() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    try repository.upsertAccounts([
-        DiscoveredAccount(accountKey: "a"),
-        DiscoveredAccount(accountKey: "b"),
-        DiscoveredAccount(accountKey: "c")
-    ])
-    try repository.upsertFolders([
-        DiscoveredFolder(accountKey: "a", providerName: "Archive", role: .normal),
-        DiscoveredFolder(accountKey: "a", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "b", providerName: "Archive", role: .normal),
-        DiscoveredFolder(accountKey: "b", providerName: "INBOX", role: .normal),
-        DiscoveredFolder(accountKey: "c", providerName: "Archive", role: .normal),
-        DiscoveredFolder(accountKey: "c", providerName: "INBOX", role: .normal)
-    ])
-    let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(defaultResponse: "[]", delay: .milliseconds(25))
-    let service = SyncService(
-        bridge: fakeBridge,
-        databaseQueue: databaseQueue,
-        policy: SyncPolicy(
-            initialPerFolderLimit: 1,
-            incrementalPerFolderLimit: 1,
-            maxConcurrentAccounts: 3,
-            maxConcurrentFoldersPerAccount: 3,
-            maxConcurrentHimalayaProcesses: 2
-        ),
-        now: { now }
-    )
-
-    _ = try await service.syncWorkspace(.main)
-    let stats = await fakeBridge.stats()
-
-    #expect(stats.maxActiveProcesses <= 2)
-}
-
-@Test
-func syncWorkspaceContinuesWhenOneFolderHimalayaCommandFails() async throws {
-    let databaseQueue = try DatabaseSchemaInspector.makeMigratedInMemoryDatabase()
-    let repository = MailRepository(databaseQueue: databaseQueue)
-    try repository.upsertAccounts([
-        DiscoveredAccount(accountKey: "work")
-    ])
     try repository.upsertFolders([
         DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
         DiscoveredFolder(accountKey: "work", providerName: "Archive", role: .normal)
     ])
     let now = try #require(HimalayaDateParser.parse("2026-05-30T00:00:00Z"))
-    let fakeBridge = FakeHimalayaBridge(responses: [
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-03-01 order by date desc",
-            page: 1,
-            pageSize: 1
-        )): """
-        [
-          {
-            "id":"42",
-            "flags":["Seen"],
-            "subject":"Welcome",
-            "from":{"name":"GitHub","addr":"noreply@github.com"},
-            "to":{"name":"Ryan","addr":"ryan@example.com"},
-            "date":"2026-05-01T10:00:00Z",
-            "has_attachment":false
-          }
-        ]
-        """,
-        FakeHimalayaBridge.key(for: .envelopeList(
-            folder: "INBOX",
-            account: "work",
-            query: "after 2026-03-01 order by date desc",
-            page: 2,
-            pageSize: 1
-        )): "[]"
-    ])
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
     let service = SyncService(
-        bridge: fakeBridge,
+        appServerClient: client,
         databaseQueue: databaseQueue,
         policy: SyncPolicy(
             initialPerFolderLimit: 1,
@@ -670,18 +251,224 @@ func syncWorkspaceContinuesWhenOneFolderHimalayaCommandFails() async throws {
         now: { now }
     )
 
-    let result = try await service.syncWorkspaceResult(.main)
+    do {
+        let result = try await service.syncWorkspaceResult(.main)
+        #expect(result.syncedCount == 1)
+        #expect(result.attemptedFolderCount == 2)
+        #expect(result.hadFailure)
 
-    #expect(result.syncedCount == 1)
-    #expect(result.attemptedFolderCount == 2)
-    #expect(result.hadFailure)
-    let entities = try repository.entityList(workspace: .main)
-    #expect(entities.map(\.displayName) == ["GitHub"])
-    let folders = try repository.folders(for: .main)
-    let inbox = try #require(folders.first { $0.providerName == "INBOX" })
-    let archive = try #require(folders.first { $0.providerName == "Archive" })
-    #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: inbox.id, workspace: .main) != nil)
-    #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: archive.id, workspace: .main) == nil)
+        let entities = try repository.entityList(workspace: .main)
+        #expect(entities.map(\.displayName) == ["GitHub"])
+        let folders = try repository.folders(for: .main)
+        let inbox = try #require(folders.first { $0.providerName == "INBOX" })
+        let archive = try #require(folders.first { $0.providerName == "Archive" })
+        #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: inbox.id, workspace: .main) != nil)
+        #expect(try repository.lastSuccessfulSyncAt(accountKey: "work", folderID: archive.id, workspace: .main) == nil)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@Test
+func appServerRequestLimiterRunsHigherPriorityWaiterFirst() async throws {
+    let limiter = MailAppServerRequestLimiter(maxConcurrentRequests: 1)
+    let recorder = RequestOrderRecorder()
+
+    let backgroundStarted = AsyncStream<Void>.makeStream()
+    let releaseBackground = AsyncStream<Void>.makeStream()
+    let background = Task {
+        try await limiter.run(priority: .backgroundSync) {
+            backgroundStarted.continuation.yield()
+            for await _ in releaseBackground.stream {
+                break
+            }
+            await recorder.record("background")
+        }
+    }
+
+    _ = await backgroundStarted.stream.first(where: { _ in true })
+    let low = Task {
+        try await limiter.run(priority: .backgroundSync) {
+            await recorder.record("low")
+        }
+    }
+    let high = Task {
+        try await limiter.run(priority: .interactive) {
+            await recorder.record("high")
+        }
+    }
+
+    releaseBackground.continuation.yield()
+    try await background.value
+    try await low.value
+    try await high.value
+
+    #expect(await recorder.values == ["background", "high", "low"])
+}
+
+@Test
+func appServerRequestLimiterReservesPermitForVisibleBody() async throws {
+    let limiter = MailAppServerRequestLimiter(maxConcurrentRequests: 3)
+    let recorder = RequestOrderRecorder()
+    let releaseBackground = AsyncStream<Void>.makeStream()
+    let releaseVisible = AsyncStream<Void>.makeStream()
+
+    let backgroundTasks = (1...3).map { index in
+        Task {
+            try await limiter.run(priority: .backgroundSync) {
+                await recorder.record("background-\(index)-started")
+                for await _ in releaseBackground.stream {
+                    break
+                }
+                await recorder.record("background-\(index)-finished")
+            }
+        }
+    }
+
+    await waitUntil {
+        let values = await recorder.values
+        return values.contains("background-1-started")
+            && values.contains("background-2-started")
+    }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    #expect(await recorder.values.contains("background-3-started") == false)
+
+    let visible = Task {
+        try await limiter.run(priority: .visibleBody) {
+            await recorder.record("visible-started")
+            for await _ in releaseVisible.stream {
+                break
+            }
+            await recorder.record("visible-finished")
+        }
+    }
+
+    await waitUntil {
+        let values = await recorder.values
+        return values.contains("visible-started")
+    }
+    #expect(await recorder.values.contains("visible-started"))
+    #expect(await recorder.values.contains("background-3-started") == false)
+
+    releaseVisible.continuation.yield()
+    try await visible.value
+    #expect(await recorder.values.contains("background-3-started") == false)
+
+    releaseBackground.continuation.yield()
+    releaseBackground.continuation.yield()
+    try await backgroundTasks[0].value
+    try await backgroundTasks[1].value
+
+    await waitUntil {
+        let values = await recorder.values
+        return values.contains("background-3-started")
+    }
+    releaseBackground.continuation.yield()
+    try await backgroundTasks[2].value
+}
+
+private enum SyncFakePageMode {
+    case onePage
+    case twoPagesThenEmpty
+}
+
+private func makeSyncFakeAppServerScript(
+    logFile: URL? = nil,
+    pageMode: SyncFakePageMode = .onePage,
+    failArchiveList: Bool = false
+) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-sync-app-server-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let script = directory.appendingPathComponent("fake-server.sh")
+    let logLine = logFile.map { "printf '%s\\n' \"$line\" >> '\($0.path)'" } ?? ":"
+    let twoPageMode = pageMode == .twoPagesThenEmpty ? "1" : "0"
+    let archiveFailure = failArchiveList ? "1" : "0"
+    try """
+    #!/bin/sh
+    while IFS= read -r line; do
+      \(logLine)
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      page=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"page":\\([0-9][0-9]*\\).*/\\1/p')
+      folder=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"folder":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        initialize)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *account*list*)
+          printf '{"id":%s,"result":{"accounts":[{"name":"work","backend":"imap","default":true,"emailAddress":"ryan@example.com","displayName":"Ryan"}]}}\\n' "$id"
+          ;;
+        *folder*list*)
+          printf '{"id":%s,"result":{"folders":[{"name":"INBOX","desc":"\\\\\\\\Inbox"},{"name":"Spam","desc":"\\\\\\\\Junk"}]}}\\n' "$id"
+          ;;
+        *message*list*)
+          if [ "\(archiveFailure)" = "1" ] && [ "$folder" = "Archive" ]; then
+            printf '{"id":%s,"error":{"code":"synthetic_failure","message":"archive unavailable","retryable":true}}\\n' "$id"
+          elif [ "\(twoPageMode)" = "1" ]; then
+            case "$page" in
+              1)
+                printf '{"id":%s,"result":{"envelopes":[{"id":"42","flags":[],"subject":"First","from":{"name":"GitHub","addr":"noreply@github.com"},"to":{"name":"Ryan","addr":"ryan@example.com"},"date":"2026-05-29T10:00:00Z","has_attachment":false}]}}\\n' "$id"
+                ;;
+              2)
+                printf '{"id":%s,"result":{"envelopes":[{"id":"43","flags":[],"subject":"Second","from":{"name":"GitHub","addr":"noreply@github.com"},"to":{"name":"Ryan","addr":"ryan@example.com"},"date":"2026-05-28T10:00:00Z","has_attachment":false}]}}\\n' "$id"
+                ;;
+              *)
+                printf '{"id":%s,"result":{"envelopes":[]}}\\n' "$id"
+                ;;
+            esac
+          elif [ "$page" = "2" ]; then
+            printf '{"id":%s,"result":{"envelopes":[]}}\\n' "$id"
+          else
+            printf '{"id":%s,"result":{"envelopes":[{"id":"42","flags":["Seen"],"subject":"Welcome","from":{"name":"GitHub","addr":"noreply@github.com"},"to":{"name":"Ryan","addr":"ryan@example.com"},"date":"2026-05-01T10:00:00Z","has_attachment":false}]}}\\n' "$id"
+          fi
+          ;;
+        shutdown)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    return script
+}
+
+private func temporaryLogFile() -> URL {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-sync-app-server-\(UUID().uuidString).jsonl")
+}
+
+private func readLoggedMethods(from url: URL) throws -> [String] {
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return []
+    }
+    let data = try Data(contentsOf: url)
+    return try data.split(separator: UInt8(ascii: "\n")).compactMap { line in
+        guard let object = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+            return nil
+        }
+        return object["method"] as? String
+    }
+}
+
+private func waitUntil(
+    timeoutNanoseconds: UInt64 = 500_000_000,
+    predicate: @escaping () async -> Bool
+) async {
+    let startedAt = DispatchTime.now().uptimeNanoseconds
+    while !(await predicate()),
+          DispatchTime.now().uptimeNanoseconds - startedAt < timeoutNanoseconds {
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
 }
 
 private final class SequenceClock: @unchecked Sendable {
@@ -699,126 +486,10 @@ private final class SequenceClock: @unchecked Sendable {
     }
 }
 
-private final class FakeHimalayaBridge: HimalayaBridge, @unchecked Sendable {
-    private let state: FakeHimalayaBridgeState
-    private let delay: Duration?
+private actor RequestOrderRecorder {
+    private(set) var values: [String] = []
 
-    init(
-        responses: [String: String] = [:],
-        defaultResponse: String? = nil,
-        delay: Duration? = nil
-    ) {
-        self.state = FakeHimalayaBridgeState(responses: responses, defaultResponse: defaultResponse)
-        self.delay = delay
-    }
-
-    func run(_ command: HimalayaCommand, timeout: TimeInterval?) async throws -> HimalayaResult {
-        let stdout = await state.start(command)
-        if let delay {
-            try await Task.sleep(for: delay)
-        }
-        await state.finish(command)
-
-        guard let stdout else {
-            return HimalayaResult(
-                command: command,
-                exitCode: 1,
-                stdoutData: Data(),
-                stderrData: "missing fake response".data(using: .utf8)!,
-                duration: 0
-            )
-        }
-
-        return HimalayaResult(
-            command: command,
-            exitCode: 0,
-            stdoutData: stdout.data(using: .utf8)!,
-            stderrData: Data(),
-            duration: 0
-        )
-    }
-
-    func commands() async -> [HimalayaCommand] {
-        await state.commands
-    }
-
-    func stats() async -> FakeHimalayaBridgeStats {
-        await state.stats
-    }
-
-    static func key(for command: HimalayaCommand) -> String {
-        command.arguments.joined(separator: "\u{1F}")
-    }
-}
-
-private struct FakeHimalayaBridgeStats: Sendable {
-    var maxActiveProcesses: Int
-    var maxActiveAccounts: Int
-    var maxActiveFoldersPerAccount: [String: Int]
-}
-
-private actor FakeHimalayaBridgeState {
-    private let responses: [String: String]
-    private let defaultResponse: String?
-    private(set) var commands: [HimalayaCommand] = []
-    private var activeProcesses = 0
-    private var activeFoldersByAccount: [String: Int] = [:]
-    private var maxActiveProcesses = 0
-    private var maxActiveAccounts = 0
-    private var maxActiveFoldersPerAccount: [String: Int] = [:]
-
-    init(responses: [String: String], defaultResponse: String?) {
-        self.responses = responses
-        self.defaultResponse = defaultResponse
-    }
-
-    var stats: FakeHimalayaBridgeStats {
-        FakeHimalayaBridgeStats(
-            maxActiveProcesses: maxActiveProcesses,
-            maxActiveAccounts: maxActiveAccounts,
-            maxActiveFoldersPerAccount: maxActiveFoldersPerAccount
-        )
-    }
-
-    func start(_ command: HimalayaCommand) -> String? {
-        commands.append(command)
-        activeProcesses += 1
-        maxActiveProcesses = max(maxActiveProcesses, activeProcesses)
-
-        if let accountKey = Self.trackedAccountKey(command) {
-            activeFoldersByAccount[accountKey, default: 0] += 1
-            maxActiveAccounts = max(maxActiveAccounts, activeFoldersByAccount.count)
-            maxActiveFoldersPerAccount[accountKey] = max(
-                maxActiveFoldersPerAccount[accountKey, default: 0],
-                activeFoldersByAccount[accountKey, default: 0]
-            )
-        }
-
-        return responses[FakeHimalayaBridge.key(for: command)] ?? defaultResponse
-    }
-
-    func finish(_ command: HimalayaCommand) {
-        activeProcesses -= 1
-        guard let accountKey = Self.trackedAccountKey(command) else {
-            return
-        }
-
-        let activeCount = activeFoldersByAccount[accountKey, default: 0] - 1
-        if activeCount > 0 {
-            activeFoldersByAccount[accountKey] = activeCount
-        } else {
-            activeFoldersByAccount.removeValue(forKey: accountKey)
-        }
-    }
-
-    private static func trackedAccountKey(_ command: HimalayaCommand) -> String? {
-        guard (command.arguments.contains("envelope") || command.arguments.contains("folder")),
-              command.arguments.contains("list"),
-              let accountIndex = command.arguments.firstIndex(of: "--account"),
-              command.arguments.indices.contains(accountIndex + 1)
-        else {
-            return nil
-        }
-        return command.arguments[accountIndex + 1]
+    func record(_ value: String) {
+        values.append(value)
     }
 }

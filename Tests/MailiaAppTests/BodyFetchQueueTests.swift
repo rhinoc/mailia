@@ -40,6 +40,60 @@ func bodyFetchQueueRestartsOrphanedLoadingState() async {
 }
 
 @MainActor
+@Test
+func bodyFetchQueueDebouncesNonVisibleLoads() async throws {
+    let item = mailiaTimelineItem(id: 10, entityID: 1)
+    let body = MailiaTimelineBody(html: "<p>Hello</p>")
+    let provider = BodyFetchQueueProvider(body: body)
+    let queue = BodyFetchQueue(
+        provider: provider,
+        maxConcurrentBodyLoads: 1,
+        startDelayNanoseconds: { priority in priority == .visible ? 0 : 50_000_000 }
+    )
+    let delegate = BodyFetchQueueTestDelegate(items: [item], bodyStates: [:])
+    queue.delegate = delegate
+
+    queue.loadIfNeeded(for: item, priority: .nearby)
+
+    try await Task.sleep(nanoseconds: 10_000_000)
+    #expect(provider.loadBodyCallCount == 0)
+    #expect(delegate.bodyState(id: item.id) == nil)
+
+    await waitUntil {
+        delegate.bodyState(id: item.id) == .loaded(body)
+    }
+
+    #expect(provider.loadedItemIDs == [item.id])
+}
+
+@MainActor
+@Test
+func bodyFetchQueueStartsVisibleLoadAheadOfDebouncedPreview() async throws {
+    let previewItem = mailiaTimelineItem(id: 10, entityID: 1)
+    let visibleItem = mailiaTimelineItem(id: 11, entityID: 1)
+    let body = MailiaTimelineBody(html: "<p>Hello</p>")
+    let provider = BodyFetchQueueProvider(body: body)
+    let queue = BodyFetchQueue(
+        provider: provider,
+        maxConcurrentBodyLoads: 1,
+        startDelayNanoseconds: { priority in priority == .visible ? 0 : 200_000_000 }
+    )
+    let delegate = BodyFetchQueueTestDelegate(items: [previewItem, visibleItem], bodyStates: [:])
+    queue.delegate = delegate
+
+    queue.loadIfNeeded(for: previewItem, priority: .entityPreview, requiresTimelineMembership: false)
+    try await Task.sleep(nanoseconds: 10_000_000)
+    queue.loadIfNeeded(for: visibleItem, priority: .visible)
+
+    await waitUntil {
+        delegate.bodyState(id: visibleItem.id) == .loaded(body)
+    }
+
+    #expect(provider.loadedItemIDs.first == visibleItem.id)
+    #expect(delegate.bodyState(id: previewItem.id) == nil)
+}
+
+@MainActor
 private func waitUntil(
     timeoutNanoseconds: UInt64 = 500_000_000,
     predicate: @escaping @MainActor () -> Bool
@@ -56,6 +110,7 @@ private func mailiaTimelineItem(id: Int64, entityID: Int64) -> MailiaTimelineIte
         id: id,
         entityID: entityID,
         direction: .incoming,
+        rfcMessageID: "<message-\(id)@example.com>",
         subject: "Hello",
         preview: "Hello",
         html: nil,
@@ -67,6 +122,9 @@ private func mailiaTimelineItem(id: Int64, entityID: Int64) -> MailiaTimelineIte
         folderLabel: "Inbox",
         envelopeID: "envelope-\(id)",
         isFlagged: false,
+        from: MailAddress(displayName: "Alice", emailAddress: "alice@example.com"),
+        to: [MailAddress(displayName: "Ryan", emailAddress: "ryan@example.com")],
+        cc: [],
         fromLabel: "Alice <alice@example.com>",
         toLabel: "Ryan <ryan@example.com>",
         hasAttachments: false
@@ -125,6 +183,7 @@ private final class BodyFetchQueueTestDelegate: BodyFetchQueueDelegate {
 private final class BodyFetchQueueProvider: MailiaAppDataProviding {
     private let body: MailiaTimelineBody
     private(set) var loadBodyCallCount = 0
+    private(set) var loadedItemIDs: [Int64] = []
 
     init(body: MailiaTimelineBody) {
         self.body = body
@@ -132,6 +191,7 @@ private final class BodyFetchQueueProvider: MailiaAppDataProviding {
 
     func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody {
         loadBodyCallCount += 1
+        loadedItemIDs.append(item.id)
         return body
     }
 
@@ -206,6 +266,10 @@ private final class BodyFetchQueueProvider: MailiaAppDataProviding {
 
     func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws {
         fatalError("markEntityRead is not used in this test")
+    }
+
+    func markMessageRead(item: MailiaTimelineItem, workspace: MailiaWorkspace) async throws {
+        fatalError("markMessageRead is not used in this test")
     }
 
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws {

@@ -2,98 +2,163 @@ import Foundation
 import GRDB
 
 public struct SyncService {
-    private let bridge: any HimalayaBridge
+    private let appServerClient: MailAppServerClient
     private let repository: MailRepository
     private let himalayaConfigStore: HimalayaConfigStore
     private let policy: SyncPolicy
-    private let decoder: JSONDecoder
     private let windowCalculator: SyncWindowCalculator
-    private let himalayaCommandLimiter: HimalayaCommandLimiter
+    private let appServerRequestLimiter: MailAppServerRequestLimiter
     private let nowProvider: @Sendable () -> Date
 
     public init(
-        bridge: any HimalayaBridge,
+        appServerClient: MailAppServerClient,
         databaseQueue: DatabaseQueue,
         himalayaConfigStore: HimalayaConfigStore = HimalayaConfigStore(),
         policy: SyncPolicy = SyncPolicy(),
-        himalayaCommandLimiter: HimalayaCommandLimiter? = nil,
+        appServerRequestLimiter: MailAppServerRequestLimiter? = nil,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
-        self.bridge = bridge
+        self.appServerClient = appServerClient
         self.repository = MailRepository(databaseQueue: databaseQueue)
         self.himalayaConfigStore = himalayaConfigStore
         self.policy = policy
-        self.decoder = JSONDecoder()
         self.windowCalculator = SyncWindowCalculator(policy: policy)
-        self.himalayaCommandLimiter = himalayaCommandLimiter
-            ?? HimalayaCommandLimiter(maxConcurrentCommands: policy.maxConcurrentHimalayaProcesses)
+        self.appServerRequestLimiter = appServerRequestLimiter
+            ?? MailAppServerRequestLimiter(maxConcurrentRequests: policy.maxConcurrentHimalayaProcesses)
         self.nowProvider = now
     }
 
     @discardableResult
     public func discoverAccounts(timeout: TimeInterval? = nil) async throws -> [DiscoveredAccount] {
-        let result = try await runHimalaya(.accountList(), timeout: timeout).requireSuccess()
-        let decoded = try result.decodeJSON(as: HimalayaList<HimalayaAccountDTO>.self, decoder: decoder)
-        let configMetadata = (try? himalayaConfigStore.accountMetadata()) ?? [:]
-        let accounts = decoded.values
-            .map { accountDTO in
-                let metadata = configMetadata[accountDTO.name]
-                return accountDTO.discoveredAccount(metadata: metadata)
+        let timingStartedAt = Date()
+        do {
+            let serverAccounts = try await runAppServer(priority: .backgroundSync) {
+                try await appServerClient.accountList(timeout: timeout)
             }
-            .filter { !$0.accountKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        try repository.upsertAccounts(accounts)
-        return accounts
+            let configMetadata = (try? himalayaConfigStore.accountMetadata()) ?? [:]
+            let accounts = serverAccounts
+                .map { accountDTO in
+                    let metadata = configMetadata[accountDTO.name]
+                    return accountDTO.discoveredAccount(metadata: metadata)
+                }
+                .filter { !$0.accountKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            try repository.upsertAccounts(accounts)
+            MailiaTiming.log(
+                operation: "sync.discover_accounts",
+                startedAt: timingStartedAt,
+                fields: [.label("account_count", accounts.count)]
+            )
+            return accounts
+        } catch {
+            MailiaTiming.log(operation: "sync.discover_accounts", startedAt: timingStartedAt, status: "failure")
+            throw error
+        }
     }
 
     @discardableResult
     public func discoverFolders(
         accountKey: String,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        source: String? = nil
     ) async throws -> [DiscoveredFolder] {
-        let result = try await runHimalaya(.folderList(account: accountKey), timeout: timeout).requireSuccess()
-        let decoded = try result.decodeJSON(as: HimalayaList<HimalayaFolderDTO>.self, decoder: decoder)
-        let folders = decoded.values
-            .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .map {
-                $0.discoveredFolder(accountKey: accountKey)
+        let timingStartedAt = Date()
+        let baseFields = [.redacted("account", accountKey)] + Self.folderDiscoverySourceFields(source)
+        do {
+            let serverFolders = try await runAppServer(priority: .backgroundSync) {
+                try await appServerClient.folderList(account: accountKey, timeout: timeout)
             }
-        try repository.upsertFolders(folders)
-        try repository.markAccountSyncStatus(accountKey: accountKey, status: "ok")
-        return folders
+            let folders = serverFolders
+                .filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .map {
+                    $0.discoveredFolder(accountKey: accountKey)
+                }
+            try repository.replaceDiscoveredFolders(accountKey: accountKey, folders: folders)
+            try repository.markAccountSyncStatus(accountKey: accountKey, status: "ok")
+            MailiaTiming.log(
+                operation: "sync.discover_folders",
+                startedAt: timingStartedAt,
+                fields: baseFields + folderRoleCountFields(folders)
+            )
+            return folders
+        } catch {
+            MailiaTiming.log(
+                operation: "sync.discover_folders",
+                startedAt: timingStartedAt,
+                status: "failure",
+                fields: baseFields
+            )
+            throw error
+        }
     }
 
     @discardableResult
-    public func discoverFoldersForDiscoveredAccounts(timeout: TimeInterval? = nil) async throws -> [DiscoveredFolder] {
-        let accounts = try await discoverAccounts(timeout: timeout)
-        let accountSemaphore = AsyncSemaphore(permits: policy.maxConcurrentAccounts)
+    public func discoverFoldersForDiscoveredAccounts(
+        timeout: TimeInterval? = nil,
+        source: String? = nil
+    ) async throws -> [DiscoveredFolder] {
+        let timingStartedAt = Date()
+        let timingFields = Self.folderDiscoverySourceFields(source)
+        do {
+            let accounts = try await discoverAccounts(timeout: timeout)
+            let accountSemaphore = AsyncSemaphore(permits: policy.maxConcurrentAccounts)
 
-        return try await withThrowingTaskGroup(of: [DiscoveredFolder].self) { group in
-            for account in accounts {
-                group.addTask {
-                    try await withPermit(accountSemaphore) {
-                        do {
-                            return try await discoverFolders(accountKey: account.accountKey, timeout: timeout)
-                        } catch let error as CancellationError {
-                            throw error
-                        } catch let error as HimalayaError {
-                            NSLog("Unable to discover folders for account \(account.accountKey): \(error.localizedDescription)")
-                            try? repository.markAccountSyncStatus(
-                                accountKey: account.accountKey,
-                                status: "failed",
-                                errorMessage: error.localizedDescription
-                            )
-                            return []
+            let folders = try await withThrowingTaskGroup(of: [DiscoveredFolder].self) { group in
+                for account in accounts {
+                    group.addTask {
+                        try await withPermit(accountSemaphore) {
+                            do {
+                                return try await discoverFolders(
+                                    accountKey: account.accountKey,
+                                    timeout: timeout,
+                                    source: source
+                                )
+                            } catch let error as CancellationError {
+                                throw error
+                            } catch {
+                                NSLog("Unable to discover folders for account \(account.accountKey): \(error.localizedDescription)")
+                                try? repository.markAccountSyncStatus(
+                                    accountKey: account.accountKey,
+                                    status: "failed",
+                                    errorMessage: error.localizedDescription
+                                )
+                                return []
+                            }
                         }
                     }
                 }
-            }
 
-            var folders: [DiscoveredFolder] = []
-            for try await accountFolders in group {
-                folders += accountFolders
+                var folders: [DiscoveredFolder] = []
+                for try await accountFolders in group {
+                    folders += accountFolders
+                }
+                return folders
             }
+            MailiaTiming.log(
+                operation: "sync.discover_folders_all",
+                startedAt: timingStartedAt,
+                fields: timingFields + [
+                    .label("account_count", accounts.count),
+                    .label("folder_count", folders.count)
+                ]
+            )
             return folders
+        } catch {
+            MailiaTiming.log(
+                operation: "sync.discover_folders_all",
+                startedAt: timingStartedAt,
+                status: "failure",
+                fields: timingFields
+            )
+            throw error
         }
+    }
+
+    @discardableResult
+    public func discoverFoldersForRefresh(
+        timeout: TimeInterval? = nil,
+        source: String? = nil
+    ) async throws -> [DiscoveredFolder] {
+        return try await discoverFoldersForDiscoveredAccounts(timeout: timeout, source: source)
     }
 
     @discardableResult
@@ -126,63 +191,115 @@ public struct SyncService {
         timeout: TimeInterval? = nil,
         onProgress: (@Sendable (SyncWorkspaceProgress) -> Void)? = nil
     ) async throws -> SyncWorkspaceResult {
+        let timingStartedAt = Date()
+        let baseFields: [MailiaTimingField] = [
+            .label("workspace", workspace.rawValue),
+            .label("full_history", fullHistory)
+        ]
+        do {
+            let normalizedAccountKeys: Set<String>?
+            if let accountKeys {
+                let normalized = Set(
+                    accountKeys
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                )
+                guard !normalized.isEmpty else {
+                    let result = SyncWorkspaceResult(syncedCount: 0, attemptedFolderCount: 0, hadFailure: false)
+                    MailiaTiming.log(
+                        operation: "sync.workspace",
+                        startedAt: timingStartedAt,
+                        fields: baseFields + syncWorkspaceResultFields(result)
+                    )
+                    return result
+                }
+                normalizedAccountKeys = normalized
+            } else {
+                normalizedAccountKeys = nil
+            }
+            var folders = try syncableFolders(
+                workspace: workspace,
+                accountKeys: normalizedAccountKeys,
+                folderRoles: folderRoles
+            )
+            if folders.isEmpty {
+                _ = try await discoverFoldersForDiscoveredAccounts(
+                    timeout: timeout,
+                    source: "sync_empty_fallback"
+                )
+                folders = try syncableFolders(
+                    workspace: workspace,
+                    accountKeys: normalizedAccountKeys,
+                    folderRoles: folderRoles
+                )
+            }
+            let totalFolders = folders.count
+            let shouldMarkAccountCheckpoint = accountKeys == nil && folderRoles == nil
+
+            let onFolderSynced = makeProgressHandler(
+                workspace: workspace,
+                totalUnits: totalFolders,
+                onProgress: onProgress
+            )
+
+            let outcomes = try await runByAccount(
+                folders: folders,
+                priorityScores: accountPriorityScores
+            ) { accountKey, accountFolders in
+                let accountSyncStartedAt = nowProvider()
+                let outcome = try await syncFolders(
+                    accountFolders,
+                    workspace: workspace,
+                    fullHistory: fullHistory,
+                    timeout: timeout,
+                    onFolderSynced: onFolderSynced
+                )
+
+                if shouldMarkAccountCheckpoint, !accountFolders.isEmpty, !outcome.hadFailure {
+                    try repository.markAccountSyncSucceeded(
+                        accountKey: accountKey,
+                        workspace: workspace,
+                        at: accountSyncStartedAt,
+                        startedAt: accountSyncStartedAt,
+                        finishedAt: nowProvider()
+                    )
+                }
+                if !accountFolders.isEmpty, !outcome.hadFailure {
+                    try repository.markAccountSyncStatus(accountKey: accountKey, status: "ok")
+                }
+                return outcome
+            }
+            let totalSynced = outcomes.reduce(0) { $0 + $1.syncedCount }
+            let result = SyncWorkspaceResult(
+                syncedCount: totalSynced,
+                attemptedFolderCount: totalFolders,
+                hadFailure: outcomes.contains { $0.hadFailure }
+            )
+            MailiaTiming.log(
+                operation: "sync.workspace",
+                startedAt: timingStartedAt,
+                fields: baseFields + syncWorkspaceResultFields(result)
+            )
+            return result
+        } catch {
+            MailiaTiming.log(operation: "sync.workspace", startedAt: timingStartedAt, status: "failure", fields: baseFields)
+            throw error
+        }
+    }
+
+    private func syncableFolders(
+        workspace: Workspace,
+        accountKeys: Set<String>?,
+        folderRoles: Set<FolderRole>?
+    ) throws -> [StoredFolder] {
         var folders = try repository.folders(for: workspace)
         if let accountKeys {
-            let normalizedAccountKeys = Set(
-                accountKeys
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-            )
-            guard !normalizedAccountKeys.isEmpty else {
-                return SyncWorkspaceResult(syncedCount: 0, attemptedFolderCount: 0, hadFailure: false)
-            }
-            folders = folders.filter { normalizedAccountKeys.contains($0.accountKey) }
+            folders = folders.filter { accountKeys.contains($0.accountKey) }
         }
         if let folderRoles {
             folders = folders.filter { folderRoles.contains($0.role) }
         }
-        let totalFolders = folders.count
-        let shouldMarkAccountCheckpoint = accountKeys == nil && folderRoles == nil
-
-        let onFolderSynced = makeProgressHandler(
-            workspace: workspace,
-            totalUnits: totalFolders,
-            onProgress: onProgress
-        )
-
-        let outcomes = try await runByAccount(
-            folders: folders,
-            priorityScores: accountPriorityScores
-        ) { accountKey, accountFolders in
-            let accountSyncStartedAt = nowProvider()
-            let outcome = try await syncFolders(
-                accountFolders,
-                workspace: workspace,
-                fullHistory: fullHistory,
-                timeout: timeout,
-                onFolderSynced: onFolderSynced
-            )
-
-            if shouldMarkAccountCheckpoint, !accountFolders.isEmpty, !outcome.hadFailure {
-                try repository.markAccountSyncSucceeded(
-                    accountKey: accountKey,
-                    workspace: workspace,
-                    at: accountSyncStartedAt,
-                    startedAt: accountSyncStartedAt,
-                    finishedAt: nowProvider()
-                )
-            }
-            if !accountFolders.isEmpty, !outcome.hadFailure {
-                try repository.markAccountSyncStatus(accountKey: accountKey, status: "ok")
-            }
-            return outcome
-        }
-        let totalSynced = outcomes.reduce(0) { $0 + $1.syncedCount }
-        return SyncWorkspaceResult(
-            syncedCount: totalSynced,
-            attemptedFolderCount: totalFolders,
-            hadFailure: outcomes.contains { $0.hadFailure }
-        )
+        return folders
     }
 
     @discardableResult
@@ -193,41 +310,59 @@ public struct SyncService {
         timeout: TimeInterval? = nil,
         onFolderSynced: (@Sendable (Int) -> Void)? = nil
     ) async throws -> Int {
-        let syncStartedAt = nowProvider()
-        let lastSuccessfulSyncAt = try repository.lastSuccessfulSyncAt(
-            accountKey: folder.accountKey,
-            folderID: folder.id,
-            workspace: workspace
-        )
-        let window = fullHistory
-            ? windowCalculator.fullHistoryWindow(checkpointHighWater: syncStartedAt)
-            : windowCalculator.incrementalWindow(
-                now: syncStartedAt,
-                lastSuccessfulSyncAt: lastSuccessfulSyncAt,
-                isJunk: workspace == .junk || folder.role == .junk
+        let timingStartedAt = Date()
+        let baseFields: [MailiaTimingField] = [
+            .label("workspace", workspace.rawValue),
+            .redacted("account", folder.accountKey),
+            .redacted("folder", folder.providerName),
+            .label("folder_role", folder.role.rawValue),
+            .label("full_history", fullHistory)
+        ]
+        do {
+            let syncStartedAt = nowProvider()
+            let lastSuccessfulSyncAt = try repository.lastSuccessfulSyncAt(
+                accountKey: folder.accountKey,
+                folderID: folder.id,
+                workspace: workspace
             )
-        let pageResult = try await makeEnvelopePageSyncer().sync(
-            folder: folder,
-            query: syncQuery(startDate: window.startDate),
-            window: window,
-            timeout: timeout,
-            progress: { result in
-                onFolderSynced?(result.syncedCount)
-            },
-            checkpoint: { result in
-                try repository.markFolderSyncSucceeded(
-                    accountKey: folder.accountKey,
-                    folderID: folder.id,
-                    workspace: workspace,
-                    at: window.checkpointHighWater ?? syncStartedAt,
-                    startedAt: syncStartedAt,
-                    finishedAt: nowProvider(),
-                    queryStartAt: window.queryStart,
-                    oldestSyncedMessageDate: result.oldestSyncedMessageDate
+            let window = fullHistory
+                ? windowCalculator.fullHistoryWindow(checkpointHighWater: syncStartedAt)
+                : windowCalculator.incrementalWindow(
+                    now: syncStartedAt,
+                    lastSuccessfulSyncAt: lastSuccessfulSyncAt,
+                    isJunk: workspace == .junk || folder.role == .junk
                 )
-            }
-        )
-        return pageResult.syncedCount
+            let pageResult = try await makeEnvelopePageSyncer().sync(
+                folder: folder,
+                query: syncQuery(startDate: window.startDate),
+                window: window,
+                timeout: timeout,
+                progress: { result in
+                    onFolderSynced?(result.syncedCount)
+                },
+                checkpoint: { result in
+                    try repository.markFolderSyncSucceeded(
+                        accountKey: folder.accountKey,
+                        folderID: folder.id,
+                        workspace: workspace,
+                        at: window.checkpointHighWater ?? syncStartedAt,
+                        startedAt: syncStartedAt,
+                        finishedAt: nowProvider(),
+                        queryStartAt: window.queryStart,
+                        oldestSyncedMessageDate: result.oldestSyncedMessageDate
+                    )
+                }
+            )
+            MailiaTiming.log(
+                operation: "sync.folder",
+                startedAt: timingStartedAt,
+                fields: baseFields + [.label("message_count", pageResult.syncedCount)]
+            )
+            return pageResult.syncedCount
+        } catch {
+            MailiaTiming.log(operation: "sync.folder", startedAt: timingStartedAt, status: "failure", fields: baseFields)
+            throw error
+        }
     }
 
     @discardableResult
@@ -237,44 +372,72 @@ public struct SyncService {
         timeout: TimeInterval? = nil,
         onProgress: (@Sendable (SyncWorkspaceProgress) -> Void)? = nil
     ) async throws -> Int {
-        let normalizedEmailAddresses = emailAddresses
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .filter { !$0.isEmpty && $0.contains("@") }
-            .sorted()
-        guard !normalizedEmailAddresses.isEmpty else { return 0 }
-
-        let folders = try repository.folders(for: workspace)
-        let totalQueries = folders.count * normalizedEmailAddresses.count * 2
-
-        let onQuerySynced = makeProgressHandler(
-            workspace: workspace,
-            totalUnits: totalQueries,
-            onProgress: onProgress
-        )
-
-        let accountSyncedCounts = try await runByAccount(folders: folders) { _, accountFolders in
-            var syncedCount = 0
-            for folder in accountFolders {
-                for emailAddress in normalizedEmailAddresses {
-                    syncedCount += try await syncFilteredFolderBestEffort(
-                        folder,
-                        workspace: workspace,
-                        filter: "from \(emailAddress)",
-                        timeout: timeout,
-                        onQuerySynced: onQuerySynced
-                    )
-                    syncedCount += try await syncFilteredFolderBestEffort(
-                        folder,
-                        workspace: workspace,
-                        filter: "to \(emailAddress)",
-                        timeout: timeout,
-                        onQuerySynced: onQuerySynced
-                    )
-                }
+        let timingStartedAt = Date()
+        let baseFields: [MailiaTimingField] = [.label("workspace", workspace.rawValue)]
+        do {
+            let normalizedEmailAddresses = emailAddresses
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty && $0.contains("@") }
+                .sorted()
+            guard !normalizedEmailAddresses.isEmpty else {
+                MailiaTiming.log(
+                    operation: "sync.entity_history",
+                    startedAt: timingStartedAt,
+                    fields: baseFields + [
+                        .label("address_count", 0),
+                        .label("synced_count", 0)
+                    ]
+                )
+                return 0
             }
+
+            let folders = try repository.folders(for: workspace)
+            let totalQueries = folders.count * normalizedEmailAddresses.count * 2
+
+            let onQuerySynced = makeProgressHandler(
+                workspace: workspace,
+                totalUnits: totalQueries,
+                onProgress: onProgress
+            )
+
+            let accountSyncedCounts = try await runByAccount(folders: folders) { _, accountFolders in
+                var syncedCount = 0
+                for folder in accountFolders {
+                    for emailAddress in normalizedEmailAddresses {
+                        syncedCount += try await syncFilteredFolderBestEffort(
+                            folder,
+                            workspace: workspace,
+                            filter: "from \(emailAddress)",
+                            timeout: timeout,
+                            onQuerySynced: onQuerySynced
+                        )
+                        syncedCount += try await syncFilteredFolderBestEffort(
+                            folder,
+                            workspace: workspace,
+                            filter: "to \(emailAddress)",
+                            timeout: timeout,
+                            onQuerySynced: onQuerySynced
+                        )
+                    }
+                }
+                return syncedCount
+            }
+            let syncedCount = accountSyncedCounts.reduce(0, +)
+            MailiaTiming.log(
+                operation: "sync.entity_history",
+                startedAt: timingStartedAt,
+                fields: baseFields + [
+                    .label("address_count", normalizedEmailAddresses.count),
+                    .label("folder_count", folders.count),
+                    .label("query_count", totalQueries),
+                    .label("synced_count", syncedCount)
+                ]
+            )
             return syncedCount
+        } catch {
+            MailiaTiming.log(operation: "sync.entity_history", startedAt: timingStartedAt, status: "failure", fields: baseFields)
+            throw error
         }
-        return accountSyncedCounts.reduce(0, +)
     }
 
     private func makeProgressHandler(
@@ -410,7 +573,7 @@ public struct SyncService {
             return SyncFoldersOutcome(syncedCount: count, hadFailure: false)
         } catch let error as CancellationError {
             throw error
-        } catch let error as HimalayaError {
+        } catch {
             NSLog(
                 "Unable to sync folder \(folder.providerName) for account \(folder.accountKey) in \(workspace.rawValue): \(error.localizedDescription)"
             )
@@ -431,17 +594,40 @@ public struct SyncService {
         timeout: TimeInterval?,
         onQuerySynced: (@Sendable (Int) -> Void)? = nil
     ) async throws -> Int {
-        let window = windowCalculator.fullHistoryWindow()
-        let pageResult = try await makeEnvelopePageSyncer().sync(
-            folder: folder,
-            query: syncQuery(startDate: window.startDate, filter: filter),
-            window: window,
-            timeout: timeout,
-            progress: { result in
-                onQuerySynced?(result.uniqueSyncedCount)
-            }
-        )
-        return pageResult.uniqueSyncedCount
+        let timingStartedAt = Date()
+        let baseFields: [MailiaTimingField] = [
+            .label("workspace", workspace.rawValue),
+            .redacted("account", folder.accountKey),
+            .redacted("folder", folder.providerName),
+            .label("folder_role", folder.role.rawValue),
+            .label("filter_direction", filter.hasPrefix("to ") ? "to" : "from")
+        ]
+        do {
+            let window = windowCalculator.fullHistoryWindow()
+            let pageResult = try await makeEnvelopePageSyncer().sync(
+                folder: folder,
+                query: syncQuery(startDate: window.startDate, filter: filter),
+                window: window,
+                timeout: timeout,
+                progress: { result in
+                    onQuerySynced?(result.uniqueSyncedCount)
+                }
+            )
+            MailiaTiming.log(
+                operation: "sync.filtered_folder",
+                startedAt: timingStartedAt,
+                fields: baseFields + [.label("message_count", pageResult.uniqueSyncedCount)]
+            )
+            return pageResult.uniqueSyncedCount
+        } catch {
+            MailiaTiming.log(
+                operation: "sync.filtered_folder",
+                startedAt: timingStartedAt,
+                status: "failure",
+                fields: baseFields
+            )
+            throw error
+        }
     }
 
     private func syncFilteredFolderBestEffort(
@@ -461,7 +647,7 @@ public struct SyncService {
             )
         } catch let error as CancellationError {
             throw error
-        } catch let error as HimalayaError {
+        } catch {
             NSLog(
                 "Unable to sync filtered folder \(folder.providerName) for account \(folder.accountKey) in \(workspace.rawValue): \(error.localizedDescription)"
             )
@@ -470,21 +656,49 @@ public struct SyncService {
         }
     }
 
-    private func runHimalaya(
-        _ command: HimalayaCommand,
-        timeout: TimeInterval?
-    ) async throws -> HimalayaResult {
-        try await himalayaCommandLimiter.run(
-            command,
-            bridge: bridge,
-            timeout: timeout,
-            priority: .backgroundSync
-        )
+    private func runAppServer<Result: Sendable>(
+        priority: MailAppServerRequestPriority,
+        operation: @escaping @Sendable () async throws -> Result
+    ) async throws -> Result {
+        try await appServerRequestLimiter.run(priority: priority, operation: operation)
     }
 
     private func makeEnvelopePageSyncer() -> EnvelopePageSyncer {
-        EnvelopePageSyncer(repository: repository, decoder: decoder) { command, timeout in
-            try await runHimalaya(command, timeout: timeout)
+        EnvelopePageSyncer(repository: repository) { folder, query, page, pageSize, timeout in
+            let timingStartedAt = Date()
+            let fields: [MailiaTimingField] = [
+                .redacted("account", folder.accountKey),
+                .redacted("folder", folder.providerName),
+                .label("folder_role", folder.role.rawValue),
+                .label("page", page),
+                .label("page_size", pageSize)
+            ]
+            do {
+                let envelopes = try await runAppServer(priority: .backgroundSync) {
+                    try await appServerClient.messageList(
+                        folder: folder.providerName,
+                        account: folder.accountKey,
+                        query: query,
+                        page: page,
+                        pageSize: pageSize,
+                        timeout: timeout
+                    )
+                }
+                MailiaTiming.log(
+                    operation: "sync.message_list_page",
+                    startedAt: timingStartedAt,
+                    fields: fields + [.label("envelope_count", envelopes.count)]
+                )
+                return envelopes
+            } catch {
+                MailiaTiming.log(
+                    operation: "sync.message_list_page",
+                    startedAt: timingStartedAt,
+                    status: "failure",
+                    fields: fields
+                )
+                throw error
+            }
         }
     }
 
@@ -549,21 +763,49 @@ public struct SyncService {
         }
     }
 
+    private func folderRoleCountFields(_ folders: [DiscoveredFolder]) -> [MailiaTimingField] {
+        let counts = Dictionary(grouping: folders, by: \.role).mapValues(\.count)
+        return [
+            .label("folder_count", folders.count),
+            .label("normal_count", counts[.normal] ?? 0),
+            .label("sent_count", counts[.sent] ?? 0),
+            .label("junk_count", counts[.junk] ?? 0),
+            .label("trash_count", counts[.trash] ?? 0),
+            .label("other_count", folders.count
+                - (counts[.normal] ?? 0)
+                - (counts[.sent] ?? 0)
+                - (counts[.junk] ?? 0)
+                - (counts[.trash] ?? 0))
+        ]
+    }
+
+    private static func folderDiscoverySourceFields(_ source: String?) -> [MailiaTimingField] {
+        guard let source,
+              !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return [] }
+        return [.label("source", source)]
+    }
+
+    private func syncWorkspaceResultFields(_ result: SyncWorkspaceResult) -> [MailiaTimingField] {
+        [
+            .label("synced_count", result.syncedCount),
+            .label("attempted_folder_count", result.attemptedFolderCount),
+            .label("had_failure", result.hadFailure)
+        ]
+    }
+
 }
 
 private struct EnvelopePageSyncer {
     private let repository: MailRepository
-    private let decoder: JSONDecoder
-    private let runHimalaya: @Sendable (HimalayaCommand, TimeInterval?) async throws -> HimalayaResult
+    private let listMessages: @Sendable (StoredFolder, String, Int, Int, TimeInterval?) async throws -> [MailAppServerMessageEnvelope]
 
     init(
         repository: MailRepository,
-        decoder: JSONDecoder,
-        runHimalaya: @escaping @Sendable (HimalayaCommand, TimeInterval?) async throws -> HimalayaResult
+        listMessages: @escaping @Sendable (StoredFolder, String, Int, Int, TimeInterval?) async throws -> [MailAppServerMessageEnvelope]
     ) {
         self.repository = repository
-        self.decoder = decoder
-        self.runHimalaya = runHimalaya
+        self.listMessages = listMessages
     }
 
     @discardableResult
@@ -580,19 +822,8 @@ private struct EnvelopePageSyncer {
         var syncResult = EnvelopePageSyncResult()
 
         while true {
-            let result = try await runHimalaya(
-                .envelopeList(
-                    folder: folder.providerName,
-                    account: folder.accountKey,
-                    query: query,
-                    page: page,
-                    pageSize: pageSize
-                ),
-                timeout
-            ).requireSuccess()
-
-            let decoded = try result.decodeJSON(as: HimalayaList<HimalayaEnvelopeDTO>.self, decoder: decoder)
-            let bounded = decoded.values.prefix(pageSize)
+            let listed = try await listMessages(folder, query, page, pageSize, timeout)
+            let bounded = listed.prefix(pageSize)
             let envelopes = bounded.map {
                 $0.envelopeMessage(
                     accountKey: folder.accountKey,
@@ -600,10 +831,20 @@ private struct EnvelopePageSyncer {
                     folderRole: folder.role
                 )
             }
-            let ids = try repository.upsertEnvelopes(envelopes)
+            let ids = try MailiaTiming.measure(
+                operation: "repository.upsert_envelopes",
+                fields: [
+                    .redacted("account", folder.accountKey),
+                    .redacted("folder", folder.providerName),
+                    .label("folder_role", folder.role.rawValue),
+                    .label("envelope_count", envelopes.count)
+                ]
+            ) {
+                try repository.upsertEnvelopes(envelopes)
+            }
             syncResult.record(ids: ids, envelopes: envelopes)
 
-            guard decoded.values.count >= pageSize else { break }
+            guard listed.count >= pageSize else { break }
             page += 1
         }
 

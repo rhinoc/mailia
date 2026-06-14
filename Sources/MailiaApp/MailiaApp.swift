@@ -541,6 +541,7 @@ private struct ContentView: View {
             TimelinePane(
                 entity: selectedEntity,
                 items: selectedTimeline,
+                loadingStatus: viewModel.refreshStatus,
                 isLoadingTimeline: viewModel.isLoadingTimeline,
                 isLoadingOlderTimeline: viewModel.isLoadingOlderTimeline,
                 isLoadingNewerTimeline: viewModel.isLoadingNewerTimeline,
@@ -777,7 +778,7 @@ private struct EntityListPane: View {
                     }
 
                     if viewModel.entities.isEmpty, viewModel.isLoadingEntityList {
-                        SidebarTransitionPlaceholderRow()
+                        SidebarTransitionPlaceholderRow(status: viewModel.refreshStatus)
                             .listRowSeparator(.hidden)
                     } else if viewModel.entities.isEmpty {
                         EmptyEntityRow(searchQuery: viewModel.searchQuery)
@@ -1813,11 +1814,72 @@ private struct EmptyEntityRow: View {
 }
 
 private struct SidebarTransitionPlaceholderRow: View {
+    let status: String
+
+    private var displayStatus: String {
+        status == "Ready" ? "Loading..." : status
+    }
+
     var body: some View {
-        Color.clear
-            .frame(maxWidth: .infinity)
-            .frame(height: 220)
-            .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 8)
+
+            VStack(spacing: 10) {
+                ForEach(0..<4, id: \.self) { index in
+                    SidebarLoadingSkeletonRow(seed: index)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 8)
+        .accessibilityLabel(displayStatus)
+    }
+}
+
+private struct SidebarLoadingSkeletonRow: View {
+    let seed: Int
+
+    private var titleWidth: CGFloat {
+        [132, 184, 156, 118][seed % 4]
+    }
+
+    private var subtitleWidth: CGFloat {
+        [214, 168, 236, 190][seed % 4]
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            LoadingSkeletonShape(cornerRadius: 18)
+                .frame(width: 36, height: 36)
+
+            VStack(alignment: .leading, spacing: 7) {
+                LoadingSkeletonShape(cornerRadius: 4)
+                    .frame(width: titleWidth, height: 10)
+
+                LoadingSkeletonShape(cornerRadius: 4)
+                    .frame(width: subtitleWidth, height: 9)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .frame(minHeight: 48)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct LoadingSkeletonShape: View {
+    let cornerRadius: CGFloat
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(Color(nsColor: .separatorColor).opacity(0.26))
     }
 }
 
@@ -1826,6 +1888,7 @@ private struct TimelinePane: View {
 
     let entity: MailiaEntitySummary?
     let items: [MailiaTimelineItem]
+    let loadingStatus: String
     let isLoadingTimeline: Bool
     let isLoadingOlderTimeline: Bool
     let isLoadingNewerTimeline: Bool
@@ -1896,7 +1959,7 @@ private struct TimelinePane: View {
                     onSyncEntityHistory: onSyncEntityHistory
                 )
             } else if isLoadingEntityList {
-                TimelineTransitionPlaceholderView()
+                TimelineTransitionPlaceholderView(status: loadingStatus)
             } else {
                 EmptyTimelineSelectionView(hasSelectableEntities: hasSelectableEntities)
             }
@@ -1905,15 +1968,38 @@ private struct TimelinePane: View {
 }
 
 private struct TimelineTransitionPlaceholderView: View {
+    let status: String
+
+    private var displayStatus: String {
+        status == "Ready" ? "Loading..." : status
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             Color(nsColor: .textBackgroundColor)
+
+            VStack(spacing: 14) {
+                ProgressView()
+                    .controlSize(.regular)
+
+                VStack(spacing: 10) {
+                    LoadingSkeletonShape(cornerRadius: 5)
+                        .frame(width: 180, height: 12)
+                    LoadingSkeletonShape(cornerRadius: 5)
+                        .frame(width: 124, height: 10)
+                }
+                .accessibilityHidden(true)
+            }
+            .frame(maxWidth: 320)
+            .padding(32)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+
             WindowDragRegion()
                 .frame(height: MailiaTopChrome.controlTopPadding)
                 .frame(maxWidth: .infinity, alignment: .top)
         }
         .ignoresSafeArea(.container, edges: .top)
-        .accessibilityHidden(true)
+        .accessibilityLabel(displayStatus)
     }
 }
 
@@ -3497,7 +3583,7 @@ private struct CacheSettingsTable: View {
         case .avatars:
             EntityBrandAvatarResolver.defaultDiskCacheDirectory()
         case .messageBodies:
-            try? MailiaEnvironment.live().applicationSupportDirectory
+            try? MailiaEnvironment.applicationSupportDirectory()
         }
     }
 

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mailia-mail-core",
+    "crates/mailia-mail-himalaya",
+    "crates/mailia-mail-protocol",
+    "crates/mailia-mail-server",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.87"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = "0.4"
+dirs = "6"
+io-imap = { version = "=0.1.0", default-features = true }
+io-smtp = { version = "=0.1.0", default-features = true }
+mail-parser = "=0.9.4"
+pimalaya-config = { version = "=0.0.1", default-features = true }
+pimalaya-stream = { version = "=0.0.1", default-features = true }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+url = "2"

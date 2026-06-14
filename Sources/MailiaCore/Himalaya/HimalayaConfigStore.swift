@@ -185,7 +185,6 @@ public struct HimalayaConfigStore {
         if let home = environment["HOME"]?.nilIfBlank {
             let homeURL = URL(fileURLWithPath: home.expandingTildeInPath)
             urls.append(homeURL.appendingPathComponent(".config/himalaya/config.toml"))
-            urls.append(homeURL.appendingPathComponent(".himalayarc"))
         }
 
         return urls

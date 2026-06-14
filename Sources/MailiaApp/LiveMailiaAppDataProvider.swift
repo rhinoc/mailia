@@ -45,6 +45,7 @@ protocol MailiaAppDataProviding {
         workspace: MailiaWorkspace,
         progress: @escaping @MainActor (String) -> Void
     ) async throws
+    func markMessageRead(item: MailiaTimelineItem, workspace: MailiaWorkspace) async throws
     func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws
     func downloadAttachments(for item: MailiaTimelineItem) async throws -> MailiaAttachmentDownloadResult
@@ -89,14 +90,64 @@ private actor RefreshProgressAggregator {
     }
 }
 
-private enum MailiaSyncFailure: LocalizedError {
+private enum BackgroundFolderRefreshDecision: String, Sendable {
+    case start
+    case skipInFlight = "in_flight"
+    case skipRecentlyAttempted = "recently_attempted"
+}
+
+private actor BackgroundFolderRefreshGate {
+    private let minimumInterval: TimeInterval
+    private var isRunning = false
+    private var lastAttemptStartedAt: Date?
+
+    init(minimumInterval: TimeInterval) {
+        self.minimumInterval = minimumInterval
+    }
+
+    func begin(now: Date) -> BackgroundFolderRefreshDecision {
+        if isRunning {
+            return .skipInFlight
+        }
+        if let lastAttemptStartedAt,
+           now.timeIntervalSince(lastAttemptStartedAt) < minimumInterval {
+            return .skipRecentlyAttempted
+        }
+        isRunning = true
+        lastAttemptStartedAt = now
+        return .start
+    }
+
+    func finish() {
+        isRunning = false
+    }
+}
+
+@MainActor
+private func measureMainActorTiming<Result>(
+    operation: String,
+    fields: [MailiaTimingField] = [],
+    _ body: () async throws -> Result
+) async throws -> Result {
+    let startedAt = Date()
+    do {
+        let result = try await body()
+        MailiaTiming.log(operation: operation, startedAt: startedAt, fields: fields)
+        return result
+    } catch {
+        MailiaTiming.log(operation: operation, startedAt: startedAt, status: "failure", fields: fields)
+        throw error
+    }
+}
+
+enum MailiaSyncFailure: LocalizedError {
     case mailboxSyncFailed
     case mailboxDiscoveryFailed(Error)
 
     var errorDescription: String? {
         switch self {
         case .mailboxSyncFailed:
-            "One or more mailboxes failed to sync. Check that the Himalaya CLI is installed and reachable by Mailia."
+            "One or more mailboxes failed to sync. Check that the Mailia app-server is available and the account settings are valid."
         case let .mailboxDiscoveryFailed(error):
             "Unable to discover mailboxes: \(error.localizedDescription)"
         }
@@ -108,31 +159,33 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
     private let databaseQueue: DatabaseQueue
     private let repository: MailRepository
     private let syncService: SyncService
-    private let bridge: any HimalayaBridge
+    private let appServerClient: MailAppServerClient
     private let himalayaConfigStore: HimalayaConfigStore
-    private let himalayaCommandLimiter: HimalayaCommandLimiter
+    private let appServerRequestLimiter: MailAppServerRequestLimiter
     private let downloadsDirectory: URL
     private let revealDownloadedFiles: @MainActor ([URL], URL) -> Void
     private let emailDisplayPipeline = EmailHTMLDisplayPipeline()
     private let htmlTextExtractor = HTMLTextExtractor()
+    private let backgroundFolderRefreshGate: BackgroundFolderRefreshGate
+    private let nowProvider: @Sendable () -> Date
 
     init() {
         do {
             let environment = try MailiaEnvironment.live(
-                himalayaBridge: MailiaHimalayaExecutableSettings.bridge()
+                appServerClient: MailiaHimalayaExecutableSettings.appServerClient()
             )
             let databaseQueue = try environment.openDatabase()
             self.init(
                 databaseQueue: databaseQueue,
-                bridge: environment.himalayaBridge,
+                appServerClient: environment.appServerClient,
                 downloadsDirectory: environment.downloadsDirectory
             )
         } catch {
             let databaseQueue = try! DatabaseQueue()
-            try! DatabaseMigratorFactory.makeMigrator().migrate(databaseQueue)
+            try! DatabaseSchemaFactory.initialize(databaseQueue)
             self.init(
                 databaseQueue: databaseQueue,
-                bridge: MailiaHimalayaExecutableSettings.bridge(),
+                appServerClient: MailiaHimalayaExecutableSettings.appServerClient(),
                 downloadsDirectory: Self.defaultDownloadsDirectory()
             )
         }
@@ -140,38 +193,53 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
     init(
         databaseQueue: DatabaseQueue,
-        bridge: any HimalayaBridge,
+        appServerClient: MailAppServerClient,
         downloadsDirectory: URL,
         policy: SyncPolicy = SyncPolicy(),
-        himalayaCommandLimiter: HimalayaCommandLimiter? = nil,
+        appServerRequestLimiter: MailAppServerRequestLimiter? = nil,
         himalayaConfigStore: HimalayaConfigStore = HimalayaConfigStore(),
-        revealDownloadedFiles: @MainActor @escaping ([URL], URL) -> Void = Self.revealInFinder
+        revealDownloadedFiles: @MainActor @escaping ([URL], URL) -> Void = Self.revealInFinder,
+        backgroundFolderRefreshMinimumInterval: TimeInterval = 300,
+        now: @escaping @Sendable () -> Date = Date.init
     ) {
-        let commandLimiter = himalayaCommandLimiter
-            ?? HimalayaCommandLimiter(maxConcurrentCommands: policy.maxConcurrentHimalayaProcesses)
+        let requestLimiter = appServerRequestLimiter
+            ?? MailAppServerRequestLimiter(maxConcurrentRequests: policy.maxConcurrentHimalayaProcesses)
         self.databaseQueue = databaseQueue
         self.repository = MailRepository(databaseQueue: databaseQueue)
-        self.bridge = bridge
+        self.appServerClient = appServerClient
         self.himalayaConfigStore = himalayaConfigStore
-        self.himalayaCommandLimiter = commandLimiter
+        self.appServerRequestLimiter = requestLimiter
         self.downloadsDirectory = downloadsDirectory
         self.revealDownloadedFiles = revealDownloadedFiles
+        self.backgroundFolderRefreshGate = BackgroundFolderRefreshGate(
+            minimumInterval: backgroundFolderRefreshMinimumInterval
+        )
+        self.nowProvider = now
         self.syncService = SyncService(
-            bridge: bridge,
+            appServerClient: appServerClient,
             databaseQueue: databaseQueue,
             policy: policy,
-            himalayaCommandLimiter: commandLimiter
+            appServerRequestLimiter: requestLimiter,
+            now: now
         )
     }
 
     func loadSnapshot(workspace: MailiaWorkspace, searchQuery: String) async throws -> MailiaSnapshot {
-        let entities = try repository.entityList(workspace: workspace.coreWorkspace)
-        let sendAccounts = try localSendAccounts()
-        return MailiaSnapshot(
-            entities: filterAndMap(entities, workspace: workspace, searchQuery: searchQuery),
-            sendAccounts: sendAccounts,
-            loadedAt: Date()
-        )
+        try await measureMainActorTiming(
+            operation: "app.load_snapshot",
+            fields: [
+                .label("workspace", workspace.coreWorkspace.rawValue),
+                .label("search_active", !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            ]
+        ) {
+            let entities = try repository.entityList(workspace: workspace.coreWorkspace)
+            let sendAccounts = try localSendAccounts()
+            return MailiaSnapshot(
+                entities: filterAndMap(entities, workspace: workspace, searchQuery: searchQuery),
+                sendAccounts: sendAccounts,
+                loadedAt: Date()
+            )
+        }
     }
 
     func lastRefreshFinishedAt() async throws -> Date? {
@@ -349,69 +417,113 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         options: MailiaRefreshOptions,
         progress: @escaping @MainActor (MailiaRefreshProgress) -> Void
     ) async throws -> MailiaSnapshot {
-        progress(MailiaRefreshProgress(
-            phase: .discovering,
-            title: "Discovering mailboxes",
-            detail: nil,
-            fraction: nil
-        ))
-        var discoveryError: Error?
-        do {
-            _ = try await syncService.discoverFoldersForDiscoveredAccounts(timeout: 45)
-        } catch let error as CancellationError {
-            throw error
-        } catch {
-            discoveryError = error
-            NSLog("Unable to refresh mailbox list before sync: \(error.localizedDescription)")
-        }
+        try await measureMainActorTiming(
+            operation: "app.refresh",
+            fields: [
+                .label("workspace", workspace.coreWorkspace.rawValue),
+                .label("full_history", options.fullHistory),
+                .label("preferred_account_count", options.preferredAccountKeys.count),
+                .label("search_active", !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            ]
+        ) {
+            progress(MailiaRefreshProgress(
+                phase: .discovering,
+                title: "Discovering mailboxes",
+                detail: nil,
+                fraction: nil
+            ))
+            if try repository.folders().isEmpty {
+                do {
+                    _ = try await syncService.discoverFoldersForRefresh(
+                        timeout: 45,
+                        source: "blocking_initial"
+                    )
+                } catch let error as CancellationError {
+                    throw error
+                } catch {
+                    throw MailiaSyncFailure.mailboxDiscoveryFailed(error)
+                }
+            } else {
+                refreshDiscoveredFoldersInBackground(timeout: 45)
+            }
 
-        let aggregator = RefreshProgressAggregator()
-        let report: @Sendable (SyncWorkspaceProgress) -> Void = { workspaceProgress in
-            Task { @MainActor in
-                progress(await aggregator.update(workspaceProgress))
+            let aggregator = RefreshProgressAggregator()
+            let report: @Sendable (SyncWorkspaceProgress) -> Void = { workspaceProgress in
+                Task { @MainActor in
+                    progress(await aggregator.update(workspaceProgress))
+                }
+            }
+
+            let mainAccountPriorityScores = try refreshAccountPriorityScores(
+                workspace: .main,
+                preferredAccountKeys: options.preferredAccountKeys
+            )
+            let junkAccountPriorityScores = try refreshAccountPriorityScores(
+                workspace: .junk,
+                preferredAccountKeys: options.preferredAccountKeys
+            )
+            let syncTimeout: TimeInterval = options.fullHistory ? 300 : 45
+
+            async let mainSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
+                .main,
+                accountPriorityScores: mainAccountPriorityScores,
+                fullHistory: options.fullHistory,
+                timeout: syncTimeout,
+                onProgress: report
+            )
+            async let junkSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
+                .junk,
+                accountPriorityScores: junkAccountPriorityScores,
+                fullHistory: options.fullHistory,
+                timeout: syncTimeout,
+                onProgress: report
+            )
+            let syncResults = try await (mainSync, junkSync)
+            if syncResults.0.hadFailure || syncResults.1.hadFailure {
+                throw MailiaSyncFailure.mailboxSyncFailed
+            }
+
+            progress(MailiaRefreshProgress(
+                phase: .finishing,
+                title: "Updating",
+                detail: nil,
+                fraction: nil
+            ))
+            return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
+        }
+    }
+
+    private func refreshDiscoveredFoldersInBackground(timeout: TimeInterval) {
+        Task { [backgroundFolderRefreshGate, nowProvider, syncService] in
+            let startedAt = Date()
+            let decision = await backgroundFolderRefreshGate.begin(now: nowProvider())
+            guard decision == .start else {
+                MailiaTiming.log(
+                    operation: "sync.discover_folders_all",
+                    startedAt: startedAt,
+                    status: "skipped",
+                    fields: [
+                        .label("source", "background_refresh"),
+                        .label("skip_reason", decision.rawValue)
+                    ]
+                )
+                return
+            }
+            do {
+                _ = try await syncService.discoverFoldersForRefresh(
+                    timeout: timeout,
+                    source: "background_refresh"
+                )
+                await backgroundFolderRefreshGate.finish()
+            } catch let error as CancellationError {
+                await backgroundFolderRefreshGate.finish()
+                _ = error
+                return
+            } catch {
+                await backgroundFolderRefreshGate.finish()
+                NSLog("Unable to refresh mailbox list in background: \(error.localizedDescription)")
             }
         }
-
-        let mainAccountPriorityScores = try refreshAccountPriorityScores(
-            workspace: .main,
-            preferredAccountKeys: options.preferredAccountKeys
-        )
-        let junkAccountPriorityScores = try refreshAccountPriorityScores(
-            workspace: .junk,
-            preferredAccountKeys: options.preferredAccountKeys
-        )
-        let syncTimeout: TimeInterval = options.fullHistory ? 300 : 45
-
-        async let mainSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
-            .main,
-            accountPriorityScores: mainAccountPriorityScores,
-            fullHistory: options.fullHistory,
-            timeout: syncTimeout,
-            onProgress: report
-        )
-        async let junkSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
-            .junk,
-            accountPriorityScores: junkAccountPriorityScores,
-            fullHistory: options.fullHistory,
-            timeout: syncTimeout,
-            onProgress: report
-        )
-        let syncResults = try await (mainSync, junkSync)
-        if syncResults.0.hadFailure || syncResults.1.hadFailure {
-            throw MailiaSyncFailure.mailboxSyncFailed
-        }
-        if let discoveryError,
-           syncResults.0.attemptedFolderCount + syncResults.1.attemptedFolderCount == 0 {
-            throw MailiaSyncFailure.mailboxDiscoveryFailed(discoveryError)
-        }
-
-        progress(MailiaRefreshProgress(
-            phase: .finishing,
-            title: "Updating",
-            detail: nil,
-            fraction: nil
-        ))
-        return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
     }
 
     private func refreshAccountPriorityScores(
@@ -461,7 +573,11 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         if !normalizedAccountKeys.isEmpty {
             for accountKey in normalizedAccountKeys {
                 do {
-                    _ = try await syncService.discoverFolders(accountKey: accountKey, timeout: 15)
+                    _ = try await syncService.discoverFolders(
+                        accountKey: accountKey,
+                        timeout: 15,
+                        source: "after_send"
+                    )
                 } catch {
                     NSLog("Unable to refresh folders for \(accountKey): \(error.localizedDescription)")
                 }
@@ -499,7 +615,11 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             if existingFolderCount == 0 {
                 for accountKey in normalizedAccountKeys {
                     do {
-                        _ = try await syncService.discoverFolders(accountKey: accountKey, timeout: 15)
+                        _ = try await syncService.discoverFolders(
+                            accountKey: accountKey,
+                            timeout: 15,
+                            source: "newer_timeline_empty_cache"
+                        )
                     } catch {
                         NSLog("Unable to refresh folders for \(accountKey): \(error.localizedDescription)")
                     }
@@ -551,42 +671,54 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         searchQuery: String,
         progress: @escaping @MainActor (MailiaRefreshProgress) -> Void
     ) async throws -> MailiaSnapshot {
-        progress(MailiaRefreshProgress(
-            phase: .discovering,
-            title: "Discovering mailboxes",
-            detail: nil,
-            fraction: nil
-        ))
-        do {
-            _ = try await syncService.discoverFoldersForDiscoveredAccounts(timeout: 45)
-        } catch let error as CancellationError {
-            throw error
-        } catch {
-            NSLog("Unable to refresh mailbox list before entity sync: \(error.localizedDescription)")
-        }
-
-        let aggregator = RefreshProgressAggregator()
-        let report: @Sendable (SyncWorkspaceProgress) -> Void = { workspaceProgress in
-            Task { @MainActor in
-                progress(await aggregator.update(workspaceProgress))
+        try await measureMainActorTiming(
+            operation: "app.sync_entity_history",
+            fields: [
+                .label("workspace", workspace.coreWorkspace.rawValue),
+                .label("address_count", emailAddresses.count),
+                .label("search_active", !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            ]
+        ) {
+            progress(MailiaRefreshProgress(
+                phase: .discovering,
+                title: "Discovering mailboxes",
+                detail: nil,
+                fraction: nil
+            ))
+            do {
+                _ = try await syncService.discoverFoldersForDiscoveredAccounts(
+                    timeout: 45,
+                    source: "entity_history"
+                )
+            } catch let error as CancellationError {
+                throw error
+            } catch {
+                NSLog("Unable to refresh mailbox list before entity sync: \(error.localizedDescription)")
             }
+
+            let aggregator = RefreshProgressAggregator()
+            let report: @Sendable (SyncWorkspaceProgress) -> Void = { workspaceProgress in
+                Task { @MainActor in
+                    progress(await aggregator.update(workspaceProgress))
+                }
+            }
+
+            _ = try await syncService.syncEntityHistory(
+                workspace.coreWorkspace,
+                emailAddresses: emailAddresses,
+                timeout: 300,
+                onProgress: report
+            )
+
+            progress(MailiaRefreshProgress(
+                phase: .finishing,
+                title: "Updating conversations",
+                detail: nil,
+                fraction: nil
+            ))
+
+            return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
         }
-
-        _ = try await syncService.syncEntityHistory(
-            workspace.coreWorkspace,
-            emailAddresses: emailAddresses,
-            timeout: 300,
-            onProgress: report
-        )
-
-        progress(MailiaRefreshProgress(
-            phase: .finishing,
-            title: "Updating conversations",
-            detail: nil,
-            fraction: nil
-        ))
-
-        return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
     }
 
     func loadTimelinePage(
@@ -596,133 +728,151 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         anchorID: Int64?,
         limit: Int
     ) async throws -> MailiaTimelinePage {
-        let fetchLimit = limit + 1
-        let messages = try repository.messages(
-            entityID: entityID,
-            workspace: workspace.coreWorkspace,
-            includeBodies: false,
-            limit: fetchLimit,
-            beforeMessageID: direction == .older ? anchorID : nil,
-            afterMessageID: direction == .newer ? anchorID : nil
-        )
-        let hasMore = messages.count > limit
-        let pageMessages: [TimelineMessage]
-        switch direction {
-        case .latest, .older:
-            pageMessages = hasMore ? Array(messages.suffix(limit)) : messages
-        case .newer:
-            pageMessages = hasMore ? Array(messages.prefix(limit)) : messages
-        }
-        let emojiByAccount: [String: String] = Dictionary(
-            uniqueKeysWithValues: try repository.accounts().compactMap { account -> (String, String)? in
-                guard let emoji = account.emoji?.nilIfBlank else { return nil }
-                return (account.accountKey, emoji)
-            }
-        )
-        let items = pageMessages.map { message in
-            makeTimelineItem(message: message, entityID: entityID, emojiByAccount: emojiByAccount)
-        }
-        return MailiaTimelinePage(items: items, hasMore: hasMore)
-    }
-
-    func loadLatestTimelineItems(entityIDs: [Int64], workspace: MailiaWorkspace) async throws -> [MailiaTimelineItem] {
-        var seenEntityIDs = Set<Int64>()
-        let uniqueEntityIDs = entityIDs.filter { seenEntityIDs.insert($0).inserted }
-        guard !uniqueEntityIDs.isEmpty else { return [] }
-
-        let emojiByAccount: [String: String] = Dictionary(
-            uniqueKeysWithValues: try repository.accounts().compactMap { account -> (String, String)? in
-                guard let emoji = account.emoji?.nilIfBlank else { return nil }
-                return (account.accountKey, emoji)
-            }
-        )
-
-        var items: [MailiaTimelineItem] = []
-        items.reserveCapacity(uniqueEntityIDs.count)
-        for entityID in uniqueEntityIDs {
-            guard let message = try repository.messages(
+        try await measureMainActorTiming(
+            operation: "app.load_timeline_page",
+            fields: [
+                .label("workspace", workspace.coreWorkspace.rawValue),
+                .label("direction", String(describing: direction)),
+                .label("limit", limit),
+                .label("has_anchor", anchorID != nil)
+            ]
+        ) {
+            let fetchLimit = limit + 1
+            let messages = try repository.messages(
                 entityID: entityID,
                 workspace: workspace.coreWorkspace,
                 includeBodies: false,
-                limit: 1
-            ).first else {
-                continue
+                limit: fetchLimit,
+                beforeMessageID: direction == .older ? anchorID : nil,
+                afterMessageID: direction == .newer ? anchorID : nil
+            )
+            let hasMore = messages.count > limit
+            let pageMessages: [TimelineMessage]
+            switch direction {
+            case .latest, .older:
+                pageMessages = hasMore ? Array(messages.suffix(limit)) : messages
+            case .newer:
+                pageMessages = hasMore ? Array(messages.prefix(limit)) : messages
             }
-            items.append(makeTimelineItem(message: message, entityID: entityID, emojiByAccount: emojiByAccount))
+            let emojiByAccount: [String: String] = Dictionary(
+                uniqueKeysWithValues: try repository.accounts().compactMap { account -> (String, String)? in
+                    guard let emoji = account.emoji?.nilIfBlank else { return nil }
+                    return (account.accountKey, emoji)
+                }
+            )
+            let items = pageMessages.map { message in
+                makeTimelineItem(message: message, entityID: entityID, emojiByAccount: emojiByAccount)
+            }
+            return MailiaTimelinePage(items: items, hasMore: hasMore)
         }
-        return items
+    }
+
+    func loadLatestTimelineItems(entityIDs: [Int64], workspace: MailiaWorkspace) async throws -> [MailiaTimelineItem] {
+        try await measureMainActorTiming(
+            operation: "app.load_latest_timeline_items",
+            fields: [
+                .label("workspace", workspace.coreWorkspace.rawValue),
+                .label("requested_count", entityIDs.count)
+            ]
+        ) {
+            var seenEntityIDs = Set<Int64>()
+            let uniqueEntityIDs = entityIDs.filter { seenEntityIDs.insert($0).inserted }
+            guard !uniqueEntityIDs.isEmpty else { return [] }
+
+            let emojiByAccount: [String: String] = Dictionary(
+                uniqueKeysWithValues: try repository.accounts().compactMap { account -> (String, String)? in
+                    guard let emoji = account.emoji?.nilIfBlank else { return nil }
+                    return (account.accountKey, emoji)
+                }
+            )
+
+            let messagesByEntityID = try repository.latestMessages(
+                entityIDs: uniqueEntityIDs,
+                workspace: workspace.coreWorkspace
+            )
+            return uniqueEntityIDs.compactMap { entityID in
+                guard let message = messagesByEntityID[entityID] else { return nil }
+                return makeTimelineItem(message: message, entityID: entityID, emojiByAccount: emojiByAccount)
+            }
+        }
     }
 
     func loadBody(for item: MailiaTimelineItem) async throws -> MailiaTimelineBody {
-        if let cached = try repository.messageBody(messageID: item.id),
-           let body = try cachedTimelineBody(cached, item: item) {
-            return body
-        }
+        try await measureMainActorTiming(
+            operation: "app.load_body",
+            fields: [.label("has_attachment_flag", item.hasAttachments)]
+        ) {
+            if let cached = try repository.messageBody(messageID: item.id),
+               let body = try cachedTimelineBody(cached, item: item) {
+                return body
+            }
 
-        let locations = try bodyFetchLocations(for: item)
-        guard !locations.isEmpty else {
-            return unavailableTimelineBody(item: item)
-        }
+            let locations = try bodyFetchLocations(for: item)
+            guard !locations.isEmpty else {
+                return unavailableTimelineBody(item: item)
+            }
 
-        var lastBody: MessageBodyFetchResult?
-        for location in locations {
-            let body = try await fetchBody(
-                messageID: item.id,
-                accountKey: location.accountKey,
-                folderName: location.sourceFolderName,
-                envelopeID: location.himalayaEnvelopeID
+            var lastBody: MessageBodyFetchResult?
+            for location in locations {
+                let body: MessageBodyFetchResult
+                do {
+                    body = try await fetchBody(
+                        messageID: item.id,
+                        accountKey: location.accountKey,
+                        folderName: location.sourceFolderName,
+                        envelopeID: location.himalayaEnvelopeID
+                    )
+                } catch {
+                    guard Self.shouldMarkMessageLocationMissing(for: error) else {
+                        throw error
+                    }
+                    continue
+                }
+                if body.hasAttachments {
+                    try repository.setMessageHasAttachments(messageID: item.id, hasAttachments: true)
+                }
+                guard body.hasDisplayContent else {
+                    lastBody = body
+                    continue
+                }
+
+                try repository.cacheMessageBody(
+                    messageID: item.id,
+                    sanitizedHTML: body.sanitizedHTML,
+                    htmlVariants: body.htmlVariants,
+                    textFallback: body.textFallback
+                )
+                return MailiaTimelineBody(
+                    html: body.sanitizedHTML?.nilIfBlank,
+                    htmlVariants: MailiaTimelineHTMLVariants(body.htmlVariants),
+                    hasAttachments: item.hasAttachments || body.hasAttachments
+                )
+            }
+
+            let body = lastBody ?? MessageBodyFetchResult(
+                sanitizedHTML: nil,
+                htmlVariants: nil,
+                textFallback: nil,
+                hasAttachments: false
             )
-            if body.hasAttachments {
-                try repository.setMessageHasAttachments(messageID: item.id, hasAttachments: true)
-            }
-            guard body.hasDisplayContent else {
-                lastBody = body
-                continue
-            }
-
             try repository.cacheMessageBody(
                 messageID: item.id,
                 sanitizedHTML: body.sanitizedHTML,
                 htmlVariants: body.htmlVariants,
-                textFallback: body.textFallback,
-                sanitizerVersion: body.sanitizerVersion
+                textFallback: body.textFallback
             )
+            if body.sanitizedHTML?.nilIfBlank == nil {
+                return unavailableTimelineBody(item: item)
+            }
             return MailiaTimelineBody(
                 html: body.sanitizedHTML?.nilIfBlank,
                 htmlVariants: MailiaTimelineHTMLVariants(body.htmlVariants),
                 hasAttachments: item.hasAttachments || body.hasAttachments
             )
         }
-
-        let body = lastBody ?? MessageBodyFetchResult(
-            sanitizedHTML: nil,
-            htmlVariants: nil,
-            textFallback: nil,
-            hasAttachments: false,
-            sanitizerVersion: EmailHTMLDisplayPipeline.sanitizerVersion
-        )
-        try repository.cacheMessageBody(
-            messageID: item.id,
-            sanitizedHTML: body.sanitizedHTML,
-            htmlVariants: body.htmlVariants,
-            textFallback: body.textFallback,
-            sanitizerVersion: body.sanitizerVersion
-        )
-        if body.sanitizedHTML?.nilIfBlank == nil {
-            return unavailableTimelineBody(item: item)
-        }
-        return MailiaTimelineBody(
-            html: body.sanitizedHTML?.nilIfBlank,
-            htmlVariants: MailiaTimelineHTMLVariants(body.htmlVariants),
-            hasAttachments: item.hasAttachments || body.hasAttachments
-        )
     }
 
     private func cachedTimelineBody(_ cached: TimelineMessageBody, item: MailiaTimelineItem) throws -> MailiaTimelineBody? {
-        if cached.sanitizerVersion != EmailHTMLDisplayPipeline.sanitizerVersion {
-            return nil
-        }
-
         guard let html = cached.sanitizedHTML?.nilIfBlank else {
             return nil
         }
@@ -763,33 +913,47 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         case flag(isEnabled: Bool)
         case move(targetFoldersByAccount: [String: String])
 
-        func command(for location: MessageLocationTarget) -> HimalayaCommand? {
+        func shouldRun(for location: MessageLocationTarget) -> Bool {
             switch self {
-            case let .flag(isEnabled):
-                return isEnabled
-                    ? .flagAdd(
-                        id: location.himalayaEnvelopeID,
-                        flag: "flagged",
-                        folder: location.sourceFolderName,
-                        account: location.accountKey
-                    )
-                    : .flagRemove(
-                        id: location.himalayaEnvelopeID,
-                        flag: "flagged",
-                        folder: location.sourceFolderName,
-                        account: location.accountKey
-                    )
+            case .flag:
+                return true
             case let .move(targetFoldersByAccount):
                 guard let targetFolderName = targetFoldersByAccount[location.accountKey],
                       targetFolderName != location.sourceFolderName
                 else {
-                    return nil
+                    return false
                 }
-                return .messageMove(
+                return true
+            }
+        }
+
+        func perform(
+            location: MessageLocationTarget,
+            appServerClient: MailAppServerClient,
+            timeout: TimeInterval?
+        ) async throws {
+            switch self {
+            case let .flag(isEnabled):
+                _ = try await appServerClient.messageModify(
                     id: location.himalayaEnvelopeID,
-                    from: location.sourceFolderName,
-                    to: targetFolderName,
-                    account: location.accountKey
+                    folder: location.sourceFolderName,
+                    account: location.accountKey,
+                    addFlags: isEnabled ? ["flagged"] : [],
+                    removeFlags: isEnabled ? [] : ["flagged"],
+                    timeout: timeout
+                )
+            case let .move(targetFoldersByAccount):
+                guard let targetFolderName = targetFoldersByAccount[location.accountKey],
+                      targetFolderName != location.sourceFolderName
+                else {
+                    return
+                }
+                _ = try await appServerClient.messageModify(
+                    id: location.himalayaEnvelopeID,
+                    folder: location.sourceFolderName,
+                    account: location.accountKey,
+                    moveTo: targetFolderName,
+                    timeout: timeout
                 )
             }
         }
@@ -808,7 +972,10 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         progress: @escaping @MainActor (String) -> Void
     ) async throws {
         progress("Discovering folders...")
-        _ = try await syncService.discoverFoldersForDiscoveredAccounts(timeout: 45)
+        _ = try await syncService.discoverFoldersForDiscoveredAccounts(
+            timeout: 45,
+            source: "entity_action"
+        )
         let locations = try repository.messageLocations(
             entityID: entityID,
             workspace: workspace.coreWorkspace,
@@ -866,45 +1033,93 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         )
         guard !locations.isEmpty else { return }
 
+        var failures: [String] = []
         for location in locations {
-            _ = try repository.setMessageLocationFlag(
-                accountKey: location.accountKey,
-                folderName: location.sourceFolderName,
-                himalayaEnvelopeID: location.himalayaEnvelopeID,
-                flag: "seen",
-                isEnabled: true
-            )
+            do {
+                try await markMessageReadRemotely(location)
+                let didUpdate = try repository.setMessageLocationFlag(
+                    accountKey: location.accountKey,
+                    folderName: location.sourceFolderName,
+                    himalayaEnvelopeID: location.himalayaEnvelopeID,
+                    flag: "seen",
+                    isEnabled: true
+                )
+                if !didUpdate {
+                    failures.append("No matching message location was found for \(location.himalayaEnvelopeID).")
+                }
+            } catch {
+                failures.append(Self.errorDescription(error))
+            }
         }
 
-        for location in locations {
-            await markMessageReadRemotely(location)
+        if let firstFailure = failures.first {
+            throw EntityActionError.partialFailure(
+                failed: failures.count,
+                total: locations.count,
+                firstFailure: firstFailure
+            )
         }
     }
 
-    private func markMessageReadRemotely(_ location: MessageLocationTarget) async {
+    func markMessageRead(item: MailiaTimelineItem, workspace: MailiaWorkspace) async throws {
+        let locations = try repository.messageLocations(messageID: item.id)
+        guard !locations.isEmpty else { return }
+
+        var failures: [String] = []
+        for location in locations {
+            do {
+                try await markMessageReadRemotely(location)
+                let didUpdate = try repository.setMessageLocationFlag(
+                    accountKey: location.accountKey,
+                    folderName: location.sourceFolderName,
+                    himalayaEnvelopeID: location.himalayaEnvelopeID,
+                    flag: "seen",
+                    isEnabled: true
+                )
+                if !didUpdate {
+                    failures.append("No matching message location was found for \(location.himalayaEnvelopeID).")
+                }
+            } catch {
+                failures.append(Self.errorDescription(error))
+            }
+        }
+
+        if let firstFailure = failures.first {
+            throw EntityActionError.partialFailure(
+                failed: failures.count,
+                total: locations.count,
+                firstFailure: firstFailure
+            )
+        }
+    }
+
+    private func markMessageReadRemotely(_ location: MessageLocationTarget) async throws {
         let maxAttempts = 3
+        var lastError: Error?
         for attempt in 1...maxAttempts {
             do {
-                _ = try await himalayaCommandLimiter.run(
-                    .flagSeen(
+                try await appServerRequestLimiter.run(priority: .backgroundSync) {
+                    _ = try await appServerClient.messageModify(
                         id: location.himalayaEnvelopeID,
                         folder: location.sourceFolderName,
-                        account: location.accountKey
-                    ),
-                    bridge: bridge,
-                    timeout: 30,
-                    priority: .backgroundSync
-                ).requireSuccess()
+                        account: location.accountKey,
+                        addFlags: ["seen"],
+                        timeout: 30
+                    )
+                }
                 return
             } catch {
+                lastError = error
                 guard attempt < maxAttempts else {
-                    NSLog("Unable to mark message read remotely: \(Self.errorDescription(error))")
-                    return
+                    throw error
                 }
 
                 let delay = UInt64(attempt) * 500_000_000
                 try? await Task.sleep(nanoseconds: delay)
             }
+        }
+        if let lastError {
+            throw lastError
         }
     }
 
@@ -914,7 +1129,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         operation: EntityActionOperation,
         progress: @escaping @MainActor (String) -> Void
     ) async throws {
-        let runnableLocations = locations.filter { operation.command(for: $0) != nil }
+        let runnableLocations = locations.filter { operation.shouldRun(for: $0) }
         guard !runnableLocations.isEmpty else { return }
 
         let results = await runEntityActionCommands(
@@ -980,8 +1195,8 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             }
         }
         let totalCount = locations.count
-        let bridge = bridge
-        let commandLimiter = himalayaCommandLimiter
+        let appServerClient = appServerClient
+        let requestLimiter = appServerRequestLimiter
 
         progress(action.statusLabel)
         return await withTaskGroup(of: [EntityActionLocationResult].self) { group in
@@ -989,7 +1204,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 group.addTask {
                     var groupResults: [EntityActionLocationResult] = []
                     for location in locationGroup {
-                        guard let command = operation.command(for: location) else {
+                        guard operation.shouldRun(for: location) else {
                             groupResults.append(
                                 EntityActionLocationResult(
                                     location: location,
@@ -1001,12 +1216,13 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                         }
 
                         do {
-                            _ = try await commandLimiter.run(
-                                command,
-                                bridge: bridge,
-                                timeout: 30,
-                                priority: .interactive
-                            ).requireSuccess()
+                            try await requestLimiter.run(priority: .interactive) {
+                                try await operation.perform(
+                                    location: location,
+                                    appServerClient: appServerClient,
+                                    timeout: 30
+                                )
+                            }
                             groupResults.append(
                                 EntityActionLocationResult(
                                     location: location,
@@ -1047,10 +1263,16 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             throw EntityActionError.noMessages
         }
 
-        let command: HimalayaCommand = isFlagged
-            ? .flagAdd(id: envelopeID, flag: "flagged", folder: folderName, account: item.accountLabel)
-            : .flagRemove(id: envelopeID, flag: "flagged", folder: folderName, account: item.accountLabel)
-        _ = try await runHimalaya(command, timeout: 30, priority: .interactive).requireSuccess()
+        try await appServerRequestLimiter.run(priority: .interactive) {
+            _ = try await appServerClient.messageModify(
+                id: envelopeID,
+                folder: folderName,
+                account: item.accountLabel,
+                addFlags: isFlagged ? ["flagged"] : [],
+                removeFlags: isFlagged ? [] : ["flagged"],
+                timeout: 30
+            )
+        }
         let didUpdate = try repository.setMessageLocationFlag(
             accountKey: item.accountLabel,
             folderName: folderName,
@@ -1074,21 +1296,18 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 
         let targetDownloadsDirectory = Self.configuredDownloadsDirectory(fallback: downloadsDirectory)
         try FileManager.default.createDirectory(at: targetDownloadsDirectory, withIntermediateDirectories: true)
-        let existingFiles = downloadedFileNames(in: targetDownloadsDirectory)
-        _ = try await runHimalaya(
-            .attachmentDownload(
+        let attachments = try await appServerRequestLimiter.run(priority: .userDownload) {
+            try await appServerClient.attachmentDownload(
                 messageID: envelopeID,
                 folder: folderName,
                 account: item.accountLabel,
-                downloadsDirectory: targetDownloadsDirectory
-            ),
-            timeout: 300,
-            priority: .userDownload
-        ).requireSuccess()
+                downloadsDirectory: targetDownloadsDirectory,
+                timeout: 300
+            )
+        }
 
-        let currentFiles = downloadedFileNames(in: targetDownloadsDirectory)
-        let newFiles = currentFiles.filter { !existingFiles.contains($0) }
-        let newFileURLs = newFiles.map { targetDownloadsDirectory.appendingPathComponent($0) }
+        let newFileURLs = attachments.map { URL(fileURLWithPath: $0.path) }
+        let newFiles = newFileURLs.map(\.lastPathComponent)
         revealDownloadedFiles(newFileURLs, targetDownloadsDirectory)
         return MailiaAttachmentDownloadResult(
             directoryPath: targetDownloadsDirectory.path,
@@ -1102,51 +1321,29 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         replyAll: Bool,
         accountKey: String?
     ) async throws {
-        guard let folderName = item.folderLabel.nilIfBlank,
-              let envelopeID = item.envelopeID.nilIfBlank else {
-            throw EntityActionError.noMatchingMessageLocation
-        }
         let plainBody = content.plainText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard plainBody.nilIfBlank != nil || content.hasRenderableContent else {
             throw EntityActionError.noMessages
         }
 
-        let templateResult = try await runHimalaya(
-            .templateReply(
-                id: envelopeID,
-                body: plainBody.nilIfBlank ?? " ",
-                folder: folderName,
-                account: item.accountLabel,
-                replyAll: replyAll
-            ),
-            timeout: 60,
-            priority: .interactive
-        ).requireSuccess()
-
-        let template = Self.replyTemplateWithoutQuotedOriginal(
-            Self.templateContent(from: templateResult)
+        let sendAccount = try selectedSendAccount(accountKey: accountKey?.nilIfBlank ?? item.accountLabel.nilIfBlank)
+        guard let fromAddress = sendAccount.emailAddress?.nilIfBlank else {
+            throw EntityActionError.missingSendAccountEmail(accountKey: sendAccount.id)
+        }
+        let headers = replyHeaders(
+            to: item,
+            from: MailAddress(displayName: sendAccount.displayName?.nilIfBlank, emailAddress: fromAddress),
+            replyAll: replyAll
         )
-        guard let template = template.nilIfBlank else {
+        guard headers.contains(where: { $0.name.caseInsensitiveCompare("To") == .orderedSame }) else {
             throw EntityActionError.noMessages
         }
-
-        if content.requiresRawMIME {
-            let parsedTemplate = MailiaEmailTemplate.parse(template)
-            let rawMessage = try OutgoingMessageMIMEBuilder.rawMessage(
-                headers: parsedTemplate.headers,
-                content: content
-            )
-            _ = try await runHimalaya(
-                .messageSend(message: rawMessage, account: accountKey?.nilIfBlank ?? item.accountLabel),
-                timeout: 300,
-                priority: .interactive
-            ).requireSuccess()
-        } else {
-            _ = try await runHimalaya(
-                .templateSend(template: template, account: accountKey?.nilIfBlank ?? item.accountLabel),
-                timeout: 120,
-                priority: .interactive
-            ).requireSuccess()
+        let rawMessage = try OutgoingMessageMIMEBuilder.rawMessage(
+            headers: headers,
+            content: content
+        )
+        try await appServerRequestLimiter.run(priority: .interactive) {
+            _ = try await appServerClient.messageSend(raw: rawMessage, account: sendAccount.id, timeout: 300)
         }
     }
 
@@ -1165,40 +1362,124 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             throw EntityActionError.noMessages
         }
 
-        var headers = ["To:\(cleanedRecipients.joined(separator: ", "))"]
+        let sendAccount = try selectedSendAccount(accountKey: accountKey?.nilIfBlank)
+        guard let fromAddress = sendAccount.emailAddress?.nilIfBlank else {
+            throw EntityActionError.missingSendAccountEmail(accountKey: sendAccount.id)
+        }
+        let rawHeaders = newMessageHeaders(
+            from: MailAddress(displayName: sendAccount.displayName?.nilIfBlank, emailAddress: fromAddress),
+            recipients: cleanedRecipients,
+            subject: subject
+        )
+        let rawMessage = try OutgoingMessageMIMEBuilder.rawMessage(
+            headers: rawHeaders,
+            content: content
+        )
+        try await appServerRequestLimiter.run(priority: .interactive) {
+            _ = try await appServerClient.messageSend(raw: rawMessage, account: sendAccount.id, timeout: 300)
+        }
+    }
+
+    private func selectedSendAccount(accountKey: String?) throws -> MailiaSendAccount {
+        let accounts = try localSendAccounts()
+        if let accountKey, let account = accounts.first(where: { $0.id == accountKey }) {
+            return account
+        }
+        if let defaultAccount = accounts.first(where: \.isDefault) {
+            return defaultAccount
+        }
+        if let account = accounts.first {
+            return account
+        }
+        throw EntityActionError.noMessages
+    }
+
+    private func newMessageHeaders(
+        from: MailAddress,
+        recipients: [String],
+        subject: String?
+    ) -> [MailiaEmailHeader] {
+        var headers = [
+            MailiaEmailHeader(name: "From", value: from.displayLabel),
+            MailiaEmailHeader(name: "To", value: recipients.joined(separator: ", "))
+        ]
         if let subject = Self.mailHeaderValue(subject) {
-            headers.append("Subject:\(subject)")
+            headers.append(MailiaEmailHeader(name: "Subject", value: subject))
+        }
+        return headers
+    }
+
+    private func replyHeaders(
+        to item: MailiaTimelineItem,
+        from: MailAddress,
+        replyAll: Bool
+    ) -> [MailiaEmailHeader] {
+        let recipients = replyRecipients(for: item, fromAddress: from.emailAddress, replyAll: replyAll)
+        var headers = [
+            MailiaEmailHeader(name: "From", value: from.displayLabel)
+        ]
+        if !recipients.to.isEmpty {
+            headers.append(MailiaEmailHeader(
+                name: "To",
+                value: recipients.to.map(\.displayLabel).joined(separator: ", ")
+            ))
+        }
+        if !recipients.cc.isEmpty {
+            headers.append(MailiaEmailHeader(
+                name: "Cc",
+                value: recipients.cc.map(\.displayLabel).joined(separator: ", ")
+            ))
+        }
+        headers.append(MailiaEmailHeader(name: "Subject", value: replySubject(item.subject)))
+        if let rfcMessageID = Self.mailHeaderValue(item.rfcMessageID) {
+            headers.append(MailiaEmailHeader(name: "In-Reply-To", value: rfcMessageID))
+            headers.append(MailiaEmailHeader(name: "References", value: rfcMessageID))
+        }
+        return headers
+    }
+
+    private func replyRecipients(
+        for item: MailiaTimelineItem,
+        fromAddress: String,
+        replyAll: Bool
+    ) -> (to: [MailAddress], cc: [MailAddress]) {
+        let ownAddress = fromAddress.lowercased()
+        let primaryTo: [MailAddress]
+        let copyCandidates: [MailAddress]
+
+        switch item.direction {
+        case .incoming:
+            primaryTo = item.from.map { [$0] } ?? []
+            copyCandidates = replyAll ? item.to + item.cc : []
+        case .outgoing:
+            primaryTo = item.to
+            copyCandidates = replyAll ? item.cc : []
         }
 
-        let templateResult = try await runHimalaya(
-            .templateWrite(body: plainBody.nilIfBlank ?? " ", headers: headers, account: accountKey?.nilIfBlank),
-            timeout: 60,
-            priority: .interactive
-        ).requireSuccess()
+        var seen = Set([ownAddress])
+        let to = uniqueAddresses(primaryTo, seen: &seen)
+        let cc = uniqueAddresses(copyCandidates, seen: &seen)
+        return (to, cc)
+    }
 
-        let template = Self.templateContent(from: templateResult)
-        guard let template = template.nilIfBlank else {
-            throw EntityActionError.noMessages
+    private func uniqueAddresses(_ addresses: [MailAddress], seen: inout Set<String>) -> [MailAddress] {
+        var result: [MailAddress] = []
+        for address in addresses {
+            let email = address.emailAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !email.isEmpty else { continue }
+            let key = email.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            result.append(MailAddress(displayName: address.displayName?.nilIfBlank, emailAddress: email))
         }
+        return result
+    }
 
-        if content.requiresRawMIME {
-            let parsedTemplate = MailiaEmailTemplate.parse(template)
-            let rawMessage = try OutgoingMessageMIMEBuilder.rawMessage(
-                headers: parsedTemplate.headers,
-                content: content
-            )
-            _ = try await runHimalaya(
-                .messageSend(message: rawMessage, account: accountKey?.nilIfBlank),
-                timeout: 300,
-                priority: .interactive
-            ).requireSuccess()
-        } else {
-            _ = try await runHimalaya(
-                .templateSend(template: template, account: accountKey?.nilIfBlank),
-                timeout: 120,
-                priority: .interactive
-            ).requireSuccess()
+    private func replySubject(_ subject: String) -> String {
+        let value = Self.mailHeaderValue(subject) ?? "(No subject)"
+        if value.range(of: #"^\s*(re|回复|答复|回覆)\s*[:：]"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return value
         }
+        return "Re: \(value)"
     }
 
     private static func mailHeaderValue(_ value: String?) -> String? {
@@ -1207,38 +1488,6 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfBlank
-    }
-
-    private static func templateContent(from result: HimalayaResult) -> String {
-        if let output = try? result.decodeJSON(as: HimalayaTemplateWriteOutput.self) {
-            return output.content
-        }
-        if let output = try? result.decodeJSON(as: String.self) {
-            return output
-        }
-        return result.stdout
-    }
-
-    static func replyTemplateWithoutQuotedOriginal(_ template: String) -> String {
-        let lines = template.components(separatedBy: .newlines)
-        guard let quoteStartIndex = lines.indices.reversed().first(where: { index in
-            let line = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
-            guard line.hasPrefix("On "), line.hasSuffix("wrote:") else {
-                return false
-            }
-            let quotedLines = lines[(index + 1)...]
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            return !quotedLines.isEmpty && quotedLines.allSatisfy { $0.hasPrefix(">") }
-        }) else {
-            return template
-        }
-
-        var keptLines = Array(lines[..<quoteStartIndex])
-        while keptLines.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
-            keptLines.removeLast()
-        }
-        return keptLines.joined(separator: "\n")
     }
 
     private func makeTimelineItem(
@@ -1250,14 +1499,11 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             id: message.messageID,
             entityID: entityID,
             direction: message.direction,
+            rfcMessageID: message.rfcMessageID,
             subject: message.subject?.nilIfBlank ?? "(No subject)",
             preview: preview(for: message),
-            html: message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion
-                ? message.sanitizedHTML?.nilIfBlank
-                : nil,
-            htmlVariants: message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion
-                ? MailiaTimelineHTMLVariants(message.htmlVariants)
-                : nil,
+            html: message.sanitizedHTML?.nilIfBlank,
+            htmlVariants: MailiaTimelineHTMLVariants(message.htmlVariants),
             date: HimalayaDateParser.parse(message.messageDate),
             accountLabel: message.accountKey,
             accountEmoji: emojiByAccount[message.accountKey],
@@ -1265,6 +1511,9 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             folderLabel: message.folderName ?? "",
             envelopeID: message.himalayaEnvelopeID ?? "",
             isFlagged: message.flags.contains { $0.caseInsensitiveCompare("flagged") == .orderedSame },
+            from: message.from,
+            to: message.to,
+            cc: message.cc,
             fromLabel: message.from?.displayLabel ?? "",
             toLabel: message.to.map(\.displayLabel).joined(separator: ", "),
             hasAttachments: message.hasAttachments
@@ -1276,7 +1525,6 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         var htmlVariants: EmailHTMLDisplayVariants?
         var textFallback: String?
         var hasAttachments: Bool
-        var sanitizerVersion: Int
 
         var hasDisplayContent: Bool {
             sanitizedHTML?.nilIfBlank != nil
@@ -1291,43 +1539,79 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             try? FileManager.default.removeItem(at: exportDirectory)
         }
 
-        _ = try await runHimalaya(
-            .messageExport(id: envelopeID, folder: folderName, account: accountKey, destination: exportDirectory),
-            timeout: 30,
-            priority: .visibleBody
-        ).requireSuccess()
+        let bodyFetchFields: [MailiaTimingField] = [
+            .redacted("account", accountKey),
+            .redacted("folder", folderName)
+        ]
+        let bodyFetchStartedAt = Date()
+        let message: MailAppServerMessageGetResult
+        do {
+            message = try await appServerRequestLimiter.run(priority: .visibleBody, timingMethod: "message_get") {
+                try await appServerClient.messageGet(
+                    id: envelopeID,
+                    folder: folderName,
+                    account: accountKey,
+                    timeout: 30
+                )
+            }
+            MailiaTiming.log(
+                operation: "body.message_get",
+                startedAt: bodyFetchStartedAt,
+                fields: bodyFetchFields
+            )
+        } catch {
+            let errorKind = Self.bodyFetchTimingErrorKind(for: error)
+            MailiaTiming.log(
+                operation: "body.message_get",
+                startedAt: bodyFetchStartedAt,
+                status: "failure",
+                fields: bodyFetchFields + [.label("error_kind", errorKind)]
+            )
+            if Self.shouldMarkMessageLocationMissing(for: error) {
+                try? repository.markMessageLocationMissing(
+                    accountKey: accountKey,
+                    folderName: folderName,
+                    himalayaEnvelopeID: envelopeID
+                )
+            }
+            throw error
+        }
 
-        let htmlURL = exportDirectory.appendingPathComponent("index.html")
-        let textURL = exportDirectory.appendingPathComponent("plain.txt")
-        let html = try? String(contentsOf: htmlURL, encoding: .utf8)
-        let rawText = try? String(contentsOf: textURL, encoding: .utf8)
-
-        let document = try emailDisplayPipeline.document(
-            exportedHTML: html,
-            exportedText: rawText,
-            exportDirectory: exportDirectory
-        )
+        let document = try MailiaTiming.measure(
+            operation: "body.display_pipeline",
+            fields: [
+                .label("has_html", message.html?.nilIfBlank != nil),
+                .label("has_text", message.text?.nilIfBlank != nil),
+                .label("has_attachment_flag", message.hasAttachment)
+            ]
+        ) {
+            try emailDisplayPipeline.document(
+                exportedHTML: message.html,
+                exportedText: message.text,
+                exportDirectory: exportDirectory
+            )
+        }
 
         return MessageBodyFetchResult(
             sanitizedHTML: document.html,
             htmlVariants: document.htmlVariants,
             textFallback: document.textFallback,
-            hasAttachments: document.hasAttachments,
-            sanitizerVersion: document.sanitizerVersion
+            hasAttachments: message.hasAttachment || document.hasAttachments
         )
     }
 
-    private func runHimalaya(
-        _ command: HimalayaCommand,
-        timeout: TimeInterval?,
-        priority: HimalayaCommandPriority
-    ) async throws -> HimalayaResult {
-        try await himalayaCommandLimiter.run(
-            command,
-            bridge: bridge,
-            timeout: timeout,
-            priority: priority
-        )
+    private static func bodyFetchTimingErrorKind(for error: Error) -> String {
+        if error is CancellationError {
+            return "cancelled"
+        }
+        if let error = error as? MailAppServerError {
+            return error.timingErrorKind
+        }
+        return "unknown"
+    }
+
+    private static func shouldMarkMessageLocationMissing(for error: Error) -> Bool {
+        (error as? MailAppServerError)?.marksMessageLocationMissing == true
     }
 
     private static func defaultDownloadsDirectory(fileManager: FileManager = .default) -> URL {
@@ -1420,8 +1704,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
             return text
         }
         if let html = message.sanitizedHTML?.nilIfBlank {
-            if message.sanitizerVersion == EmailHTMLDisplayPipeline.sanitizerVersion,
-               let preview = htmlTextExtractor.previewText(from: html) {
+            if let preview = htmlTextExtractor.previewText(from: html) {
                 return preview
             }
         }
@@ -1439,6 +1722,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
 private enum EntityActionError: LocalizedError {
     case noMessages
     case noMatchingMessageLocation
+    case missingSendAccountEmail(accountKey: String)
     case missingTargetFolder(accountKey: String, role: FolderRole)
     case noAttachments
     case partialFailure(failed: Int, total: Int, firstFailure: String)
@@ -1449,6 +1733,8 @@ private enum EntityActionError: LocalizedError {
             "No movable messages were found for this entity."
         case .noMatchingMessageLocation:
             "No matching message location was found for this message."
+        case let .missingSendAccountEmail(accountKey):
+            "No email address is configured for \(accountKey)."
         case let .missingTargetFolder(accountKey, role):
             "No \(role.rawValue) folder was found for \(accountKey)."
         case .noAttachments:
@@ -1457,10 +1743,6 @@ private enum EntityActionError: LocalizedError {
             "\(failed) of \(total) message actions failed. First failure: \(firstFailure)"
         }
     }
-}
-
-private struct HimalayaTemplateWriteOutput: Decodable {
-    var content: String
 }
 
 private extension MailAddress {

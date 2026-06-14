@@ -394,13 +394,13 @@ function displayHTMLForOptions(
 ) {
   if (!html) return "<p>No body content is available for this message.</p>";
   if (hideQuotedReplyText && !loadRemoteContent) {
-    return variants?.quotedReplyHiddenRemoteContentBlockedHTML ?? "";
+    return variants?.quotedReplyHiddenRemoteContentBlockedHTML ?? html;
   }
   if (hideQuotedReplyText) {
-    return variants?.quotedReplyHiddenHTML ?? "";
+    return variants?.quotedReplyHiddenHTML ?? html;
   }
   if (!loadRemoteContent) {
-    return variants?.remoteContentBlockedHTML ?? "";
+    return variants?.remoteContentBlockedHTML ?? html;
   }
   return html;
 }

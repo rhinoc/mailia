@@ -44,6 +44,10 @@ if [[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]; then
   sign_target "$APP/Contents/Frameworks/Sparkle.framework" --deep
 fi
 
+if [[ -x "$APP/Contents/MacOS/mailia-mail" ]]; then
+  sign_target "$APP/Contents/MacOS/mailia-mail"
+fi
+
 sign_target "$APP/Contents/MacOS/Mailia"
 sign_target "$APP"
 codesign --verify --verbose=2 "$APP"

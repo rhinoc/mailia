@@ -8,7 +8,7 @@ Himalaya setup.
 
 `MailiaCore` owns persistent mail state and mailbox-facing behavior:
 
-- Database schema and migrations.
+- Database schema.
 - Repository queries and DTO mapping.
 - Himalaya command construction and process execution.
 - Account metadata read/write for Himalaya TOML configuration.
@@ -50,8 +50,7 @@ provider credentials.
 
 Himalaya configuration is discovered from `HIMALAYA_CONFIG`,
 `~/Library/Application Support/himalaya/config.toml`,
-`$XDG_CONFIG_HOME/himalaya/config.toml`, `~/.config/himalaya/config.toml`, or
-`~/.himalayarc`.
+`$XDG_CONFIG_HOME/himalaya/config.toml`, or `~/.config/himalaya/config.toml`.
 
 ## Local State
 

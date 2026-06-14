@@ -309,13 +309,12 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
 
   useEffect(() => {
     setRevealBoundary((current) => {
-      const nextBoundary = makeRevealBoundary(
-        selectedEntityID,
-        state.items,
-        computedFirstVisibleIndex
-      );
       if (current.entityID !== selectedEntityID) {
-        return nextBoundary;
+        return makeRevealBoundary(
+          selectedEntityID,
+          state.items,
+          computedFirstVisibleIndex
+        );
       }
 
       const currentIndex = readVisibleStartIndex(
@@ -325,13 +324,18 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
         computedFirstVisibleIndex
       );
       if (computedFirstVisibleIndex < currentIndex) {
-        return nextBoundary;
+        return makeRevealBoundary(
+          selectedEntityID,
+          state.items,
+          currentIndex - 1
+        );
       }
 
       return current;
     });
   }, [
     computedFirstVisibleIndex,
+    visibleStartIndex,
     state.items,
     selectedEntityID
   ]);
