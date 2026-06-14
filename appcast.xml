@@ -7,6 +7,17 @@
     <language>en</language>
 
     <item>
+      <title>Version 0.0.10</title>
+      <sparkle:version>0.0.10</sparkle:version>
+      <pubDate>Sun, 14 Jun 2026 06:11:34 +0000</pubDate>
+      <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="https://github.com/rhinoc/mailia/releases/download/v0.0.10/Mailia-0.0.10-macos.dmg"
+        sparkle:edSignature="i+af+34ZMJPs0EcMQr1xQQK5bQ/L6ro14LaGBLYWNwlIbvBzMgRJ4ytXgKfTgLhanun0T/HEsZMT2xfqG04FAw==" length="10972306"
+        type="application/octet-stream"/>
+    </item>
+
+    <item>
       <title>Version 0.0.9</title>
       <sparkle:version>0.0.9</sparkle:version>
       <pubDate>Sat, 13 Jun 2026 11:40:00 +0000</pubDate>
