@@ -69,6 +69,16 @@ enum MailiaHimalayaExecutableSettings {
             )
         }
 
+        if let developmentURL = developmentAppServerURL(
+            executableURL: executableURL,
+            fileManager: fileManager
+        ) {
+            return (
+                developmentURL,
+                ["app-server", "--listen", "stdio://"]
+            )
+        }
+
         return (
             bundleURL.appendingPathComponent("Contents/MacOS/mailia-mail"),
             ["app-server", "--listen", "stdio://"]
@@ -85,6 +95,43 @@ enum MailiaHimalayaExecutableSettings {
             executableDirectory?.appendingPathComponent("mailia-mail"),
             bundleURL.appendingPathComponent("Contents/MacOS/mailia-mail")
         ].compactMap(\.self)
+
+        return candidates.first { fileManager.isExecutableFile(atPath: $0.path) }
+    }
+
+    static func developmentAppServerURL(
+        executableURL: URL?,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        guard let executableDirectory = executableURL?.deletingLastPathComponent() else {
+            return nil
+        }
+
+        let buildDirectory = executableDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .lastPathComponent
+        guard buildDirectory == ".build" else {
+            return nil
+        }
+
+        let repositoryRoot = executableDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let targetConfiguration = executableDirectory.lastPathComponent == "release" ? "release" : "debug"
+        let candidates = [
+            repositoryRoot
+                .appendingPathComponent("mailia-mail", isDirectory: true)
+                .appendingPathComponent("target", isDirectory: true)
+                .appendingPathComponent(targetConfiguration, isDirectory: true)
+                .appendingPathComponent("mailia-mail"),
+            repositoryRoot
+                .appendingPathComponent("mailia-mail", isDirectory: true)
+                .appendingPathComponent("target", isDirectory: true)
+                .appendingPathComponent("debug", isDirectory: true)
+                .appendingPathComponent("mailia-mail")
+        ]
 
         return candidates.first { fileManager.isExecutableFile(atPath: $0.path) }
     }

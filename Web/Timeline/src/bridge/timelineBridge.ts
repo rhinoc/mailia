@@ -23,6 +23,7 @@ export type TimelineOutboundEvent =
       folderName?: string | null;
       himalayaEnvelopeID?: string | null;
     }
+  | { type: "messageBodyRendered"; messageID: TimelineMessageID }
   | { type: "downloadAttachments"; messageID: TimelineMessageID }
   | { type: "setScrolledToBottom"; atBottom: boolean }
   | { type: "log"; payload: { level: string; message: string } };
@@ -185,6 +186,8 @@ function toNativeEnvelope(event: TimelineOutboundEvent) {
       };
     case "downloadAttachments":
       return { type: "downloadAttachments", payload: { messageID: event.messageID } };
+    case "messageBodyRendered":
+      return { type: "messageBodyRendered", payload: { messageID: event.messageID } };
     case "setScrolledToBottom":
       return null;
     case "log":

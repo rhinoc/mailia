@@ -38,6 +38,7 @@ interface MessageCardProps {
   attachmentState: AttachmentDownloadState;
   onRequestBody(message: TimelineMessage, priority: number): void;
   onBodyHeightMeasured(cacheKey: string, height: number): void;
+  onBodyRendered(message: TimelineMessage): void;
   onDownloadAttachments(message: TimelineMessage): void;
 }
 
@@ -59,6 +60,7 @@ export function MessageCard({
   attachmentState,
   onRequestBody,
   onBodyHeightMeasured,
+  onBodyRendered,
   onDownloadAttachments
 }: MessageCardProps) {
   const hasAvailableBody = Boolean(message.sanitizedHTML || message.bodyStatus === "loaded");
@@ -77,8 +79,10 @@ export function MessageCard({
   const [revealedBodyMessageID, setRevealedBodyMessageID] = useState<
     TimelineMessage["messageID"] | null
   >(hasBody ? messageID : null);
+  const [hasMeasuredRenderedBody, setHasMeasuredRenderedBody] = useState(false);
   const [showsDetailedDate, setShowsDetailedDate] = useState(false);
   const lastBodyDebugKeyRef = useRef<string | null>(null);
+  const renderedMessageIDRef = useRef<TimelineMessage["messageID"] | null>(null);
   const isBodyRevealed = hasBody && revealedBodyMessageID === messageID;
   const hasBodyFailed = bodyStatus === "failed";
   const shouldRequestBody = canRequestBody &&
@@ -91,6 +95,11 @@ export function MessageCard({
   useEffect(() => {
     setCommittedBodyHeight(clampPlaceholderHeight(reservedBodyHeight ?? estimatedBodyHeight));
   }, [bodyHeightCacheKey]);
+
+  useEffect(() => {
+    setHasMeasuredRenderedBody(false);
+    renderedMessageIDRef.current = null;
+  }, [bodyHeightCacheKey, messageID]);
 
   useEffect(() => {
     if (reservedBodyHeight === undefined) return;
@@ -228,6 +237,7 @@ export function MessageCard({
 
   const handleMeasuredBodyHeight = useCallback((height: number) => {
     const nextHeight = clampMeasuredHeight(height);
+    setHasMeasuredRenderedBody(true);
     onBodyHeightMeasured(bodyHeightCacheKey, nextHeight);
 
     if (shouldDeferBodyRequest()) return;
@@ -236,6 +246,29 @@ export function MessageCard({
       return Math.abs(current - nextPlaceholderHeight) > 2 ? nextPlaceholderHeight : current;
     });
   }, [bodyHeightCacheKey, onBodyHeightMeasured, shouldDeferBodyRequest]);
+
+  useEffect(() => {
+    if (!isBodyRevealed || !hasMeasuredRenderedBody) return;
+    if (renderedMessageIDRef.current === messageID) return;
+
+    renderedMessageIDRef.current = messageID;
+    logBodyDebug("bodyRendered", {
+      messageID,
+      bodyStatus,
+      hasSanitizedHTML: Boolean(message.sanitizedHTML),
+      hasHTMLVariants: Boolean(message.htmlVariants)
+    });
+    onBodyRendered(message);
+  }, [
+    bodyStatus,
+    hasMeasuredRenderedBody,
+    isBodyRevealed,
+    message,
+    message.htmlVariants,
+    message.sanitizedHTML,
+    messageID,
+    onBodyRendered
+  ]);
 
   const handleDoubleClick = useCallback(() => {
     setShowsDetailedDate((current) => !current);

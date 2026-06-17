@@ -242,29 +242,35 @@ public actor MailAppServerClient {
     private let environment: [String: String]
     private let workingDirectoryURL: URL?
     private let defaultTimeout: TimeInterval
+    private let launchFailureRetryInterval: TimeInterval
 
     private var process: Process?
     private var stdin: FileHandle?
     private var stdout: FileHandle?
     private var stderrReader: AppServerStderrReader?
-    private var requestMetricsByMethod: [String: [AppServerRequestMetric]] = [:]
+    private var requestMetricsByID: [Int64: AppServerRequestMetric] = [:]
     private var nextID: Int64 = 1
     private var pending: [Int64: PendingRequest] = [:]
     private var responseReader: AppServerResponseReader?
     private var initializeResult: MailAppServerInitializeResult?
+    private var launchFailureBackoffUntil: Date?
+    private var launchFailureError: MailAppServerError?
+    private var suppressedLaunchFailureCount = 0
 
     public init(
         executableURL: URL,
         arguments: [String] = ["app-server", "--listen", "stdio://"],
         environment: [String: String] = [:],
         workingDirectoryURL: URL? = nil,
-        defaultTimeout: TimeInterval = 10
+        defaultTimeout: TimeInterval = 10,
+        launchFailureRetryInterval: TimeInterval = 5
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
         self.environment = environment
         self.workingDirectoryURL = workingDirectoryURL
         self.defaultTimeout = defaultTimeout
+        self.launchFailureRetryInterval = max(0, launchFailureRetryInterval)
     }
 
     deinit {
@@ -284,6 +290,14 @@ public actor MailAppServerClient {
                 return initializeResult
             }
             throw MailAppServerError.notRunning
+        }
+
+        if let cachedLaunchFailure = cachedLaunchFailureInBackoff() {
+            throw cachedLaunchFailure
+        }
+        if suppressedLaunchFailureCount > 0 {
+            NSLog("Mailia app-server launch retry after suppressing %d repeated failures", suppressedLaunchFailureCount)
+            suppressedLaunchFailureCount = 0
         }
 
         let process = Process()
@@ -313,9 +327,19 @@ public actor MailAppServerClient {
         do {
             try process.run()
         } catch {
-            throw MailAppServerError.launchFailed(error.localizedDescription)
+            stderrReader.stop()
+            try? stdinPipe.fileHandleForWriting.close()
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            let launchError = MailAppServerError.launchFailed(error.localizedDescription)
+            launchFailureError = launchError
+            launchFailureBackoffUntil = Date().addingTimeInterval(launchFailureRetryInterval)
+            throw launchError
         }
 
+        launchFailureError = nil
+        launchFailureBackoffUntil = nil
+        suppressedLaunchFailureCount = 0
         self.process = process
         self.stdin = stdinPipe.fileHandleForWriting
         self.stdout = stdoutPipe.fileHandleForReading
@@ -339,6 +363,17 @@ public actor MailAppServerClient {
         )
         self.initializeResult = initializeResult
         return initializeResult
+    }
+
+    private func cachedLaunchFailureInBackoff() -> MailAppServerError? {
+        guard let launchFailureBackoffUntil,
+              let launchFailureError,
+              Date() < launchFailureBackoffUntil
+        else {
+            return nil
+        }
+        suppressedLaunchFailureCount += 1
+        return launchFailureError
     }
 
     public func noop(timeout: TimeInterval? = nil) async throws {
@@ -503,10 +538,16 @@ public actor MailAppServerClient {
         let timingFields: [MailiaTimingField] = [
             .label("method", method.replacingOccurrences(of: "/", with: "_"))
         ]
+        var timingRequestID: Int64?
+        var suppressLaunchFailureTiming = false
 
         do {
             if method != "initialize", method != "shutdown" {
                 if process == nil || process?.isRunning != true || stdin == nil {
+                    if let cachedLaunchFailure = cachedLaunchFailureInBackoff() {
+                        suppressLaunchFailureTiming = true
+                        throw cachedLaunchFailure
+                    }
                     _ = try await start(timeout: timeout)
                 }
             }
@@ -516,6 +557,7 @@ public actor MailAppServerClient {
 
             let id = nextID
             nextID += 1
+            timingRequestID = id
             let payload = try AppServerRequest(id: id, method: method, params: params)
             let data = try JSONEncoder().encode(payload)
             let pending = PendingRequest()
@@ -545,7 +587,7 @@ public actor MailAppServerClient {
                 timeoutTask.cancel()
                 pending.cancel()
             }
-            let metric = await takeRequestMetric(method: method, backendStatus: "ok")
+            let metric = await takeRequestMetric(requestID: id, method: method, backendStatus: "ok")
             MailiaTiming.log(
                 operation: "app_server.request",
                 startedAt: timingStartedAt,
@@ -557,35 +599,54 @@ public actor MailAppServerClient {
             )
             return output
         } catch {
-            let metric = await takeRequestMetric(method: method, backendStatus: Self.backendStatus(for: error))
+            let metric: AppServerRequestMetric?
+            if let timingRequestID {
+                metric = await takeRequestMetric(
+                    requestID: timingRequestID,
+                    method: method,
+                    backendStatus: Self.backendStatus(for: error)
+                )
+            } else {
+                metric = nil
+            }
             let errorKind = Self.timingErrorKind(for: error)
-            MailiaTiming.log(
-                operation: "app_server.request",
-                startedAt: timingStartedAt,
-                status: Self.timingStatus(for: error),
-                fields: timingFields + MailAppServerRequestTiming.fields(
-                    for: metric,
-                    outcome: Self.timingOutcome(for: error),
-                    errorCode: Self.timingErrorCode(for: error)
-                ) + [.label("error_kind", errorKind)]
-            )
+            if !suppressLaunchFailureTiming {
+                MailiaTiming.log(
+                    operation: "app_server.request",
+                    startedAt: timingStartedAt,
+                    status: Self.timingStatus(for: error),
+                    fields: timingFields + MailAppServerRequestTiming.fields(
+                        for: metric,
+                        outcome: Self.timingOutcome(for: error),
+                        errorCode: Self.timingErrorCode(for: error)
+                    ) + [.label("error_kind", errorKind)]
+                )
+            }
             throw error
         }
     }
 
     private func receiveStderrLine(_ line: String) {
         guard let metric = AppServerRequestMetric.parse(line) else { return }
-        let method = metric.method
-        requestMetricsByMethod[method, default: []].append(metric)
-        if requestMetricsByMethod[method, default: []].count > 20 {
-            requestMetricsByMethod[method]?.removeFirst()
+        requestMetricsByID[metric.requestID] = metric
+        if requestMetricsByID.count > 100,
+           let oldestID = requestMetricsByID.keys.min() {
+            requestMetricsByID[oldestID] = nil
         }
     }
 
-    private func takeRequestMetric(method: String, backendStatus: String?) async -> AppServerRequestMetric? {
+    private func takeRequestMetric(
+        requestID: Int64,
+        method: String,
+        backendStatus: String?
+    ) async -> AppServerRequestMetric? {
         let deadline = Date().addingTimeInterval(0.05)
         while true {
-            if let metric = takeStoredRequestMetric(method: method, backendStatus: backendStatus) {
+            if let metric = takeStoredRequestMetric(
+                requestID: requestID,
+                method: method,
+                backendStatus: backendStatus
+            ) {
                 return metric
             }
             guard Date() < deadline else {
@@ -595,19 +656,21 @@ public actor MailAppServerClient {
         }
     }
 
-    private func takeStoredRequestMetric(method: String, backendStatus: String?) -> AppServerRequestMetric? {
-        guard var metrics = requestMetricsByMethod[method], !metrics.isEmpty else {
+    private func takeStoredRequestMetric(
+        requestID: Int64,
+        method: String,
+        backendStatus: String?
+    ) -> AppServerRequestMetric? {
+        guard let metric = requestMetricsByID[requestID] else {
             return nil
         }
-        let index: Int
-        if let backendStatus,
-           let matchingIndex = metrics.firstIndex(where: { $0.status == backendStatus }) {
-            index = matchingIndex
-        } else {
-            index = metrics.startIndex
+        guard metric.method == method else {
+            return nil
         }
-        let metric = metrics.remove(at: index)
-        requestMetricsByMethod[method] = metrics.isEmpty ? nil : metrics
+        if let backendStatus, metric.status != backendStatus {
+            return nil
+        }
+        requestMetricsByID[requestID] = nil
         return metric
     }
 
@@ -737,7 +800,7 @@ public actor MailAppServerClient {
         stderrReader = nil
         responseReader = nil
         initializeResult = nil
-        requestMetricsByMethod.removeAll()
+        requestMetricsByID.removeAll()
     }
 
     private func failAllPending(_ error: MailAppServerError) {
@@ -849,6 +912,7 @@ enum MailAppServerRequestTiming {
         [
             .label("outcome", outcome),
             .label("error_code", errorCode),
+            .label("backend_request_id", metric?.requestID ?? -1),
             .label("backend_status", metric?.status ?? "missing"),
             .label("backend_duration_ms", metric?.durationMilliseconds ?? -1),
             .label("config_load_count", metric?.configLoadCount ?? -1),
@@ -858,6 +922,7 @@ enum MailAppServerRequestTiming {
 }
 
 struct AppServerRequestMetric: Equatable, Sendable {
+    var requestID: Int64
     var method: String
     var status: String
     var durationMilliseconds: Int
@@ -876,6 +941,7 @@ struct AppServerRequestMetric: Equatable, Sendable {
         }
 
         guard
+            let requestID = values["request_id"].flatMap(Int64.init),
             let method = values["method"],
             let status = values["status"],
             let duration = values["duration_ms"].flatMap(Int.init),
@@ -886,6 +952,7 @@ struct AppServerRequestMetric: Equatable, Sendable {
         }
 
         return AppServerRequestMetric(
+            requestID: requestID,
             method: method,
             status: status,
             durationMilliseconds: duration,

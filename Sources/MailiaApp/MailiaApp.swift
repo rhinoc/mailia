@@ -564,6 +564,7 @@ private struct ContentView: View {
                 },
                 onRequestOlder: viewModel.loadOlderTimelineIfNeeded,
                 onSetMessageFlag: viewModel.setMessageFlag,
+                onMessageBodyRendered: viewModel.noteMessageBodyRendered,
                 onDownloadAttachments: viewModel.downloadAttachments,
                 onSendReply: viewModel.sendReply,
                 onSendNewMessage: viewModel.sendNewMessage,
@@ -1909,6 +1910,7 @@ private struct TimelinePane: View {
     let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
+    let onMessageBodyRendered: (MailiaTimelineItem) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
     let onSendReply: (MailiaTimelineItem, MailiaComposerContent, Bool, String?) -> Void
     let onSendNewMessage: ([String], String?, MailiaComposerContent, String?) -> Void
@@ -1951,6 +1953,7 @@ private struct TimelinePane: View {
                     onRequestBody: onRequestBody,
                     onRequestOlder: onRequestOlder,
                     onSetMessageFlag: onSetMessageFlag,
+                    onMessageBodyRendered: onMessageBodyRendered,
                     onDownloadAttachments: onDownloadAttachments,
                     onSendReply: onSendReply,
                     onSelectSendAccount: onSelectSendAccount,
@@ -2318,6 +2321,7 @@ private struct TimelineBody: View {
     let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
+    let onMessageBodyRendered: (MailiaTimelineItem) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
     let onSendReply: (MailiaTimelineItem, MailiaComposerContent, Bool, String?) -> Void
     let onSelectSendAccount: (String) -> Void
@@ -2349,6 +2353,7 @@ private struct TimelineBody: View {
                         onRequestBody: onRequestBody,
                         onRequestOlder: onRequestOlder,
                         onSetMessageFlag: onSetMessageFlag,
+                        onMessageBodyRendered: onMessageBodyRendered,
                         onDownloadAttachments: onDownloadAttachments,
                         onSendReply: { item, body, replyAll, accountKey in
                             onSendReply(item, MailiaComposerContent(plainText: body), replyAll, accountKey)

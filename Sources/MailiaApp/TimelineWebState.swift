@@ -791,6 +791,7 @@ enum TimelineWebEvent: Equatable, Sendable {
     case selectSendAccount(accountKey: String)
     case setMessageFlag(messageID: Int64, isFlagged: Bool)
     case downloadAttachments(messageID: Int64)
+    case messageBodyRendered(messageID: Int64)
     case entityAction(action: String, entityID: Int64?)
     case scrollAnchor(messageID: Int64, edge: TimelineWebState.ScrollAnchor.Edge)
     case log(level: String, message: String)
@@ -829,6 +830,9 @@ extension TimelineWebEvent {
         case "downloadAttachments":
             let payload = try envelope.payloadObject(as: MessagePayload.self)
             self = .downloadAttachments(messageID: payload.messageID)
+        case "messageBodyRendered":
+            let payload = try envelope.payloadObject(as: MessagePayload.self)
+            self = .messageBodyRendered(messageID: payload.messageID)
         case "entityAction":
             let payload = try envelope.payloadObject(as: EntityActionPayload.self)
             self = .entityAction(action: payload.action, entityID: payload.entityID)

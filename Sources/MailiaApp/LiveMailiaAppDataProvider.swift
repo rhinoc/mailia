@@ -46,6 +46,7 @@ protocol MailiaAppDataProviding {
         progress: @escaping @MainActor (String) -> Void
     ) async throws
     func markMessageRead(item: MailiaTimelineItem, workspace: MailiaWorkspace) async throws
+    func markMessagesRead(items: [MailiaTimelineItem], workspace: MailiaWorkspace) async throws -> Int
     func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws
     func downloadAttachments(for item: MailiaTimelineItem) async throws -> MailiaAttachmentDownloadResult
@@ -62,8 +63,8 @@ protocol MailiaAppDataProviding {
     func clearMessageBodyCache() async throws
 }
 
-/// Aggregates per-workspace sync progress (Main + Junk run concurrently) into a single
-/// determinate progress value for the refresh button.
+/// Aggregates per-workspace sync progress into a single determinate progress value
+/// for the refresh button.
 private actor RefreshProgressAggregator {
     private var byWorkspace: [Workspace: SyncWorkspaceProgress] = [:]
 
@@ -167,6 +168,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
     private let emailDisplayPipeline = EmailHTMLDisplayPipeline()
     private let htmlTextExtractor = HTMLTextExtractor()
     private let backgroundFolderRefreshGate: BackgroundFolderRefreshGate
+    private let backgroundMailboxMaintenanceDelayNanoseconds: UInt64
     private let nowProvider: @Sendable () -> Date
 
     init() {
@@ -200,6 +202,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         himalayaConfigStore: HimalayaConfigStore = HimalayaConfigStore(),
         revealDownloadedFiles: @MainActor @escaping ([URL], URL) -> Void = Self.revealInFinder,
         backgroundFolderRefreshMinimumInterval: TimeInterval = 300,
+        backgroundMailboxMaintenanceDelayNanoseconds: UInt64 = 1_000_000_000,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         let requestLimiter = appServerRequestLimiter
@@ -214,6 +217,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         self.backgroundFolderRefreshGate = BackgroundFolderRefreshGate(
             minimumInterval: backgroundFolderRefreshMinimumInterval
         )
+        self.backgroundMailboxMaintenanceDelayNanoseconds = backgroundMailboxMaintenanceDelayNanoseconds
         self.nowProvider = now
         self.syncService = SyncService(
             appServerClient: appServerClient,
@@ -432,7 +436,9 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 detail: nil,
                 fraction: nil
             ))
+            let shouldRefreshKnownFoldersInBackground: Bool
             if try repository.folders().isEmpty {
+                shouldRefreshKnownFoldersInBackground = false
                 do {
                     _ = try await syncService.discoverFoldersForRefresh(
                         timeout: 45,
@@ -444,7 +450,7 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                     throw MailiaSyncFailure.mailboxDiscoveryFailed(error)
                 }
             } else {
-                refreshDiscoveredFoldersInBackground(timeout: 45)
+                shouldRefreshKnownFoldersInBackground = true
             }
 
             let aggregator = RefreshProgressAggregator()
@@ -463,24 +469,43 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 preferredAccountKeys: options.preferredAccountKeys
             )
             let syncTimeout: TimeInterval = options.fullHistory ? 300 : 45
+            var shouldRefreshRemainingMailboxesInBackground = false
 
-            async let mainSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
-                .main,
-                accountPriorityScores: mainAccountPriorityScores,
-                fullHistory: options.fullHistory,
-                timeout: syncTimeout,
-                onProgress: report
-            )
-            async let junkSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
-                .junk,
-                accountPriorityScores: junkAccountPriorityScores,
-                fullHistory: options.fullHistory,
-                timeout: syncTimeout,
-                onProgress: report
-            )
-            let syncResults = try await (mainSync, junkSync)
-            if syncResults.0.hadFailure || syncResults.1.hadFailure {
-                throw MailiaSyncFailure.mailboxSyncFailed
+            if options.fullHistory {
+                async let mainSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
+                    .main,
+                    accountPriorityScores: mainAccountPriorityScores,
+                    fullHistory: true,
+                    timeout: syncTimeout,
+                    onProgress: report
+                )
+                async let junkSync: SyncWorkspaceResult = syncService.syncWorkspaceResult(
+                    .junk,
+                    accountPriorityScores: junkAccountPriorityScores,
+                    fullHistory: true,
+                    timeout: syncTimeout,
+                    onProgress: report
+                )
+                let syncResults = try await (mainSync, junkSync)
+                if syncResults.0.hadFailure || syncResults.1.hadFailure {
+                    throw MailiaSyncFailure.mailboxSyncFailed
+                }
+            } else {
+                let currentWorkspace = workspace.coreWorkspace
+                let currentAccountPriorityScores = currentWorkspace == .junk
+                    ? junkAccountPriorityScores
+                    : mainAccountPriorityScores
+                let currentSync = try await syncService.syncWorkspaceResult(
+                    currentWorkspace,
+                    accountPriorityScores: currentAccountPriorityScores,
+                    fullHistory: false,
+                    timeout: syncTimeout,
+                    onProgress: report
+                )
+                if currentSync.hadFailure {
+                    throw MailiaSyncFailure.mailboxSyncFailed
+                }
+                shouldRefreshRemainingMailboxesInBackground = true
             }
 
             progress(MailiaRefreshProgress(
@@ -489,41 +514,88 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
                 detail: nil,
                 fraction: nil
             ))
-            return try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
+            let snapshot = try await loadSnapshot(workspace: workspace, searchQuery: searchQuery)
+            if shouldRefreshRemainingMailboxesInBackground {
+                refreshRemainingMailboxesInBackground(
+                    currentWorkspace: workspace.coreWorkspace,
+                    timeout: syncTimeout,
+                    refreshKnownFolders: shouldRefreshKnownFoldersInBackground,
+                    mainAccountPriorityScores: mainAccountPriorityScores,
+                    junkAccountPriorityScores: junkAccountPriorityScores
+                )
+            }
+            return snapshot
         }
     }
 
-    private func refreshDiscoveredFoldersInBackground(timeout: TimeInterval) {
-        Task { [backgroundFolderRefreshGate, nowProvider, syncService] in
-            let startedAt = Date()
-            let decision = await backgroundFolderRefreshGate.begin(now: nowProvider())
-            guard decision == .start else {
-                MailiaTiming.log(
-                    operation: "sync.discover_folders_all",
-                    startedAt: startedAt,
-                    status: "skipped",
-                    fields: [
-                        .label("source", "background_refresh"),
-                        .label("skip_reason", decision.rawValue)
-                    ]
-                )
-                return
+    private func refreshRemainingMailboxesInBackground(
+        currentWorkspace: Workspace,
+        timeout: TimeInterval,
+        refreshKnownFolders: Bool,
+        mainAccountPriorityScores: [String: Int],
+        junkAccountPriorityScores: [String: Int]
+    ) {
+        Task { [backgroundFolderRefreshGate, backgroundMailboxMaintenanceDelayNanoseconds, nowProvider, syncService] in
+            if backgroundMailboxMaintenanceDelayNanoseconds > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: backgroundMailboxMaintenanceDelayNanoseconds)
+                } catch {
+                    return
+                }
             }
-            do {
-                _ = try await syncService.discoverFoldersForRefresh(
-                    timeout: timeout,
-                    source: "background_refresh"
-                )
-                await backgroundFolderRefreshGate.finish()
-            } catch let error as CancellationError {
-                await backgroundFolderRefreshGate.finish()
-                _ = error
-                return
-            } catch {
-                await backgroundFolderRefreshGate.finish()
-                NSLog("Unable to refresh mailbox list in background: \(error.localizedDescription)")
+
+            if refreshKnownFolders {
+                let startedAt = Date()
+                let decision = await backgroundFolderRefreshGate.begin(now: nowProvider())
+                guard decision == .start else {
+                    MailiaTiming.log(
+                        operation: "sync.discover_folders_all",
+                        startedAt: startedAt,
+                        status: "skipped",
+                        fields: [
+                            .label("source", "background_refresh"),
+                            .label("skip_reason", decision.rawValue)
+                        ]
+                    )
+                    return
+                }
+                do {
+                    _ = try await syncService.discoverFoldersForRefresh(
+                        timeout: timeout,
+                        source: "background_refresh"
+                    )
+                    await backgroundFolderRefreshGate.finish()
+                } catch let error as CancellationError {
+                    await backgroundFolderRefreshGate.finish()
+                    _ = error
+                    return
+                } catch {
+                    await backgroundFolderRefreshGate.finish()
+                    NSLog("Unable to refresh mailbox list in background: \(error.localizedDescription)")
+                }
+            }
+
+            for workspace in Self.backgroundSyncWorkspaces(after: currentWorkspace) {
+                do {
+                    let scores = workspace == .junk ? junkAccountPriorityScores : mainAccountPriorityScores
+                    _ = try await syncService.syncWorkspaceResult(
+                        workspace,
+                        accountPriorityScores: scores,
+                        fullHistory: false,
+                        timeout: timeout
+                    )
+                } catch let error as CancellationError {
+                    _ = error
+                    return
+                } catch {
+                    NSLog("Unable to refresh \(workspace.rawValue) mailbox in background: \(error.localizedDescription)")
+                }
             }
         }
+    }
+
+    nonisolated private static func backgroundSyncWorkspaces(after currentWorkspace: Workspace) -> [Workspace] {
+        [.main, .junk].filter { $0 != currentWorkspace }
     }
 
     private func refreshAccountPriorityScores(
@@ -1033,24 +1105,8 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         )
         guard !locations.isEmpty else { return }
 
-        var failures: [String] = []
-        for location in locations {
-            do {
-                try await markMessageReadRemotely(location)
-                let didUpdate = try repository.setMessageLocationFlag(
-                    accountKey: location.accountKey,
-                    folderName: location.sourceFolderName,
-                    himalayaEnvelopeID: location.himalayaEnvelopeID,
-                    flag: "seen",
-                    isEnabled: true
-                )
-                if !didUpdate {
-                    failures.append("No matching message location was found for \(location.himalayaEnvelopeID).")
-                }
-            } catch {
-                failures.append(Self.errorDescription(error))
-            }
-        }
+        let results = await runMarkReadCommands(locations: locations)
+        let failures = try applyMarkReadResults(results)
 
         if let firstFailure = failures.first {
             throw EntityActionError.partialFailure(
@@ -1093,12 +1149,228 @@ struct LiveMailiaAppDataProvider: MailiaAppDataProviding {
         }
     }
 
+    func markMessagesRead(items: [MailiaTimelineItem], workspace: MailiaWorkspace) async throws -> Int {
+        var seenMessageIDs = Set<Int64>()
+        let uniqueItems = items.filter { seenMessageIDs.insert($0.id).inserted }
+        guard !uniqueItems.isEmpty else { return 0 }
+
+        var changedCount = 0
+        var failures: [String] = []
+        var totalLocationCount = 0
+
+        for item in uniqueItems {
+            let locations = try repository.messageLocations(messageID: item.id, onlyUnread: true)
+            guard !locations.isEmpty else { continue }
+
+            totalLocationCount += locations.count
+            let results = await runMarkReadCommands(locations: locations)
+            let itemFailures = try applyMarkReadResults(results)
+
+            if itemFailures.isEmpty {
+                changedCount += 1
+            } else {
+                failures.append(contentsOf: itemFailures)
+            }
+        }
+
+        if let firstFailure = failures.first {
+            throw EntityActionError.partialFailure(
+                failed: failures.count,
+                total: max(totalLocationCount, failures.count),
+                firstFailure: firstFailure
+            )
+        }
+
+        return changedCount
+    }
+
+    private func runMarkReadCommands(locations: [MessageLocationTarget]) async -> [EntityActionLocationResult] {
+        let groupedLocations = Dictionary(grouping: locations) { location in
+            "\(location.accountKey)\u{1F}\(location.messageID)"
+        }
+        .values
+        .map { group in
+            group.sorted {
+                if $0.sourceFolderName == $1.sourceFolderName {
+                    $0.himalayaEnvelopeID < $1.himalayaEnvelopeID
+                } else {
+                    $0.sourceFolderName < $1.sourceFolderName
+                }
+            }
+        }
+
+        let appServerClient = appServerClient
+        let requestLimiter = appServerRequestLimiter
+        return await withTaskGroup(of: [EntityActionLocationResult].self) { group in
+            for locationGroup in groupedLocations {
+                group.addTask {
+                    guard Self.shouldCoalesceMarkReadLocationGroup(locationGroup) else {
+                        var groupResults: [EntityActionLocationResult] = []
+                        for location in locationGroup {
+                            do {
+                                try await Self.markMessageReadRemotely(
+                                    location,
+                                    appServerClient: appServerClient,
+                                    requestLimiter: requestLimiter
+                                )
+                                groupResults.append(EntityActionLocationResult(
+                                    location: location,
+                                    didRunCommand: true,
+                                    failureDescription: nil
+                                ))
+                            } catch {
+                                groupResults.append(EntityActionLocationResult(
+                                    location: location,
+                                    didRunCommand: true,
+                                    failureDescription: Self.errorDescription(error)
+                                ))
+                            }
+                        }
+                        return groupResults
+                    }
+
+                    guard let remoteLocation = Self.preferredMarkReadRemoteLocation(in: locationGroup) else {
+                        return []
+                    }
+
+                    do {
+                        try await Self.markMessageReadRemotely(
+                            remoteLocation,
+                            appServerClient: appServerClient,
+                            requestLimiter: requestLimiter
+                        )
+                        return locationGroup.map { location in
+                            EntityActionLocationResult(
+                                location: location,
+                                didRunCommand: true,
+                                failureDescription: nil
+                            )
+                        }
+                    } catch {
+                        let failure = Self.errorDescription(error)
+                        return locationGroup.map { location in
+                            EntityActionLocationResult(
+                                location: location,
+                                didRunCommand: location == remoteLocation,
+                                failureDescription: failure
+                            )
+                        }
+                    }
+                }
+            }
+
+            var results: [EntityActionLocationResult] = []
+            for await groupResults in group {
+                results += groupResults
+            }
+            return results
+        }
+    }
+
+    nonisolated private static func shouldCoalesceMarkReadLocationGroup(
+        _ locations: [MessageLocationTarget]
+    ) -> Bool {
+        locations.contains { location in
+            location.sourceFolderName.lowercased().hasPrefix("[gmail]/")
+        }
+    }
+
+    nonisolated private static func preferredMarkReadRemoteLocation(
+        in locations: [MessageLocationTarget]
+    ) -> MessageLocationTarget? {
+        locations.sorted(by: markReadRemoteLocationPrecedes).first
+    }
+
+    nonisolated private static func markReadRemoteLocationPrecedes(
+        _ lhs: MessageLocationTarget,
+        _ rhs: MessageLocationTarget
+    ) -> Bool {
+        let lhsRank = markReadRemoteLocationRank(lhs)
+        let rhsRank = markReadRemoteLocationRank(rhs)
+        if lhsRank != rhsRank {
+            return lhsRank < rhsRank
+        }
+        if lhs.sourceFolderName != rhs.sourceFolderName {
+            return lhs.sourceFolderName.localizedStandardCompare(rhs.sourceFolderName) == .orderedAscending
+        }
+        return lhs.himalayaEnvelopeID.localizedStandardCompare(rhs.himalayaEnvelopeID) == .orderedAscending
+    }
+
+    nonisolated private static func markReadRemoteLocationRank(_ location: MessageLocationTarget) -> Int {
+        let folder = location.sourceFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercasedFolder = folder.lowercased()
+        if lowercasedFolder == "inbox" {
+            return 0
+        }
+        if !lowercasedFolder.hasPrefix("[gmail]/") && location.sourceFolderRole == .normal {
+            return 1
+        }
+        if lowercasedFolder.contains("all mail") || lowercasedFolder.contains("所有邮件") {
+            return 3
+        }
+        if lowercasedFolder.contains("important") || lowercasedFolder.contains("重要") {
+            return 4
+        }
+        return 2
+    }
+
+    private func applyMarkReadResults(_ results: [EntityActionLocationResult]) throws -> [String] {
+        var failures = results.compactMap(\.failureDescription)
+        for result in results where result.failureDescription == nil && result.didRunCommand {
+            let didUpdate = try repository.setMessageLocationFlag(
+                accountKey: result.location.accountKey,
+                folderName: result.location.sourceFolderName,
+                himalayaEnvelopeID: result.location.himalayaEnvelopeID,
+                flag: "seen",
+                isEnabled: true
+            )
+            if !didUpdate {
+                failures.append("No matching message location was found for \(result.location.himalayaEnvelopeID).")
+            }
+        }
+        return failures
+    }
+
+    nonisolated private static func markMessageReadRemotely(
+        _ location: MessageLocationTarget,
+        appServerClient: MailAppServerClient,
+        requestLimiter: MailAppServerRequestLimiter
+    ) async throws {
+        let maxAttempts = 3
+        var lastError: Error?
+        for attempt in 1...maxAttempts {
+            do {
+                try await requestLimiter.run(priority: .backgroundSync, timingMethod: "message_modify") {
+                    _ = try await appServerClient.messageModify(
+                        id: location.himalayaEnvelopeID,
+                        folder: location.sourceFolderName,
+                        account: location.accountKey,
+                        addFlags: ["seen"],
+                        timeout: 30
+                    )
+                }
+                return
+            } catch {
+                lastError = error
+                guard attempt < maxAttempts else {
+                    throw error
+                }
+
+                let delay = UInt64(attempt) * 500_000_000
+                try? await Task.sleep(nanoseconds: delay)
+            }
+        }
+        if let lastError {
+            throw lastError
+        }
+    }
+
     private func markMessageReadRemotely(_ location: MessageLocationTarget) async throws {
         let maxAttempts = 3
         var lastError: Error?
         for attempt in 1...maxAttempts {
             do {
-                try await appServerRequestLimiter.run(priority: .backgroundSync) {
+                try await appServerRequestLimiter.run(priority: .backgroundSync, timingMethod: "message_modify") {
                     _ = try await appServerClient.messageModify(
                         id: location.himalayaEnvelopeID,
                         folder: location.sourceFolderName,

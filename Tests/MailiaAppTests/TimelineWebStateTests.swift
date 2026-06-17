@@ -1,3 +1,4 @@
+import Foundation
 import MailiaCore
 import Testing
 @testable import MailiaApp
@@ -74,6 +75,15 @@ func timelineWebStateSendsFullHTMLWhenRemoteContentIsAllowed() {
     } else {
         Issue.record("Expected loaded body state.")
     }
+}
+
+@Test
+func timelineWebEventDecodesBodyRenderedMessage() throws {
+    let data = #"{"type":"messageBodyRendered","payload":{"messageID":42}}"#
+        .data(using: .utf8)!
+    let envelope = try JSONDecoder.timelineWeb.decode(TimelineWebEventEnvelope.self, from: data)
+
+    #expect(try envelope.event() == .messageBodyRendered(messageID: 42))
 }
 
 private func timelineWebStateItem(htmlVariants: MailiaTimelineHTMLVariants?) -> MailiaTimelineItem {

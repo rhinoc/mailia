@@ -199,6 +199,16 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
     [bridge]
   );
 
+  const recordBodyRendered = useCallback(
+    (message: TimelineMessageView) => {
+      bridge.send({
+        type: "messageBodyRendered",
+        messageID: message.messageID
+      });
+    },
+    [bridge]
+  );
+
   useEffect(() => {
     return () => {
       if (scrollSettleTimerRef.current !== null) {
@@ -525,6 +535,7 @@ export function TimelineView({ bridge, state }: TimelineViewProps) {
                 }
                 onRequestBody={requestBody}
                 onBodyHeightMeasured={recordBodyHeight}
+                onBodyRendered={recordBodyRendered}
                 onDownloadAttachments={downloadAttachments}
               />
             </div>

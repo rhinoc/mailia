@@ -682,11 +682,28 @@ fn log_request_metric(
         "ok"
     };
     eprintln!(
-        "{SERVER_NAME}: request method={method} status={status} duration_ms={} config_load_count={} auth_refresh_count={}",
+        "{SERVER_NAME}: request request_id={} method={method} status={status} duration_ms={} config_load_count={} auth_refresh_count={}",
+        request_id_metric_value(&response.id),
         duration.as_millis(),
         state.config_load_count.load(Ordering::SeqCst),
         state.auth_refresh_count.load(Ordering::SeqCst)
     );
+}
+
+fn request_id_metric_value(id: &RequestId) -> String {
+    match id {
+        RequestId::Number(value) => value.to_string(),
+        RequestId::String(value) => value
+            .chars()
+            .map(|character| {
+                if character.is_whitespace() || character == '=' {
+                    '_'
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    }
 }
 
 fn account_from_summary(account: AccountSummary) -> Account {
@@ -915,6 +932,15 @@ mod tests {
         assert_eq!(error.code, RpcErrorCode::Internal);
         assert_eq!(error.retryable, Some(true));
         assert_eq!(error.message, "request timed out after 25 ms");
+    }
+
+    #[test]
+    fn request_metric_id_value_is_grep_friendly() {
+        assert_eq!(request_id_metric_value(&RequestId::Number(42)), "42");
+        assert_eq!(
+            request_id_metric_value(&RequestId::String("slow request=1".to_owned())),
+            "slow_request_1"
+        );
     }
 
     #[test]

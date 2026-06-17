@@ -32,7 +32,7 @@ public struct SyncService {
     public func discoverAccounts(timeout: TimeInterval? = nil) async throws -> [DiscoveredAccount] {
         let timingStartedAt = Date()
         do {
-            let serverAccounts = try await runAppServer(priority: .backgroundSync) {
+            let serverAccounts = try await runAppServer(priority: .backgroundSync, timingMethod: "account_list") {
                 try await appServerClient.accountList(timeout: timeout)
             }
             let configMetadata = (try? himalayaConfigStore.accountMetadata()) ?? [:]
@@ -64,7 +64,7 @@ public struct SyncService {
         let timingStartedAt = Date()
         let baseFields = [.redacted("account", accountKey)] + Self.folderDiscoverySourceFields(source)
         do {
-            let serverFolders = try await runAppServer(priority: .backgroundSync) {
+            let serverFolders = try await runAppServer(priority: .backgroundSync, timingMethod: "folder_list") {
                 try await appServerClient.folderList(account: accountKey, timeout: timeout)
             }
             let folders = serverFolders
@@ -658,9 +658,10 @@ public struct SyncService {
 
     private func runAppServer<Result: Sendable>(
         priority: MailAppServerRequestPriority,
+        timingMethod: String? = nil,
         operation: @escaping @Sendable () async throws -> Result
     ) async throws -> Result {
-        try await appServerRequestLimiter.run(priority: priority, operation: operation)
+        try await appServerRequestLimiter.run(priority: priority, timingMethod: timingMethod, operation: operation)
     }
 
     private func makeEnvelopePageSyncer() -> EnvelopePageSyncer {
@@ -674,7 +675,7 @@ public struct SyncService {
                 .label("page_size", pageSize)
             ]
             do {
-                let envelopes = try await runAppServer(priority: .backgroundSync) {
+                let envelopes = try await runAppServer(priority: .backgroundSync, timingMethod: "message_list") {
                     try await appServerClient.messageList(
                         folder: folder.providerName,
                         account: folder.accountKey,

@@ -406,7 +406,8 @@ final class AppViewModel: ObservableObject {
     @Published var workspace: MailiaWorkspace = .main {
         didSet {
             guard workspace != oldValue else { return }
-            pendingMarkReadTask?.cancel()
+            clearRenderedReadBatch()
+            cancelEntityReadTasks()
             clearPresentationForFilterChange()
             reloadForCurrentFilters()
         }
@@ -421,8 +422,9 @@ final class AppViewModel: ObservableObject {
                 isComposingNewMessage = false
             }
             selectedSendAccountKey = nil
-            scheduleMarkSelectedEntityReadIfNeeded()
+            clearRenderedReadBatch()
             loadTimelineForSelection()
+            markSelectedEntityReadIfNeeded()
             resolveSelectedEntityAvatarIfNeeded()
         }
     }
@@ -476,22 +478,24 @@ final class AppViewModel: ObservableObject {
     private var sendAccountsRefreshTask: Task<Void, Never>?
     private var entityPreviewBodyPrefetchTask: Task<Void, Never>?
     private var optimisticHiddenEntityIDs: Set<Int64> = []
-    private var pendingMarkReadTask: Task<Void, Never>?
-    private var markReadTasks: [Int64: Task<Void, Never>] = [:]
+    private var pendingRenderedReadItems: [Int64: MailiaTimelineItem] = [:]
+    private var renderedReadFlushTask: Task<Void, Never>?
+    private var inFlightRenderedReadMessageIDs: Set<Int64> = []
+    private var markEntityReadTasks: [Int64: Task<Void, Never>] = [:]
     private let avatarResolver: EntityBrandAvatarResolver
     private let timelinePageSize = 80
     private let selectedTimelineBodyPrefetchLimit = 4
     private let entityPreviewBodyPrefetchLimit = 12
     private let maxConcurrentAvatarResolutions = 4
     private let partialRefreshSnapshotDelayNanoseconds: UInt64 = 350_000_000
-    private let selectedMarkReadDelayNanoseconds: UInt64
+    private let renderedReadBatchDelayNanoseconds: UInt64
     private let postSendFollowUpRefreshDelaysNanoseconds: [UInt64]
     private let avatarResolutionTimeoutNanoseconds: UInt64 = 12_000_000_000
 
     init(
         provider: any MailiaAppDataProviding = LiveMailiaAppDataProvider(),
         avatarResolver: EntityBrandAvatarResolver = EntityBrandAvatarResolver(),
-        selectedMarkReadDelayNanoseconds: UInt64 = 1_500_000_000,
+        renderedReadBatchDelayNanoseconds: UInt64 = 400_000_000,
         postSendFollowUpRefreshDelaysNanoseconds: [UInt64] = [3_000_000_000, 8_000_000_000],
         startupRefreshStalenessThreshold: TimeInterval = 600,
         now: @escaping @Sendable () -> Date = Date.init
@@ -499,7 +503,7 @@ final class AppViewModel: ObservableObject {
         self.provider = provider
         self.bodyLoadQueue = BodyFetchQueue(provider: provider)
         self.avatarResolver = avatarResolver
-        self.selectedMarkReadDelayNanoseconds = selectedMarkReadDelayNanoseconds
+        self.renderedReadBatchDelayNanoseconds = renderedReadBatchDelayNanoseconds
         self.postSendFollowUpRefreshDelaysNanoseconds = postSendFollowUpRefreshDelaysNanoseconds
         self.startupRefreshStalenessThreshold = startupRefreshStalenessThreshold
         self.now = now
@@ -514,8 +518,8 @@ final class AppViewModel: ObservableObject {
         for task in postSendFollowUpRefreshTasks.values {
             task.cancel()
         }
-        pendingMarkReadTask?.cancel()
-        for task in markReadTasks.values {
+        renderedReadFlushTask?.cancel()
+        for task in markEntityReadTasks.values {
             task.cancel()
         }
         for task in avatarResolutionTasks.values {
@@ -697,59 +701,75 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func scheduleMarkSelectedEntityReadIfNeeded() {
-        pendingMarkReadTask?.cancel()
-
-        guard let selectedEntityID,
-              let entity = entities.first(where: { $0.id == selectedEntityID }),
-              entity.unreadCount > 0
+    func noteMessageBodyRendered(_ item: MailiaTimelineItem) {
+        guard selectedEntityID == item.entityID,
+              timeline.contains(where: { $0.id == item.id }),
+              let entity = entities.first(where: { $0.id == item.entityID }),
+              entity.unreadCount > 0,
+              markEntityReadTasks[item.entityID] == nil,
+              !inFlightRenderedReadMessageIDs.contains(item.id)
         else {
             return
         }
 
-        let workspaceSnapshot = workspace
-        pendingMarkReadTask = Task { [weak self] in
+        pendingRenderedReadItems[item.id] = item
+        scheduleRenderedReadFlush()
+    }
+
+    private func scheduleRenderedReadFlush() {
+        renderedReadFlushTask?.cancel()
+        renderedReadFlushTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: self?.selectedMarkReadDelayNanoseconds ?? 1_500_000_000)
+                try await Task.sleep(nanoseconds: self?.renderedReadBatchDelayNanoseconds ?? 400_000_000)
             } catch {
                 return
             }
 
             guard !Task.isCancelled else { return }
-            self?.markEntityReadAfterViewing(
-                entityID: selectedEntityID,
-                workspace: workspaceSnapshot
-            )
+            self?.flushRenderedReadBatch()
         }
     }
 
-    private func markEntityReadAfterViewing(entityID: Int64, workspace workspaceSnapshot: MailiaWorkspace) {
-        pendingMarkReadTask = nil
+    private func flushRenderedReadBatch() {
+        renderedReadFlushTask?.cancel()
+        renderedReadFlushTask = nil
 
-        guard selectedEntityID == entityID,
-              workspace == workspaceSnapshot,
-              let entity = entities.first(where: { $0.id == entityID }),
-              entity.unreadCount > 0,
-              let item = selectedMarkReadTargetItem(for: entity)
-        else {
-            return
-        }
+        let items = pendingRenderedReadItems.values
+            .filter { !inFlightRenderedReadMessageIDs.contains($0.id) }
+            .sorted { $0.id < $1.id }
+        pendingRenderedReadItems.removeAll()
+        guard !items.isEmpty else { return }
 
-        let messageID = item.id
-        guard markReadTasks[messageID] == nil else { return }
+        let workspaceSnapshot = workspace
+        let searchQuerySnapshot = searchQuery
+        let messageIDs = Set(items.map(\.id))
+        inFlightRenderedReadMessageIDs.formUnion(messageIDs)
 
-        markReadTasks[messageID] = Task { [weak self] in
+        Task { [weak self] in
             guard let self else { return }
             do {
-                try await provider.markMessageRead(item: item, workspace: workspaceSnapshot)
-                markReadTasks[messageID] = nil
-                decrementUnreadCount(for: entityID)
+                let changedCount = try await provider.markMessagesRead(items: items, workspace: workspaceSnapshot)
+                inFlightRenderedReadMessageIDs.subtract(messageIDs)
+                guard changedCount > 0 else { return }
+
+                let snapshot = try await provider.loadSnapshot(
+                    workspace: workspaceSnapshot,
+                    searchQuery: searchQuerySnapshot
+                )
+                guard workspace == workspaceSnapshot,
+                      searchQuery == searchQuerySnapshot else { return }
+                applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
             } catch {
-                markReadTasks[messageID] = nil
+                inFlightRenderedReadMessageIDs.subtract(messageIDs)
                 refreshStatus = "Unable to mark mail read: \(error.localizedDescription)"
-                NSLog("Unable to mark message read: \(error.localizedDescription)")
+                NSLog("Unable to mark rendered messages read: \(error.localizedDescription)")
                 do {
-                    let snapshot = try await provider.loadSnapshot(workspace: workspaceSnapshot, searchQuery: searchQuery)
+                    let snapshot = try await provider.loadSnapshot(
+                        workspace: workspaceSnapshot,
+                        searchQuery: searchQuerySnapshot
+                    )
+                    guard workspace == workspaceSnapshot,
+                          searchQuery == searchQuerySnapshot else { return }
                     applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
                 } catch {
                     NSLog("Unable to reload mail after mark-read failure: \(error.localizedDescription)")
@@ -758,16 +778,67 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func selectedMarkReadTargetItem(for entity: MailiaEntitySummary) -> MailiaTimelineItem? {
-        guard let latestMessageID = entity.latestMessageID else {
-            return timeline.last { $0.entityID == entity.id }
-        }
-        return timeline.first { $0.entityID == entity.id && $0.id == latestMessageID }
+    private func clearRenderedReadBatch() {
+        renderedReadFlushTask?.cancel()
+        renderedReadFlushTask = nil
+        pendingRenderedReadItems.removeAll()
     }
 
-    private func decrementUnreadCount(for entityID: Int64) {
-        guard let index = entities.firstIndex(where: { $0.id == entityID }) else { return }
-        entities[index].unreadCount = max(0, entities[index].unreadCount - 1)
+    private func markSelectedEntityReadIfNeeded() {
+        guard let entityID = selectedEntityID,
+              let entity = entities.first(where: { $0.id == entityID }),
+              entity.unreadCount > 0,
+              markEntityReadTasks[entityID] == nil
+        else {
+            return
+        }
+
+        let workspaceSnapshot = workspace
+        let searchQuerySnapshot = searchQuery
+        clearRenderedReadBatch()
+        setUnreadCount(0, for: entityID)
+        MailiaScrollDebugLog("[MailiaReadDebug] markEntityRead start entityID=\(entityID) unreadCount=\(entity.unreadCount) workspace=\(workspaceSnapshot.rawValue)")
+
+        markEntityReadTasks[entityID] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await provider.markEntityRead(entityID: entityID, workspace: workspaceSnapshot)
+                markEntityReadTasks[entityID] = nil
+                MailiaScrollDebugLog("[MailiaReadDebug] markEntityRead success entityID=\(entityID)")
+
+                let snapshot = try await provider.loadSnapshot(
+                    workspace: workspaceSnapshot,
+                    searchQuery: searchQuerySnapshot
+                )
+                guard workspace == workspaceSnapshot,
+                      searchQuery == searchQuerySnapshot else { return }
+                applySnapshot(snapshot, reloadTimelineIfSelectionKept: false)
+            } catch is CancellationError {
+                markEntityReadTasks[entityID] = nil
+            } catch {
+                markEntityReadTasks[entityID] = nil
+                refreshStatus = "Unable to mark mail read: \(error.localizedDescription)"
+                NSLog("Unable to mark selected entity read: \(error.localizedDescription)")
+                do {
+                    let snapshot = try await provider.loadSnapshot(
+                        workspace: workspaceSnapshot,
+                        searchQuery: searchQuerySnapshot
+                    )
+                    guard workspace == workspaceSnapshot,
+                          searchQuery == searchQuerySnapshot else { return }
+                    applySnapshot(snapshot, reloadTimelineIfSelectionKept: false, markSelectedEntityRead: false)
+                } catch {
+                    NSLog("Unable to reload mail after entity mark-read failure: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func cancelEntityReadTasks() {
+        for task in markEntityReadTasks.values {
+            task.cancel()
+        }
+        markEntityReadTasks.removeAll()
     }
 
     private func setUnreadCount(_ unreadCount: Int, for entityID: Int64) {
@@ -1989,7 +2060,11 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func applySnapshot(_ snapshot: MailiaSnapshot, reloadTimelineIfSelectionKept: Bool) {
+    private func applySnapshot(
+        _ snapshot: MailiaSnapshot,
+        reloadTimelineIfSelectionKept: Bool,
+        markSelectedEntityRead: Bool = true
+    ) {
         applySendAccounts(snapshot.sendAccounts)
         if let selectedSendAccountKey,
            !snapshot.sendAccounts.contains(where: { $0.id == selectedSendAccountKey }) {
@@ -2011,8 +2086,9 @@ final class AppViewModel: ObservableObject {
             timeline = []
             timelineBodyStates = [:]
             resetTimelineWindowState()
-        } else {
-            scheduleMarkSelectedEntityReadIfNeeded()
+        }
+        if markSelectedEntityRead {
+            markSelectedEntityReadIfNeeded()
         }
         scheduleEntityPreviewBodyPrefetch()
         hydrateCachedAvatarImagesThenResolve()

@@ -977,7 +977,20 @@ public struct MailRepository {
                       \(scope.flaggedLocationPredicate(locationAlias: "ml"))
                       \(unreadPredicate)
                       AND me.entity_id = ?
-                    ORDER BY ml.account_key, f.provider_name, ml.himalaya_envelope_id
+                    ORDER BY
+                        ml.account_key,
+                        ml.message_id,
+                        ml.is_primary DESC,
+                        CASE
+                            WHEN UPPER(f.provider_name) = 'INBOX' THEN 0
+                            WHEN f.provider_name LIKE '[Gmail]/All Mail'
+                              OR f.provider_name LIKE '[Gmail]/所有邮件' THEN 3
+                            WHEN f.provider_name LIKE '[Gmail]/Important'
+                              OR f.provider_name LIKE '[Gmail]/重要' THEN 4
+                            ELSE 1
+                        END,
+                        f.provider_name,
+                        ml.himalaya_envelope_id
                     """,
                 arguments: arguments
             )
@@ -995,9 +1008,12 @@ public struct MailRepository {
         }
     }
 
-    public func messageLocations(messageID: Int64) throws -> [MessageLocationTarget] {
+    public func messageLocations(messageID: Int64, onlyUnread: Bool = false) throws -> [MessageLocationTarget] {
         try MailiaTiming.measure(operation: "repository.message_locations_for_message") {
             try databaseQueue.read { db in
+            let unreadPredicate = onlyUnread
+                ? "AND LOWER(COALESCE(ml.flags_json, '')) NOT LIKE '%seen%'"
+                : ""
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -1011,6 +1027,7 @@ public struct MailRepository {
                     JOIN folders f ON f.id = ml.folder_id
                     WHERE ml.message_id = ?
                       AND ml.missing_since_at IS NULL
+                      \(unreadPredicate)
                     ORDER BY
                         ml.is_primary DESC,
                         CASE f.role

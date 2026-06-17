@@ -272,6 +272,10 @@ private final class BodyFetchQueueProvider: MailiaAppDataProviding {
         fatalError("markMessageRead is not used in this test")
     }
 
+    func markMessagesRead(items: [MailiaTimelineItem], workspace: MailiaWorkspace) async throws -> Int {
+        fatalError("markMessagesRead is not used in this test")
+    }
+
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws {
         fatalError("setMessageFlag is not used in this test")
     }

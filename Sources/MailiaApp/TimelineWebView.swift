@@ -9,6 +9,7 @@ struct TimelineWebView: NSViewRepresentable {
     let onRequestBody: (MailiaTimelineItem, Int?) -> Void
     let onRequestOlder: () -> Void
     let onSetMessageFlag: (MailiaTimelineItem, Bool) -> Void
+    let onMessageBodyRendered: (MailiaTimelineItem) -> Void
     let onDownloadAttachments: (MailiaTimelineItem) -> Void
     let onSendReply: (MailiaTimelineItem, String, Bool, String?) -> Void
     let onSelectSendAccount: (String) -> Void
@@ -42,6 +43,7 @@ struct TimelineWebView: NSViewRepresentable {
         private var onRequestBody: ((MailiaTimelineItem, Int?) -> Void)?
         private var onRequestOlder: (() -> Void)?
         private var onSetMessageFlag: ((MailiaTimelineItem, Bool) -> Void)?
+        private var onMessageBodyRendered: ((MailiaTimelineItem) -> Void)?
         private var onDownloadAttachments: ((MailiaTimelineItem) -> Void)?
         private var onSendReply: ((MailiaTimelineItem, String, Bool, String?) -> Void)?
         private var onSelectSendAccount: ((String) -> Void)?
@@ -57,6 +59,7 @@ struct TimelineWebView: NSViewRepresentable {
             onRequestBody = view.onRequestBody
             onRequestOlder = view.onRequestOlder
             onSetMessageFlag = view.onSetMessageFlag
+            onMessageBodyRendered = view.onMessageBodyRendered
             onDownloadAttachments = view.onDownloadAttachments
             onSendReply = view.onSendReply
             onSelectSendAccount = view.onSelectSendAccount
@@ -99,6 +102,9 @@ struct TimelineWebView: NSViewRepresentable {
             case .setMessageFlag(let messageID, let isFlagged):
                 guard let item = itemsByID[messageID] else { return }
                 onSetMessageFlag?(item, isFlagged)
+            case .messageBodyRendered(let messageID):
+                guard let item = itemsByID[messageID] else { return }
+                onMessageBodyRendered?(item)
             case .downloadAttachments(let messageID):
                 guard let item = itemsByID[messageID] else { return }
                 onDownloadAttachments?(item)

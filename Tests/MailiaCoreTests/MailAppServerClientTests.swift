@@ -216,10 +216,11 @@ func appServerErrorClassifiesMessageLocationFailuresForTiming() {
 @Test
 func appServerRequestMetricParsesRustStderrLine() {
     let metric = AppServerRequestMetric.parse(
-        "mailia-mail: request method=message/get status=ok duration_ms=37 config_load_count=2 auth_refresh_count=1"
+        "mailia-mail: request request_id=42 method=message/get status=ok duration_ms=37 config_load_count=2 auth_refresh_count=1"
     )
 
     #expect(metric == AppServerRequestMetric(
+        requestID: 42,
         method: "message/get",
         status: "ok",
         durationMilliseconds: 37,
@@ -232,6 +233,7 @@ func appServerRequestMetricParsesRustStderrLine() {
 @Test
 func appServerRequestTimingFieldsIncludeBackendMetricsAndErrorCode() {
     let metric = AppServerRequestMetric(
+        requestID: 42,
         method: "message/get",
         status: "error",
         durationMilliseconds: 82,
@@ -251,7 +253,7 @@ func appServerRequestTimingFieldsIncludeBackendMetricsAndErrorCode() {
         )
     )
 
-    #expect(line == "MailiaTiming operation=app_server.request duration_ms=94 status=failure method=message_get outcome=remote_not_found error_code=invalid_request backend_status=error backend_duration_ms=82 config_load_count=3 auth_refresh_count=1")
+    #expect(line == "MailiaTiming operation=app_server.request duration_ms=94 status=failure method=message_get outcome=remote_not_found error_code=invalid_request backend_request_id=42 backend_status=error backend_duration_ms=82 config_load_count=3 auth_refresh_count=1")
 }
 
 @Test
@@ -438,6 +440,40 @@ func appServerClientCanRestartAfterServerExits() async throws {
 }
 
 @Test
+func appServerClientBacksOffAfterLaunchFailure() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-app-server-launch-backoff-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let script = directory.appendingPathComponent("fake-server.sh")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let client = MailAppServerClient(
+        executableURL: script,
+        defaultTimeout: 1,
+        launchFailureRetryInterval: 60
+    )
+
+    await #expect(throws: MailAppServerError.self) {
+        try await client.noop()
+    }
+
+    try writeFakeNoopAppServerScript(to: script)
+
+    await #expect(throws: MailAppServerError.self) {
+        try await client.noop()
+    }
+
+    let freshClient = MailAppServerClient(
+        executableURL: script,
+        defaultTimeout: 1,
+        launchFailureRetryInterval: 60
+    )
+    _ = try await freshClient.start()
+    try await freshClient.noop()
+    try await freshClient.shutdown()
+}
+
+@Test
 func appServerClientCleansUpTimedOutRequestsAndKeepsConnectionUsable() async throws {
     let script = try makeFakeAppServerScript(body: """
     while IFS= read -r line; do
@@ -525,6 +561,32 @@ private func makeFakeAppServerScript(body: String) throws -> URL {
     """.write(to: script, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
     return script
+}
+
+private func writeFakeNoopAppServerScript(to script: URL) throws {
+    try """
+    #!/bin/sh
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        initialize)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        shutdown)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 }
 
 private func readClientAppServerMethods(from url: URL) throws -> [String] {

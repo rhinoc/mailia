@@ -82,6 +82,35 @@ func himalayaExecutableSettingsUsesBundleAppServerPathWhenExecutableIsMissing() 
 
 @MainActor
 @Test
+func himalayaExecutableSettingsUsesDevelopmentAppServerForSwiftPMBuild() throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-development-app-server-\(UUID().uuidString)", isDirectory: true)
+    let swiftExecutableDirectory = temporaryDirectory
+        .appendingPathComponent(".build/arm64-apple-macosx/debug", isDirectory: true)
+    let appServerDirectory = temporaryDirectory
+        .appendingPathComponent("mailia-mail/target/debug", isDirectory: true)
+    try FileManager.default.createDirectory(at: swiftExecutableDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: appServerDirectory, withIntermediateDirectories: true)
+    let mailiaExecutable = swiftExecutableDirectory.appendingPathComponent("Mailia")
+    let appServerExecutable = appServerDirectory.appendingPathComponent("mailia-mail")
+    try Data().write(to: mailiaExecutable)
+    try Data().write(to: appServerExecutable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: appServerExecutable.path)
+    defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+    let launch = MailiaHimalayaExecutableSettings.appServerLaunch(
+        environment: [:],
+        executableURL: mailiaExecutable,
+        bundleURL: temporaryDirectory.appendingPathComponent(".build/arm64-apple-macosx/debug"),
+        fileManager: .default
+    )
+
+    #expect(launch.executableURL.path == appServerExecutable.path)
+    #expect(launch.arguments == ["app-server", "--listen", "stdio://"])
+}
+
+@MainActor
+@Test
 func loadRefreshesWhenInitialSnapshotHasNoEntities() async {
     let refreshedSnapshot = MailiaSnapshot(
         entities: [mailiaEntitySummary(id: 1, displayName: "Alice")],
@@ -229,7 +258,7 @@ func startupRefreshReloadsTimelineWhenStaleSelectionIsKept() async {
 
 @MainActor
 @Test
-func selectedEntityAutoMarkReadMarksOnlyLatestTimelineMessage() async {
+func selectedEntityMarksWholeEntityReadOnSelection() async {
     let entity = mailiaEntitySummary(
         id: 1,
         displayName: "Alice",
@@ -238,28 +267,119 @@ func selectedEntityAutoMarkReadMarksOnlyLatestTimelineMessage() async {
     )
     let olderItem = mailiaTimelineItem(id: 100, entityID: entity.id)
     let latestItem = mailiaTimelineItem(id: 101, entityID: entity.id)
+    let readEntity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        unreadCount: 0,
+        latestMessageID: 101
+    )
     let provider = FakeMailiaAppDataProvider(
         loadSnapshots: [
-            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date())
+            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date()),
+            MailiaSnapshot(entities: [readEntity], sendAccounts: [], loadedAt: Date())
         ],
         refreshSnapshots: [],
         timelinePages: [
             MailiaTimelinePage(items: [olderItem, latestItem], hasMore: false)
         ]
     )
-    let viewModel = AppViewModel(
-        provider: provider,
-        selectedMarkReadDelayNanoseconds: 50_000_000
-    )
+    let viewModel = AppViewModel(provider: provider, renderedReadBatchDelayNanoseconds: 50_000_000)
 
     await viewModel.load()
     await waitUntil(timeoutNanoseconds: 1_000_000_000) {
-        provider.markMessageReadItems.count == 1
+        viewModel.timeline.count == 2
+    }
+    await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+        provider.markEntityReadEntityIDs == [entity.id] &&
+            viewModel.entities.first?.unreadCount == 0
     }
 
-    #expect(provider.markMessageReadItems.map(\.id) == [latestItem.id])
-    #expect(provider.markEntityReadEntityIDs.isEmpty)
-    #expect(viewModel.entities.first?.unreadCount == 9)
+    #expect(provider.markMessagesReadBatches.isEmpty)
+    #expect(provider.markMessageReadItems.isEmpty)
+}
+
+@MainActor
+@Test
+func renderedMessagesDoNotDoubleMarkWhileEntityReadIsInFlight() async {
+    let entity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        unreadCount: 10,
+        latestMessageID: 101
+    )
+    let olderItem = mailiaTimelineItem(id: 100, entityID: entity.id)
+    let latestItem = mailiaTimelineItem(id: 101, entityID: entity.id)
+    let readEntity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        unreadCount: 0,
+        latestMessageID: 101
+    )
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [
+            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date()),
+            MailiaSnapshot(entities: [readEntity], sendAccounts: [], loadedAt: Date())
+        ],
+        refreshSnapshots: [],
+        timelinePages: [
+            MailiaTimelinePage(items: [olderItem, latestItem], hasMore: false)
+        ],
+        markEntityReadDelayNanoseconds: 100_000_000
+    )
+    let viewModel = AppViewModel(provider: provider, renderedReadBatchDelayNanoseconds: 50_000_000)
+
+    await viewModel.load()
+    await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+        viewModel.timeline.count == 2
+    }
+    await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+        provider.markEntityReadEntityIDs == [entity.id]
+    }
+    viewModel.noteMessageBodyRendered(olderItem)
+    viewModel.noteMessageBodyRendered(latestItem)
+
+    try? await Task.sleep(nanoseconds: 250_000_000)
+
+    #expect(provider.markMessagesReadBatches.isEmpty)
+    #expect(provider.markMessageReadItems.isEmpty)
+    #expect(provider.markEntityReadEntityIDs == [entity.id])
+}
+
+@MainActor
+@Test
+func selectedEntityClearsUnreadBeforeRemoteMarkReadFinishes() async {
+    let entity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        unreadCount: 10,
+        latestMessageID: 101
+    )
+    let readEntity = mailiaEntitySummary(
+        id: 1,
+        displayName: "Alice",
+        unreadCount: 0,
+        latestMessageID: 101
+    )
+    let provider = FakeMailiaAppDataProvider(
+        loadSnapshots: [
+            MailiaSnapshot(entities: [entity], sendAccounts: [], loadedAt: Date()),
+            MailiaSnapshot(entities: [readEntity], sendAccounts: [], loadedAt: Date())
+        ],
+        refreshSnapshots: [],
+        timelinePages: [
+            MailiaTimelinePage(items: [mailiaTimelineItem(id: 101, entityID: entity.id)], hasMore: false)
+        ],
+        markEntityReadDelayNanoseconds: 1_000_000_000
+    )
+    let viewModel = AppViewModel(provider: provider, renderedReadBatchDelayNanoseconds: 50_000_000)
+
+    await viewModel.load()
+    await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+        provider.markEntityReadEntityIDs == [entity.id]
+    }
+
+    #expect(viewModel.entities.first?.unreadCount == 0)
+    #expect(provider.loadSnapshotCallCount == 1)
 }
 
 @MainActor
@@ -576,7 +696,8 @@ func liveProviderCoalescesBackgroundFolderRefreshes() async throws {
     let provider = LiveMailiaAppDataProvider(
         databaseQueue: databaseQueue,
         appServerClient: client,
-        downloadsDirectory: FileManager.default.temporaryDirectory
+        downloadsDirectory: FileManager.default.temporaryDirectory,
+        backgroundMailboxMaintenanceDelayNanoseconds: 0
     )
 
     do {
@@ -1023,6 +1144,329 @@ func liveProviderMarksSingleMessageReadWithoutMarkingWholeEntity() async throws 
         )
         #expect(unreadLocations.count == 1)
         #expect(unreadLocations.first?.himalayaEnvelopeID == "inbox-2")
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderBatchMarkReadSkipsAlreadySeenMessages() async throws {
+    let requestLog = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-mark-read-batch-\(UUID().uuidString).jsonl")
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      printf '%s\\n' "$line" >> '\(requestLog.path)'
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          printf '{"id":%s,"result":{"id":"older","folder":"INBOX"}}\\n' "$id"
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "older",
+            subject: "Older unread",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "latest",
+            subject: "Latest seen",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-02T10:00:00Z",
+            flags: ["Seen"]
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+    let messages = try repository.messages(entityID: entity.id, workspace: .main)
+    let older = try #require(messages.first { $0.subject == "Older unread" })
+    let latest = try #require(messages.first { $0.subject == "Latest seen" })
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        let changedCount = try await provider.markMessagesRead(
+            items: [
+                mailiaTimelineItem(id: latest.messageID, entityID: entity.id),
+                mailiaTimelineItem(id: older.messageID, entityID: entity.id)
+            ],
+            workspace: .main
+        )
+        #expect(changedCount == 1)
+        let unreadLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            onlyUnread: true
+        )
+        #expect(unreadLocations.isEmpty)
+
+        let log = (try? String(contentsOf: requestLog, encoding: .utf8)) ?? ""
+        let modifyRequestCount = log.split(separator: "\n").filter {
+            $0.contains(#""method""#) && $0.contains("message") && $0.contains("modify")
+        }.count
+        #expect(modifyRequestCount == 1)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderMarksEntityReadConcurrently() async throws {
+    let requestLog = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-mark-read-concurrent-\(UUID().uuidString).jsonl")
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      printf '%s\\n' "$line" >> '\(requestLog.path)'
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          (
+            /bin/sleep 0.35
+            printf '{"id":%s,"result":{"id":"seen","folder":"INBOX"}}\\n' "$id"
+          ) &
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal)])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            subject: "Unread 1",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-2",
+            subject: "Unread 2",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-02T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-3",
+            subject: "Unread 3",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-03T10:00:00Z"
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 3
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory,
+        appServerRequestLimiter: MailAppServerRequestLimiter(maxConcurrentRequests: 4)
+    )
+
+    do {
+        let start = Date()
+        try await provider.markEntityRead(entityID: entity.id, workspace: .main)
+        let elapsed = Date().timeIntervalSince(start)
+        let unreadLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            onlyUnread: true
+        )
+        #expect(unreadLocations.isEmpty)
+        #expect(elapsed < 0.9)
+
+        let log = (try? String(contentsOf: requestLog, encoding: .utf8)) ?? ""
+        let modifyRequestCount = log.split(separator: "\n").filter {
+            $0.contains(#""method""#) && $0.contains("message") && $0.contains("modify")
+        }.count
+        #expect(modifyRequestCount == 3)
+        try await client.shutdown()
+    } catch {
+        try? await client.shutdown()
+        throw error
+    }
+}
+
+@MainActor
+@Test
+func liveProviderMarksReadThroughPreferredLocationAndUpdatesAllLocalLocations() async throws {
+    let requestLog = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mailia-mark-read-preferred-\(UUID().uuidString).jsonl")
+    let script = try makeAppServerScript(body: """
+    while IFS= read -r line; do
+      printf '%s\\n' "$line" >> '\(requestLog.path)'
+      id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
+      method=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"method":"\\([^"]*\\)".*/\\1/p')
+      folder=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"folder":"\\([^"]*\\)".*/\\1/p')
+      case "$method" in
+        *initialize*)
+          printf '{"id":%s,"result":{"serverName":"mailia-mail","protocolVersion":1}}\\n' "$id"
+          ;;
+        *noop*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          ;;
+        *message*modify*)
+          if [ "$folder" = "INBOX" ]; then
+            printf '{"id":%s,"result":{"id":"inbox-1","folder":"INBOX"}}\\n' "$id"
+          else
+            printf '{"id":%s,"error":{"code":"internal","message":"non-writable folder"}}\\n' "$id"
+          fi
+          ;;
+        *shutdown*)
+          printf '{"id":%s,"result":{"ok":true}}\\n' "$id"
+          exit 0
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":"method_not_found","message":"unknown"}}\\n' "$id"
+          ;;
+      esac
+    done
+    """)
+    defer {
+        try? FileManager.default.removeItem(at: script.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: requestLog)
+    }
+
+    let databaseQueue = try DatabaseQueue()
+    try DatabaseSchemaFactory.initialize(databaseQueue)
+    let repository = MailRepository(databaseQueue: databaseQueue)
+    try repository.upsertAccounts([DiscoveredAccount(accountKey: "work")])
+    try repository.upsertFolders([
+        DiscoveredFolder(accountKey: "work", providerName: "INBOX", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "[Gmail]/All Mail", role: .normal),
+        DiscoveredFolder(accountKey: "work", providerName: "[Gmail]/Important", role: .normal)
+    ])
+    _ = try repository.upsertEnvelopes([
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "[Gmail]/All Mail",
+            himalayaEnvelopeID: "all-1",
+            rfcMessageID: "<preferred-location@example.net>",
+            subject: "Unread",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "[Gmail]/Important",
+            himalayaEnvelopeID: "important-1",
+            rfcMessageID: "<preferred-location@example.net>",
+            subject: "Unread",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        ),
+        EnvelopeMessage(
+            accountKey: "work",
+            folderName: "INBOX",
+            himalayaEnvelopeID: "inbox-1",
+            rfcMessageID: "<preferred-location@example.net>",
+            subject: "Unread",
+            from: MailAddress(displayName: "Alice", emailAddress: "alice@example.net"),
+            messageDate: "2026-05-01T10:00:00Z"
+        )
+    ])
+    let entity = try #require(try repository.entityList(workspace: .main).first)
+
+    let client = MailAppServerClient(
+        executableURL: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [script.path],
+        defaultTimeout: 2
+    )
+    let provider = LiveMailiaAppDataProvider(
+        databaseQueue: databaseQueue,
+        appServerClient: client,
+        downloadsDirectory: FileManager.default.temporaryDirectory
+    )
+
+    do {
+        try await provider.markEntityRead(entityID: entity.id, workspace: .main)
+        let unreadLocations = try repository.messageLocations(
+            entityID: entity.id,
+            workspace: .main,
+            onlyUnread: true
+        )
+        #expect(unreadLocations.isEmpty)
+
+        let log = (try? String(contentsOf: requestLog, encoding: .utf8)) ?? ""
+        let modifyRequests = log.split(separator: "\n").filter {
+            $0.contains(#""method""#) && $0.contains("message") && $0.contains("modify")
+        }
+        #expect(modifyRequests.count == 1)
+        #expect(modifyRequests.first?.contains(#""folder":"INBOX""#) == true)
         try await client.shutdown()
     } catch {
         try? await client.shutdown()
@@ -1824,7 +2268,9 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     private let refreshDelayNanoseconds: UInt64
     private let refreshAfterSendingDelayNanoseconds: UInt64
     private let bodyDelayNanoseconds: UInt64
+    private let markEntityReadDelayNanoseconds: UInt64
     private let refreshError: Error?
+    private let markMessagesReadResult: Result<Int, Error>
     private(set) var loadSnapshotCallCount = 0
     private(set) var lastRefreshFinishedAtCallCount = 0
     private(set) var refreshCallCount = 0
@@ -1837,6 +2283,7 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
     private(set) var sentNewMessageAccountKey: String?
     private(set) var markEntityReadEntityIDs: [Int64] = []
     private(set) var markMessageReadItems: [MailiaTimelineItem] = []
+    private(set) var markMessagesReadBatches: [[MailiaTimelineItem]] = []
 
     init(
         loadSnapshots: [MailiaSnapshot],
@@ -1849,7 +2296,9 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         refreshDelayNanoseconds: UInt64 = 0,
         refreshAfterSendingDelayNanoseconds: UInt64 = 0,
         bodyDelayNanoseconds: UInt64 = 0,
-        refreshError: Error? = nil
+        markEntityReadDelayNanoseconds: UInt64 = 0,
+        refreshError: Error? = nil,
+        markMessagesReadResult: Result<Int, Error> = .success(0)
     ) {
         self.loadSnapshots = loadSnapshots
         self.refreshSnapshots = refreshSnapshots
@@ -1862,7 +2311,9 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
         self.refreshDelayNanoseconds = refreshDelayNanoseconds
         self.refreshAfterSendingDelayNanoseconds = refreshAfterSendingDelayNanoseconds
         self.bodyDelayNanoseconds = bodyDelayNanoseconds
+        self.markEntityReadDelayNanoseconds = markEntityReadDelayNanoseconds
         self.refreshError = refreshError
+        self.markMessagesReadResult = markMessagesReadResult
     }
 
     func loadSnapshot(workspace: MailiaWorkspace, searchQuery: String) async throws -> MailiaSnapshot {
@@ -1983,10 +2434,18 @@ private final class FakeMailiaAppDataProvider: MailiaAppDataProviding {
 
     func markEntityRead(entityID: Int64, workspace: MailiaWorkspace) async throws {
         markEntityReadEntityIDs.append(entityID)
+        if markEntityReadDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: markEntityReadDelayNanoseconds)
+        }
     }
 
     func markMessageRead(item: MailiaTimelineItem, workspace: MailiaWorkspace) async throws {
         markMessageReadItems.append(item)
+    }
+
+    func markMessagesRead(items: [MailiaTimelineItem], workspace: MailiaWorkspace) async throws -> Int {
+        markMessagesReadBatches.append(items)
+        return try markMessagesReadResult.get()
     }
 
     func setMessageFlag(item: MailiaTimelineItem, isFlagged: Bool) async throws {

@@ -258,14 +258,15 @@ function evaluate(code, responses) {
   const errors = responses.filter(response => response.error);
   const metrics = stderr
     .split("\n")
-    .map(line => line.match(/request method=(\S+) status=(\S+) duration_ms=(\d+) config_load_count=(\d+) auth_refresh_count=(\d+)/))
+    .map(line => line.match(/request (?:request_id=(\S+) )?method=(\S+) status=(\S+) duration_ms=(\d+) config_load_count=(\d+) auth_refresh_count=(\d+)/))
     .filter(Boolean)
     .map(match => ({
-      method: match[1],
-      status: match[2],
-      durationMs: Number(match[3]),
-      configLoadCount: Number(match[4]),
-      authRefreshCount: Number(match[5]),
+      requestID: match[1] ?? null,
+      method: match[2],
+      status: match[3],
+      durationMs: Number(match[4]),
+      configLoadCount: Number(match[5]),
+      authRefreshCount: Number(match[6]),
     }));
 
   const accountHealth = responses.find(response => response.id === 3)?.result ?? {};
