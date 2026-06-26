@@ -84,10 +84,8 @@ Mailia ships as a macOS disk image. Download the latest
 ### First Launch and Gatekeeper
 
 Browser downloads are tagged with Gatekeeper quarantine. If macOS warns that
-the app cannot be opened or is from an unidentified developer, use
-**Control-click → Open** once and confirm in the dialog.
-
-You can also remove quarantine from the installed app:
+the app cannot be opened or is from an unidentified developer, remove
+quarantine from the installed app:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Mailia.app
